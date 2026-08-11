@@ -202,7 +202,7 @@ fn pick_next(shared: &Shared, type_name: &str) -> Option<WorkItem> {
         map.keys().cloned().collect::<std::collections::HashSet<String>>()
     };
     let queue = shared.queue();
-    let mut items = queue.load();
+    let items = queue.load();
     let now = chrono::Utc::now();
     let mut best: Option<usize> = None;
     for (i, item) in items.iter().enumerate() {
@@ -220,15 +220,25 @@ fn pick_next(shared: &Shared, type_name: &str) -> Option<WorkItem> {
             }
         };
     }
-    let idx = best?;
-    items[idx].state = workitems::STATE_IN_PROGRESS.into();
-    items[idx].attempts += 1;
-    items[idx].times.start = workitems::now_iso();
-    if let Err(e) = queue.save(&items) {
-        logging::error("engine", &format!("cannot claim workitem: {}", e));
-        return None;
+    let workid = items[best?].workid.clone();
+    // Claim under the record lock so the API server / iter add can't race the pick.
+    let claimed = queue.with_lock(|items| {
+        let item = items.iter_mut().find(|i| i.workid == workid)?;
+        if item.state != workitems::STATE_QUEUED && item.state != workitems::STATE_FAILED {
+            return None; // someone changed it between our read and the lock
+        }
+        item.state = workitems::STATE_IN_PROGRESS.into();
+        item.attempts += 1;
+        item.times.start = workitems::now_iso();
+        Some(item.clone())
+    });
+    match claimed {
+        Ok(item) => item,
+        Err(e) => {
+            logging::error("engine", &format!("cannot claim workitem: {}", e));
+            None
+        }
     }
-    Some(items[idx].clone())
 }
 
 fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: String) {

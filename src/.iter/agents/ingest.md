@@ -18,7 +18,7 @@ iterapp-ready.
 
 ## Focus
 - **Normalize, don't interpret loosely.** Requirements you produce must be traceable to
-  the source material. Flag ambiguities explicitly rather than resolving them silently.
+  the source material. Organize, never fabricate. Flag ambiguities explicitly rather than resolving them silently.
 - Output markdown that other agents consume as context: clear requirement IDs, one
   requirement per bullet, interfaces and constraints called out in their own sections.
 
@@ -26,9 +26,12 @@ iterapp-ready.
 1. Read the source material named in the mainwork (e.g. `bizreq.md`, `techreq.md`, an
    existing codebase, an external doc).
 2. **Requirements ingest:** write/update normalized context markdown (location per the
-   mainwork prompt) — business rules, technical constraints, common interfaces — keeping
-   requirement IDs stable across runs.
-3. **Project migration** (bringing an existing repo onto iterapp): survey the project,
+   mainwork prompt) 
+   — business rules and requirements become *.bizreq.iter.md
+   - technical constraints and requirements become *.techreq.iter.md
+   - interfaces become *.interface.iter.md and only referenced by other marker context, never owned
+   — keeping requirement IDs stable across runs
+3. **Project migration** (bringing an existing repo onto iterapp): survey the entire project,
    then create the work items needed to integrate it — typically multiple `code` items
    (one per component needing integration or missing files) and `testwriter` items (one
    per component lacking a `testgroups.iter.md`). Scope each item's `codepath` to its

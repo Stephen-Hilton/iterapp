@@ -173,8 +173,9 @@ iterapp-meaningful**; its **role comes from its frontmatter**, not its filename:
 | Frontmatter | Role |
 |---|---|
 | has `level:` | **structure node** — a row on the Projects map |
+| has `interface:` | **interface contract** — aggregated globally (see below) |
 | has `participants:` | **use-case thread** — drives the red line + step numbers |
-| neither | **plain context document** (testgroups.iter.md, bizreq.iter.md, notes) — discoverable and attachable as context, never a map node |
+| none | **plain context document** (testgroups.iter.md, bizreq.iter.md, notes) — discoverable and attachable as context, never a map node |
 
 *(Naming note, locked 2026-08-11: an earlier draft used `*.iter.context.md`, where
 "context" meant generic agent-context — too easily read as the C4 CONTEXT level. The
@@ -208,6 +209,19 @@ requirements, interfaces, constraints. The marker IS the context file.
 - **Read-only by design** (locked 2026-08-11): the page never edits marker files.
   Changing the model = a work item that edits the marker — the loop maintains its own
   map. The one write path into execution is Create WorkItem.
+- **Interfaces are first-class and global** (locked 2026-08-11): an interface is a
+  contract between two-or-more heterogeneous systems — the stitching BETWEEN nodes —
+  so it is never owned by the hierarchy. A marker with `interface: <id>` frontmatter
+  (plus `kind:` http|grpc|kafka|sql|cli|library|…, `endpoint:`, `description:`; body =
+  the contract) can live anywhere; the scanner aggregates all of them globally so they
+  can be rationalized and deduplicated (duplicate ids are flagged loudly). Nodes
+  *reference* interfaces: `provides: [id…]` for the serving end, and entries in
+  `uses:` that match a declared id become links (unmatched entries stay plain resource
+  badges — the "used but undeclared" worklist). Two things fall out free: clicking an
+  interface threads its providers/consumers through the tree — a **derived thread**
+  nobody had to author — and Create-WorkItem-from-node attaches the contract files for
+  everything the node uses/provides (the `{interfaces}` placeholder). iterloop itself
+  stays ignorant: interfaces are just more context for prompts.
 - **Use-cases are `*.iter.md` files with `participants:`**: a name, description, and
   an ordered participant list (`- 2.1 core/intake/orchestrator`). The red thread and
   step numbers render from it; structure files never mention use-cases.
@@ -250,6 +264,7 @@ form-open time, and every line supports the same globs as any work-item context:
 |---|---|
 | `{marker}` | the clicked node's own `.iter.md` file |
 | `{ancestor_markers}` | the marker files of that node's parent chain, walking up to the project root (directory-derived, `parent:` overrides respected) — e.g. from `core/intake/evidence-vault`: the `core/intake`, `core`, and project-root markers |
+| `{interfaces}` | the contract marker files for every interface in the node's `uses:` + `provides:` |
 | `{codepath}` | the node's directory, absolute — use to scope a glob to the work item's own tree |
 | any glob/path | passed through as a normal context entry |
 
@@ -325,6 +340,9 @@ A deterministic local port also gives scripts/agents a stable insert path.
 
 ```
 GET    /api/state                      engine state + counts
+POST   /api/engine                     {action: pause|stop|resume|shutdown} — pause
+                                       drains; the webapp outlives a stopped loop and
+                                       resume restarts it; shutdown exits the process
 GET    /api/workitems?state=…          open + closed items, filterable
 POST   /api/workitems                  insert (same validation as `iter add`: warn
                                        on unknown type, 409 at max_open_workitems)
@@ -358,18 +376,18 @@ server is just another external producer, so engine and UI can't corrupt the que
       filters, slide-down, context-aware Actions (mutating in-page state), all four
       lightboxes, New/Edit/Clone/Follow-up form, Collapse All, engine chip. Publish for
       review; iterate to perfection.
-- [ ] **W1b — remaining pages in the mockup**: client-side router; Dashboard (tiles +
+- [x] **W1b — remaining pages in the mockup**: client-side router; Dashboard (tiles +
       three chart panels, fake history); Iterloop Settings form; Projects hierarchy
       with fake markers, use-case thread, depth legend, Create-WorkItem-from-node;
       Project Settings form.
-- [ ] **W2 — freeze the design**: fold review feedback back into this spec; extract the
+- [x] **W2 — freeze the design**: fold review feedback back into this spec; extract the
       final CSS/JS structure the Rust server will embed.
-- [ ] **W3 — API layer**: `serve` subcommand (axum or tiny-http), endpoints above,
+- [x] **W3 — API layer**: `serve` subcommand (axum or tiny-http), endpoints above,
       static page embedded via `include_str!`; `run --serve` runs both. Engine stamps
       the `tests` summary on close-out.
-- [ ] **W4 — wire the page to the API**: replace fake data with `/api/*` + SSE live
+- [x] **W4 — wire the page to the API**: replace fake data with `/api/*` + SSE live
       updates; empty/error states; confirm dialogs on delete.
-- [ ] **W5 — E2E tests**: API tests with the fake runner (insert via POST during a run,
+- [x] **W5 — E2E tests**: API tests with the fake runner (insert via POST during a run,
       action transitions, cap refusal); a scripted browser smoke pass.
 
 ## Open questions

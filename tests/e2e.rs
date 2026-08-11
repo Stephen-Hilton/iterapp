@@ -363,17 +363,33 @@ fn start_serves_webapp_and_runs_engine() {
         }
     }
 
-    // Engine is running too: stop it via the signal and expect a clean exit.
+    // Stop the ENGINE via the signal: the loop exits but the webapp stays up
+    // (pause/resume from the browser depends on this), state reads "stopped".
     std::thread::sleep(Duration::from_millis(1200)); // let the scheduler clear old signals first
     let ok = Command::new(BIN).args(["stop", "--project", dest.to_str().unwrap()]).status().unwrap();
     assert!(ok.success());
     let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = http(port, "GET", "/api/state", None);
+        if state.contains("\"engine\":\"stopped\"") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "engine never reached stopped: {}", state);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(child.try_wait().unwrap().is_none(), "server must outlive the engine loop");
+
+    // Resume from the API, then shut the whole process down.
+    let resumed = http(port, "POST", "/api/engine", Some(r#"{"action":"resume"}"#));
+    assert!(resumed.contains("running"), "resume must restart the loop: {}", resumed);
+    let _ = http(port, "POST", "/api/engine", Some(r#"{"action":"shutdown"}"#));
+    let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(s) = child.try_wait().unwrap() {
             break s;
         }
-        assert!(Instant::now() < deadline, "engine did not honor stop.signal");
-        std::thread::sleep(Duration::from_millis(200));
+        assert!(Instant::now() < deadline, "shutdown action did not exit the process");
+        std::thread::sleep(Duration::from_millis(100));
     };
     assert!(status.success());
     let out = child.wait_with_output().unwrap();
@@ -381,6 +397,126 @@ fn start_serves_webapp_and_runs_engine() {
     assert!(stdout.contains("iterapp webapp:"), "must print the URL: {}", stdout);
     assert!(stdout.contains(&format!("localhost:{}/", port)));
 
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+/// Minimal HTTP client for the API tests: one request, connection-close semantics.
+fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> String {
+    use std::io::{Read, Write};
+    let Ok(mut sock) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return String::new();
+    };
+    let body = body.unwrap_or("");
+    let req = format!(
+        "{} {} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        method, path, body.len(), body
+    );
+    let _ = sock.write_all(req.as_bytes());
+    let mut resp = String::new();
+    let _ = sock.read_to_string(&mut resp);
+    resp
+}
+
+#[test]
+fn api_crud_history_markers_and_settings() {
+    let dest = std::env::temp_dir().join(format!("iterloop-e2e-api-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(dest.join(".iter/.engine")).unwrap();
+    std::fs::write(
+        dest.join(".iter/.engine/config.json"),
+        r#"{"engine":{"tick_interval_sec":1,"max_open_workitems":3},"globalsettings":{"log_default_path":""}}"#,
+    )
+    .unwrap();
+    // A marker tree: node, interface, use-case, plain doc.
+    std::fs::create_dir_all(dest.join("svc")).unwrap();
+    std::fs::write(dest.join("root.iter.md"), "---\nname: API Test Project\nlevel: project\n---\n").unwrap();
+    std::fs::write(
+        dest.join("svc/svc.iter.md"),
+        "---\nname: Svc\nlevel: component\nuses: [pay-api]\nprovides: [svc-api]\n---\ncontext",
+    )
+    .unwrap();
+    std::fs::write(
+        dest.join("svc/svc-api.iter.md"),
+        "---\ninterface: svc-api\nkind: http\nendpoint: GET /svc\n---\ncontract",
+    )
+    .unwrap();
+    std::fs::write(dest.join("svc/bizreq.iter.md"), "plain context\n").unwrap();
+
+    let port = 22000 + (std::process::id() % 20000) as u16;
+    let mut child = Command::new(BIN)
+        .args(["start", "--project", dest.to_str().unwrap(), "--port", &port.to_string()])
+        .env("ITER_CLAUDE_BIN", "/usr/bin/false") // any picked-up item fails fast, no real claude
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "server never came up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // meta
+    let meta = http(port, "GET", "/api/meta", None);
+    assert!(meta.contains("\"prepostwork\""), "{}", meta);
+    assert!(meta.contains("git-pull"));
+
+    // create (todo so the engine leaves it alone), list, patch, actions
+    let created = http(port, "POST", "/api/workitems", Some(r#"{"type":"code","title":"t1","mainwork":"m1","state":"todo"}"#));
+    assert!(created.contains("201") && created.contains("workid"), "{}", created);
+    let created2 = http(port, "POST", "/api/workitems", Some(r#"{"type":"bogus","title":"t2","mainwork":"m2","state":"todo"}"#));
+    assert!(created2.contains("matches no agent"), "warn-at-add over the API: {}", created2);
+    let list = http(port, "GET", "/api/workitems", None);
+    let body = list.split("\r\n\r\n").nth(1).unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("list parses");
+    let open = parsed["open"].as_array().unwrap();
+    assert_eq!(open.len(), 2);
+    let id = open[0]["workid"].as_str().unwrap().to_string();
+
+    let patched = http(port, "PATCH", &format!("/api/workitems/{}", id), Some(r#"{"title":"renamed","priority":9}"#));
+    assert!(patched.contains("renamed"), "{}", patched);
+    let acted = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"complete"}"#));
+    assert!(acted.contains("complete"), "{}", acted);
+    let third = http(port, "POST", "/api/workitems", Some(r#"{"type":"code","title":"t3","mainwork":"m3","state":"todo"}"#));
+    assert!(third.contains("201"), "{}", third);
+    // cap is 3: two open + one more = refusal
+    let _fourth_a = http(port, "POST", "/api/workitems", Some(r#"{"type":"code","title":"t4","mainwork":"m4","state":"todo"}"#));
+    let refused = http(port, "POST", "/api/workitems", Some(r#"{"type":"code","title":"t5","mainwork":"m5","state":"todo"}"#));
+    assert!(refused.contains("409") && refused.contains("max_open_workitems"), "{}", refused);
+
+    // history includes the completed item today
+    let hist = http(port, "GET", "/api/history?days=7", None);
+    assert!(hist.contains("\"days\""), "{}", hist);
+    assert!(hist.contains("\"complete\":1"), "today's bucket counts the completion: {}", hist);
+
+    // markers: node + interface + plain sorted by frontmatter role
+    let markers = http(port, "GET", "/api/markers", None);
+    assert!(markers.contains("API Test Project"), "{}", markers);
+    assert!(markers.contains("\"svc-api\""));
+    assert!(markers.contains("bizreq.iter.md"));
+
+    // config roundtrip
+    let put = http(port, "PUT", "/api/config", Some(r#"{"engine":{"tick_interval_sec":2},"globalsettings":{}}"#));
+    assert!(put.contains("200"), "{}", put);
+    let got = http(port, "GET", "/api/config", None);
+    assert!(got.contains("\"tick_interval_sec\": 2") || got.contains("\"tick_interval_sec\":2"), "{}", got);
+
+    // projectsettings roundtrip
+    let ps = http(port, "PUT", "/api/projectsettings", Some(r#"{"project_name":"Renamed","url_slug":"api-test"}"#));
+    assert!(ps.contains("Renamed"), "{}", ps);
+    let ps2 = http(port, "GET", "/api/projectsettings", None);
+    assert!(ps2.contains("api-test") && ps2.contains("marker_glob"), "defaults overlay: {}", ps2);
+
+    // servers registry includes us
+    let servers = http(port, "GET", "/api/servers", None);
+    assert!(servers.contains(&format!("\"port\":{}", port)) || servers.contains(&format!("\"port\": {}", port)), "{}", servers);
+
+    let _ = http(port, "POST", "/api/engine", Some(r#"{"action":"shutdown"}"#));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "shutdown did not exit");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let _ = std::fs::remove_dir_all(&dest);
 }
 

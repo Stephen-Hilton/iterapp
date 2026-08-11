@@ -3,6 +3,8 @@ mod config;
 mod context;
 mod locks;
 mod logging;
+mod markers;
+mod registry;
 mod runner;
 mod scheduler;
 mod server;
@@ -141,6 +143,13 @@ fn cmd_start(project: PathBuf, port: Option<u16>) -> i32 {
     if !boot(&project) {
         return 1;
     }
+    let project = match project.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: bad project path: {}", e);
+            return 1;
+        }
+    };
     let (listener, port) = match server::bind(&project, port) {
         Ok(bound) => bound,
         Err(e) => {
@@ -149,17 +158,22 @@ fn cmd_start(project: PathBuf, port: Option<u16>) -> i32 {
         }
     };
     let slug = server::slug(&project);
+    let settings = server::project_settings(&project);
+    let name = settings["project_name"].as_str().unwrap_or("project").to_string();
+    registry::register(&project, &name, &slug, port);
     println!();
     println!("  iterapp webapp:  http://localhost:{}/", port);
     println!("                   http://{}.localhost:{}/", slug, port);
     println!();
-    server::spawn(listener);
-    match scheduler::run(project, scheduler::RunMode { once: false, until_idle: false }) {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            1
-        }
+
+    // The engine loop runs as a restartable thread so the webapp can pause/resume it;
+    // stopping the loop does NOT kill the webapp. Shut everything down with Ctrl-C or
+    // POST /api/engine {"action":"shutdown"}.
+    let engine = server::Engine::new(project);
+    engine.start_loop();
+    server::serve(listener, std::sync::Arc::clone(&engine), port);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
     }
 }
 

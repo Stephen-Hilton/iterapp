@@ -110,6 +110,7 @@
   .enginechip .dot { width: 9px; height: 9px; border-radius: 50%; }
   .enginechip[data-engine="running"] .dot { background: var(--s-complete-bg); box-shadow: 0 0 0 3px rgba(26,154,74,.22); }
   .enginechip[data-engine="paused"]  .dot { background: var(--s-paused-bg);  box-shadow: 0 0 0 3px rgba(224,112,32,.25); }
+  .enginechip[data-engine="stopped"] .dot { background: var(--s-failed-bg);  box-shadow: 0 0 0 3px rgba(212,58,58,.25); }
   .enginechip .lbl { color: var(--text-dim); font-weight: 500; }
 
   /* ---------- summary strip ---------- */
@@ -399,6 +400,13 @@
   .prow .pdesc { color: var(--text-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 40px; }
   .prow .uses { display: flex; gap: 4px; flex: none; }
   .prow .useb { font-size: 10px; padding: 1px 7px; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text-dim); font-family: var(--mono); }
+  .prow .useb.prov { border-style: solid; color: var(--text); font-weight: 600; }
+  .prow .useb.linked { border-color: var(--accent); color: var(--accent); }
+  .kindchip { flex: none; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 8px; color: #fff; background: #6b7c8f; }
+  .k-http { background: #1f7ac2; } .k-grpc { background: #6a4fd0; } .k-kafka { background: #2f7d5f; }
+  .k-sql { background: #a5561d; } .k-file { background: #6b7c8f; } .k-cli { background: #3c4b5c; }
+  .k-library { background: #8a3d86; } .k-metrics { background: #b0821a; }
+  .dupflag { flex: none; color: var(--thread); font-weight: 700; font-size: 10px; border: 1px solid var(--thread); border-radius: 8px; padding: 0 6px; }
   .prow .step { flex: none; background: var(--thread); color: #fff; font-weight: 800; font-size: 11px; min-width: 30px; text-align: center; border-radius: 5px; padding: 1px 6px; font-variant-numeric: tabular-nums; }
   .pdetail { border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--surface2) 40%, var(--surface)); padding: 10px 16px 12px; display: grid; grid-template-columns: 96px 1fr; gap: 7px 12px; font-size: 12.5px; cursor: default; }
   .pdetail .dlabel { padding-top: 0; }
@@ -489,9 +497,20 @@
 
 /* ------------------------------------------------------------------ data */
 
+/* LIVE mode: served by `iter start`, everything comes from /api/*.
+   Opened as a file (mockup review), the page falls back to built-in mock data. */
+const LIVE = location.protocol === 'http:' || location.protocol === 'https:';
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  return data;
+}
+
 const PREPOST = ['deploy','git-commit','git-pr','git-pull','git-push','iterloop-stop','iterloop-wait-for-stop'];
 const AGENTS = ['plan','code','test','testwriter','refactor','ingest'];
-const PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // supplied by /api/meta once wired
+let PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // replaced by /api/meta in LIVE mode
 const HOME = '/Users/stephen.hilton';
 
 /* codepath is entered relative but always resolved and shown absolute */
@@ -627,9 +646,44 @@ items.push(mk({ title:'Spike: rewrite greet in awk for speed (abandoned after 3 
 /* ------------------------------------------------------------------ state */
 
 let activeFilters = new Set();          // empty = all
-let openIds = new Set([items[1].workid]); // start with one open, like the slide
+let openIds = new Set(LIVE ? [] : [items[1].workid]);
 let engineRunning = true;
 let sortBy = 'state';
+
+/* ------------------------------------------------------------- live loading */
+
+async function loadAll(){
+  if (!LIVE) return;
+  try {
+    const [meta, list] = await Promise.all([api('/api/meta'), api('/api/workitems')]);
+    AGENTS.length = 0;
+    meta.agents.forEach(a => AGENTS.push(a.type));
+    PREPOST.length = 0;
+    meta.prepostwork.forEach(p => PREPOST.push(p));
+    PROJECT_ROOT = meta.project_root;
+    items = [...list.open, ...list.closed.slice().reverse()];
+    const brand = document.querySelector('.projbrand');
+    brand.querySelector('b').textContent = meta.project_name;
+    brand.querySelector('span').textContent = `${meta.url_slug}.localhost:${location.port || 80}`;
+    document.title = `${meta.url_slug} · IterLoop`;
+    setFavicon(meta.url_slug || 'iter');
+    render();
+  } catch (e) {
+    toast('API error: ' + e.message);
+  }
+}
+
+async function refreshEngine(){
+  if (!LIVE) return;
+  try {
+    const s = await api('/api/state');
+    const chip = $('engineChip');
+    const label = s.engine[0].toUpperCase() + s.engine.slice(1);
+    chip.dataset.engine = s.engine === 'running' ? 'running' : (s.engine === 'stopped' ? 'stopped' : 'paused');
+    $('engineState').textContent = label;
+    engineRunning = s.engine === 'running';
+  } catch (e) { /* server going away is fine */ }
+}
 
 /* ------------------------------------------------------------------ render */
 
@@ -830,6 +884,26 @@ function fakeGroups(item){
 }
 
 function lbTests(item){
+  if (LIVE) {
+    api(`/api/workitems/${item.workid}/tests`).then(data => {
+      const files = data.testfiles || [];
+      if (!files.length || files.every(f => !f.groups.length)) {
+        return openLb('Test Details — ' + shortId(item),
+          `<p style="color:var(--text-dim)">No test groups found for this work item's testfiles. Groups live in <span class="mono">testgroups.iter.md</span> blocks beside the code.</p>`);
+      }
+      const rows = files.flatMap(f => f.groups.map(g => {
+        const ok = g.result === 'passed';
+        return `<tr><td><b>${esc(g.label)}</b></td>
+          <td><span class="chip" style="background:${ok?'var(--s-complete-bg)':(g.result?'var(--s-failed-bg)':'var(--surface2)')};color:${g.result?'#fff':'var(--text-dim)'}">${esc(g.result || 'never run')}</span></td>
+          <td class="mono">${esc(g.counts || '–')}</td><td class="mono">${esc(g.lastrun || '–')}</td>
+          <td class="mono">${(g.testlist||[]).map(esc).join(', ')}</td></tr>`;
+      })).join('');
+      openLb('Test Details — ' + shortId(item),
+        `<table class="t"><thead><tr><th>Group</th><th>Result</th><th>Counts</th><th>Last run</th><th>Scripts</th></tr></thead><tbody>${rows}</tbody></table>
+         <p style="color:var(--text-dim);font-size:12px;margin-bottom:0">Source: <span class="mono">${files.map(f=>esc(f.file)).join(' · ')}</span></p>`);
+    }).catch(e => toast('Tests: ' + e.message));
+    return;
+  }
   const groups = fakeGroups(item);
   if (!groups.length) return openLb('Test Details — ' + shortId(item),
     `<p style="color:var(--text-dim)">No test results recorded for this work item yet. The engine stamps results from <span class="mono">testgroups.iter.md</span> at close-out.</p>`);
@@ -894,6 +968,16 @@ function lbContext(item){
 }
 
 function lbLogs(item){
+  if (LIVE) {
+    api(`/api/workitems/${item.workid}/logs`).then(data => {
+      const text = (data.lines && data.lines.length)
+        ? data.lines.join('\n')
+        : '(no engine log lines for this item yet — logging may be disabled, or it has not been picked up)';
+      openLb('Engine Logs — ' + shortId(item),
+        `<div class="textblock mono" style="max-height:52vh">${esc(text)}</div>`);
+    }).catch(e => toast('Logs: ' + e.message));
+    return;
+  }
   const tag = `${item.type}#${(seq % 7) + 1}`;
   const lines = [];
   const push = (ts, lvl, msg) => ts && lines.push(`${ts.slice(11,19)} ${lvl}  [${tag}]  ${msg}`);
@@ -1009,6 +1093,32 @@ function saveDraft(targetState){
   d.context = $('f_context').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.testfiles = $('f_testfiles').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.mainwork = $('f_mainwork').value;
+
+  if (LIVE) {
+    const mode = draft.mode;
+    const done = () => { draft = null; closeLb(); return loadAll(); };
+    if (mode === 'edit') {
+      const fields = { title: d.title, type: d.type, priority: d.priority, risk: d.risk,
+        source: d.source, codepath: d.codepath, context: d.context, testfiles: d.testfiles,
+        prework: d.prework, postwork: d.postwork, mainwork: d.mainwork };
+      const stateAction = targetState === 'queued' ? 'queue' : targetState === 'todo' ? 'todo' : 'pause';
+      api(`/api/workitems/${draft.base}`, { method: 'PATCH', body: JSON.stringify(fields) })
+        .then(() => postAction(draft.base, stateAction))
+        .then(() => { toast(`Saved as ${targetState}`); return done(); })
+        .catch(e => toast('Save failed: ' + e.message));
+    } else {
+      d.state = targetState;
+      const what = mode === 'followup' ? 'Follow-up' : mode === 'clone' ? 'Clone' : 'WorkItem';
+      api('/api/workitems', { method: 'POST', body: JSON.stringify(d) })
+        .then(r => {
+          toast(r.warning ? `${what} created — warning: ${r.warning}` : `${what} created as ${targetState}`);
+          return done();
+        })
+        .catch(e => toast('Create failed: ' + e.message));
+    }
+    return;
+  }
+
   d.state = targetState;
   if (draft.mode === 'edit') {
     const idx = items.findIndex(i => i.workid === draft.base);
@@ -1026,9 +1136,47 @@ function saveDraft(targetState){
 
 /* ------------------------------------------------------------------ actions */
 
+async function postAction(id, action){
+  return api(`/api/workitems/${id}/action`, { method: 'POST', body: JSON.stringify({ action }) });
+}
+
 function doAction(act, id){
   const item = items.find(i => i.workid === id);
   if (!item) return;
+  if (LIVE) {
+    // Clone and follow-up stay client-side (they open the prefilled form; the POST
+    // happens on save). Everything else is a server action + reload.
+    if (act === 'clone') { openForm('clone', item); return; }
+    if (act === 'followup') { openForm('followup', item); return; }
+    if (act === 'delete') {
+      openLb('Delete work item?', `
+        <p style="margin-top:0">This permanently removes <b>${esc(item.title)}</b>
+        <span class="mono">(${shortId(item)})</span> from the queue. The engine keeps no copy.</p>`,
+        `<button class="btn" data-lbclose>Cancel</button>
+         <button class="btn danger" id="confirmDelete">Delete</button>`);
+      $('confirmDelete').addEventListener('click', () => {
+        postAction(id, 'delete').then(() => { closeLb(); toast('Deleted'); return loadAll(); })
+          .catch(e => toast('Delete failed: ' + e.message));
+      });
+      return;
+    }
+    if (act === 'pauseedit') {
+      const prior = item.state;
+      postAction(id, 'pause')
+        .then(() => loadAll())
+        .then(() => {
+          const fresh = items.find(i => i.workid === id);
+          if (fresh) openForm('edit', fresh, prior);
+        })
+        .catch(e => toast('Pause failed: ' + e.message));
+      return;
+    }
+    const serverAction = act === 'queue' ? 'queue' : act === 'complete' ? 'complete' : act;
+    postAction(id, serverAction)
+      .then(r => { toast(`${shortId(item)} → ${r.state}`); return loadAll(); })
+      .catch(e => toast('Action failed: ' + e.message));
+    return;
+  }
   switch (act) {
     case 'queue':
       item.state = 'queued'; item.lasterror = '';
@@ -1104,6 +1252,13 @@ document.addEventListener('click', (e) => {
   if (t.id === 'collapseAll') { openIds.clear(); render(); return; }
   if (t.id === 'newItem') { openForm('create', null); return; }
   if (t.id === 'engineChip' || t.closest('#engineChip')) {
+    if (LIVE) {
+      const action = engineRunning ? 'pause' : 'resume';
+      api('/api/engine', { method: 'POST', body: JSON.stringify({ action }) })
+        .then(() => { toast(action === 'pause' ? 'Engine draining: finishing in-flight work' : 'Engine resumed'); refreshEngine(); })
+        .catch(e => toast('Engine: ' + e.message));
+      return;
+    }
     engineRunning = !engineRunning;
     const chip = $('engineChip');
     chip.dataset.engine = engineRunning ? 'running' : 'paused';
@@ -1192,33 +1347,81 @@ function barPanel(title, sub, data, labels, color, height){
     </details></div>`;
 }
 
-function renderDashboard(){
-  const c7 = HIST.comp.slice(-7).reduce((a,b)=>a+b,0);
-  const f7 = HIST.fail.slice(-7).reduce((a,b)=>a+b,0);
-  const cAll = HIST.comp.reduce((a,b)=>a+b,0), fAll = HIST.fail.reduce((a,b)=>a+b,0);
-  const running = items.filter(i => i.state === 'in-progress').length;
-  const tiles = [
-    [`${Math.round(100*c7/(c7+f7))}<small>%</small>`, 'Success rate · 7d'],
-    [`${(c7/168).toFixed(1)}<small>/hr</small>`, 'Completions per hour · 7d avg'],
-    [`24<small>m</small>`, 'Median cycle time · added → closed'],
-    [`${running}`, 'Agents running now'],
-    [`${items.length}`, 'Open work items'],
-    [`38<small>%</small>`, 'Agent-created handoffs · share of closed'],
-  ];
+let dashWindow = { days: 14, start: '', end: '' };
+
+function mockHistory(){
   const labels = histLabels();
-  const agentMax = Math.max(...HIST.byAgent.map(a => a[1]));
+  return {
+    days: HIST.comp.map((c, i) => ({ date: '2026-08-' + labels[i].split('/')[1], complete: c, failed: HIST.fail[i] })),
+    by_agent: Object.fromEntries(HIST.byAgent),
+    tiles: { success_pct: 97, per_hour: 1.4, median_cycle_sec: 1440, running: items.filter(i => i.state === 'in-progress').length, open: items.length, handoff_pct: 38 },
+  };
+}
+
+function fmtCycle(sec){
+  if (!sec) return '–';
+  if (sec < 120) return `${sec}<small>s</small>`;
+  if (sec < 7200) return `${Math.round(sec/60)}<small>m</small>`;
+  return `${(sec/3600).toFixed(1)}<small>h</small>`;
+}
+
+async function renderDashboard(){
+  let data;
+  if (LIVE) {
+    try {
+      const q = dashWindow.start && dashWindow.end
+        ? `start=${dashWindow.start}&end=${dashWindow.end}` : `days=${dashWindow.days}`;
+      data = await api('/api/history?' + q);
+    } catch (e) {
+      $('view-dashboard').innerHTML = `<div class="empty">API error: ${esc(e.message)}</div>`;
+      return;
+    }
+  } else {
+    data = mockHistory();
+  }
+  const comp = data.days.map(d => d.complete);
+  const fail = data.days.map(d => d.failed);
+  const labels = data.days.map(d => { const p = d.date.split('-'); return `${+p[1]}/${p[2]}`; });
+  const t = data.tiles;
+  const cAll = comp.reduce((a,b)=>a+b,0), fAll = fail.reduce((a,b)=>a+b,0);
+  const windowLabel = `${data.days.length} days`;
+  const tiles = [
+    [`${t.success_pct}<small>%</small>`, `Success rate · window`],
+    [`${t.per_hour < 0.1 && t.per_hour > 0 ? t.per_hour.toFixed(2) : t.per_hour.toFixed(1)}<small>/hr</small>`, 'Completions per hour · window avg'],
+    [fmtCycle(t.median_cycle_sec), 'Median cycle time · added → closed'],
+    [`${t.running}`, 'Agents running now'],
+    [`${t.open}`, 'Open work items'],
+    [`${t.handoff_pct}<small>%</small>`, 'Agent-created handoffs · share of closed'],
+  ];
+  const byAgent = Object.entries(data.by_agent).sort((a,b) => b[1]-a[1]);
+  const agentMax = Math.max(1, ...byAgent.map(a => a[1]));
   $('view-dashboard').innerHTML = `
+    <div class="projtools" style="margin-bottom:10px">
+      <label>Window:
+        <select id="dashDays">
+          ${[7,14,30].map(d => `<option value="${d}" ${dashWindow.days===d && !dashWindow.start ? 'selected':''}>${d} days</option>`).join('')}
+        </select></label>
+      <label>or <input type="date" id="dashStart" value="${dashWindow.start}"> – <input type="date" id="dashEnd" value="${dashWindow.end}"></label>
+      <button class="btn" id="dashApply">Apply range</button>
+    </div>
     <div class="tiles">${tiles.map(([n,l]) => `<div class="tile"><div class="tn">${n}</div><div class="tl2">${l}</div></div>`).join('')}</div>
     <div class="dashsplit">
       <div>
-        ${barPanel('Completions per day', `last 14 days · ${cAll} closed complete`, HIST.comp, labels, 'var(--s-complete-bg)', 170)}
-        ${barPanel('Failures per day', `last 14 days · ${fAll} closed failed (kept separate from completions — the pair isn't colorblind-safe stacked)`, HIST.fail, labels, 'var(--s-failed-bg)', 96)}
+        ${barPanel('Completions per day', `${windowLabel} · ${cAll} closed complete`, comp, labels, 'var(--s-complete-bg)', 170)}
+        ${barPanel('Failures per day', `${windowLabel} · ${fAll} closed failed (kept separate from completions — the pair isn't colorblind-safe stacked)`, fail, labels, 'var(--s-failed-bg)', 96)}
       </div>
-      <div class="panel"><h3>Completions by agent</h3><div class="sub">last 7 days</div>
-        ${HIST.byAgent.map(([name,v]) =>
-          `<div class="hbar"><span class="hname">${name}</span><div class="htrack"><div class="hfill" style="width:${Math.round(100*v/agentMax)}%"></div></div><span class="hval">${v}</span></div>`).join('')}
+      <div class="panel"><h3>Completions by agent</h3><div class="sub">${windowLabel}</div>
+        ${byAgent.length ? byAgent.map(([name,v]) =>
+          `<div class="hbar"><span class="hname">${esc(name)}</span><div class="htrack"><div class="hfill" style="width:${Math.round(100*v/agentMax)}%"></div></div><span class="hval">${v}</span></div>`).join('')
+          : '<div class="empty" style="padding:14px 0">no completions in this window</div>'}
       </div>
     </div>`;
+  $('dashDays').addEventListener('change', e => { dashWindow = { days: +e.target.value, start: '', end: '' }; renderDashboard(); });
+  $('dashApply').addEventListener('click', () => {
+    const s = $('dashStart').value, en = $('dashEnd').value;
+    if (s && en) { dashWindow = { days: 0, start: s, end: en }; renderDashboard(); }
+    else toast('Pick both start and end dates');
+  });
 }
 
 /* chart tooltips (delegated) */
@@ -1258,11 +1461,17 @@ const CONFIG = {
   },
 };
 
-function renderIlSettings(){
+async function renderIlSettings(){
+  let live = null;
+  if (LIVE) {
+    try { live = await api('/api/config'); } catch (e) { toast('Config: ' + e.message); }
+  }
+  const val = (section, key, fallback) =>
+    live && live[section] && live[section][key] !== undefined ? live[section][key] : fallback;
   const group = (name, obj, sub) => `<div class="setgroup"><h3>${name}</h3><div class="sub">${sub}</div>
     ${Object.entries(obj).map(([k,[v,why]]) =>
       `<div class="setrow"><label>${k}</label>
-       <input type="text" data-cfg="${name}.${k}" value="${esc(String(v))}">
+       <input type="text" data-cfg="${name}.${k}" data-num="${typeof v === 'number'}" value="${esc(String(val(name, k, v)))}">
        <span class="why">${why}</span></div>`).join('')}</div>`;
   $('view-ilsettings').innerHTML = `<div class="setform">
     ${group('engine', CONFIG.engine, 'Scheduler, locking, and retry behavior — .iter/.engine/config.json')}
@@ -1271,9 +1480,32 @@ function renderIlSettings(){
       <button class="btn" id="cfgReset">Reset to Defaults</button>
       <button class="btn primary" id="cfgSave">Save config.json</button>
     </div></div>`;
-  $('cfgSave').addEventListener('click', () =>
-    toast('config.json saved (mock) — engine applies it on its next tick'));
-  $('cfgReset').addEventListener('click', () => { renderIlSettings(); toast('Reset to defaults (unsaved)'); });
+  $('cfgSave').addEventListener('click', () => {
+    if (!LIVE) { toast('config.json saved (mock) — engine applies it on its next tick'); return; }
+    const out = { engine: {}, globalsettings: {} };
+    document.querySelectorAll('[data-cfg]').forEach(input => {
+      const [section, key] = input.dataset.cfg.split('.');
+      const raw = input.value.trim();
+      out[section][key] = input.dataset.num === 'true' ? (Number(raw) || 0) : raw;
+    });
+    api('/api/config', { method: 'PUT', body: JSON.stringify(out) })
+      .then(() => toast('config.json saved — engine applies it on its next tick'))
+      .catch(e => toast('Save failed: ' + e.message));
+  });
+  $('cfgReset').addEventListener('click', () => {
+    if (LIVE) {
+      const defaults = { engine: {}, globalsettings: {} };
+      for (const [section, obj] of Object.entries(CONFIG)) {
+        for (const [k, [v]] of Object.entries(obj)) defaults[section][k] = v;
+      }
+      api('/api/config', { method: 'PUT', body: JSON.stringify(defaults) })
+        .then(() => { toast('Reset to defaults and saved'); renderIlSettings(); })
+        .catch(e => toast('Reset failed: ' + e.message));
+      return;
+    }
+    renderIlSettings();
+    toast('Reset to defaults (unsaved)');
+  });
 }
 
 /* ---------------------------------------------------------------- projects */
@@ -1281,7 +1513,7 @@ function renderIlSettings(){
    the configured roots for *.iter.md files, sorted into node / use-case / plain
    context by frontmatter (level: / participants: / neither). */
 const LEVELS = ['project','context','container','component'];
-const MARKERS = [
+let MARKERS = [
   { key:'',                              level:'project',   name:'Paydaay Core Product',            desc:'Wage-access platform: intake, novation, and payout orchestration', uses:[] },
   { key:'infra',                         level:'context',   name:'Shared Infrastructure',           desc:'Cross-product platform services shared by every container', uses:[] },
   { key:'infra/seccomm',                 level:'context',   name:'Security and Communications',     desc:'Identity, authorization, and edge traffic for all products', uses:[] },
@@ -1303,9 +1535,23 @@ MARKERS.forEach(m => {
   m.depth = m.key ? m.key.split('/').length : 0;
   m.dir = m.key ? `./${m.key}` : '.';
   m.path = `${m.dir}/${(m.name.split(' ')[0] || 'node').toLowerCase().replace(/[^a-z0-9]/g,'')}.iter.md`;
+  m.provides = m.provides || [];
 });
+// mock interface stitching: provider/consumer ends referencing global interface ids
+MARKERS.find(m => m.key === 'core/intake/evidence-vault').provides = ['evidence-api'];
+MARKERS.find(m => m.key === 'core/intake/orchestrator').uses.push('evidence-api');
+MARKERS.find(m => m.key === 'core/payout').provides = ['payout-events'];
+MARKERS.find(m => m.key === 'core/intake/emancipator').uses.push('payout-events');
 
-const USECASES = [
+/* Interfaces: contracts BETWEEN nodes — aggregated globally (marker files can live
+   anywhere), referenced from nodes via uses:/provides:, never owned by the tree. */
+let INTERFACES = [
+  { id:'evidence-api',  kind:'http',  endpoint:'POST /v1/evidence', description:'Store and retrieve consent artifacts', file:'./core/intake/evidence-vault/evidence-api.iter.md' },
+  { id:'payout-events', kind:'kafka', endpoint:'topic: payouts.v2', description:'Settlement lifecycle events for downstream consumers', file:'./interfaces/payout-events.iter.md' },
+  { id:'payout-events', kind:'kafka', endpoint:'topic: payouts.v1', description:'LEGACY duplicate — rationalize with payouts.v2', file:'./core/payout/payout-events.iter.md' },
+];
+
+let USECASES = [
   { name:'Capital provider logs in to modify a Sentinel',
     desc:'Edge auth through policy check, then an orchestrated intake change',
     file:'./usecases/modify-sentinel.iter.md',
@@ -1320,9 +1566,29 @@ const USECASES = [
 ];
 
 let projUC = -1;          // -1 = no use-case filter
+let projIface = '';       // '' = no interface thread; else an interface id
 let projOrder = 'hierarchy';
 let projDepth = null;     // null = all levels; else index into LEVELS
 let openMarker = null;
+let projLoaded = !LIVE;
+
+async function loadProjects(){
+  if (!LIVE) return;
+  const scan = await api('/api/markers');
+  MARKERS = scan.nodes.map(n => ({
+    key: n.key, level: n.level || 'node', name: n.name, desc: n.description,
+    uses: n.uses || [], provides: n.provides || [], depth: n.depth,
+    dir: n.dir, path: n.path,
+  }));
+  USECASES = scan.usecases.map(u => ({ name: u.name, desc: u.description, file: u.file, steps: u.steps }));
+  INTERFACES = scan.interfaces.map(i => ({ id: i.id, kind: i.kind, endpoint: i.endpoint, description: i.description, file: i.file }));
+  projLoaded = true;
+  return scan;
+}
+
+function ifaceTouches(m, id){
+  return (m.uses || []).includes(id) || (m.provides || []).includes(id);
+}
 
 function orderedMarkers(){
   const list = MARKERS.slice();
@@ -1331,28 +1597,42 @@ function orderedMarkers(){
   return list;
 }
 
-function renderProjects(){
+async function renderProjects(){
+  if (LIVE && !projLoaded) {
+    try { await loadProjects(); } catch (e) {
+      $('view-projects').innerHTML = `<div class="empty">API error: ${esc(e.message)}</div>`;
+      return;
+    }
+  }
   const uc = projUC >= 0 ? USECASES[projUC] : null;
   const counts = LEVELS.map(l => MARKERS.filter(m => m.level === l).length);
+  const threaded = uc || projIface;
   const rows = orderedMarkers()
     .filter(m => projDepth === null || LEVELS.indexOf(m.level) <= projDepth)
     .map(m => {
-      const step = uc && uc.steps[m.key];
-      const dim = uc && !step;
+      const step = uc ? uc.steps[m.key]
+        : (projIface && ifaceTouches(m, projIface)
+            ? (m.provides.includes(projIface) ? 'prov' : 'uses') : '');
+      const dim = threaded && !step;
       const indent = projOrder === 'hierarchy' ? m.depth * 22 : 0;
       const open = openMarker === m.key;
+      const ifaceOf = (u) => INTERFACES.some(i => i.id === u);
       return `
       <div class="prow ${dim?'dimmed':''} ${step?'participant':''}" data-marker="${esc(m.key)}"
            role="button" tabindex="0" style="padding-left:${8+indent}px">
         <span class="lvltag" style="background:var(--lvl-${m.level}-bg, var(--surface2));color:var(--lvl-${m.level}-fg, var(--text))">${esc(m.level)}</span>
         <span class="pname">${esc(m.name)}</span>
         <span class="pdesc">${esc(m.desc)}</span>
-        <span class="uses">${m.uses.map(u => `<span class="useb">${esc(u)}</span>`).join('')}</span>
+        <span class="uses">
+          ${m.provides.map(u => `<span class="useb prov ${ifaceOf(u)?'linked':''}" title="provides interface">▲ ${esc(u)}</span>`).join('')}
+          ${m.uses.map(u => `<span class="useb ${ifaceOf(u)?'linked':''}" title="${ifaceOf(u)?'uses declared interface':'uses (no interface declared)'}">${esc(u)}</span>`).join('')}
+        </span>
         ${step ? `<span class="step">${esc(step)}</span>` : ''}
       </div>
       ${open ? `<div class="pdetail">
         <div class="dlabel">Marker</div><div class="mono">${esc(m.path)}</div>
         <div class="dlabel">CodePath</div><div class="mono">${esc(absCodepath(m.dir))}</div>
+        <div class="dlabel">Provides</div><div>${m.provides.length ? m.provides.map(u=>`<span class="useb prov">▲ ${esc(u)}</span>`).join(' ') : '<span style="color:var(--text-dim)">—</span>'}</div>
         <div class="dlabel">Uses</div><div>${m.uses.length ? m.uses.map(u=>`<span class="useb">${esc(u)}</span>`).join(' ') : '<span style="color:var(--text-dim)">—</span>'}</div>
         <div class="dlabel">Use-cases</div><div>${USECASES.filter(u=>u.steps[m.key]).map(u=>`${esc(u.name)} <b class="mono">(${u.steps[m.key]})</b>`).join('<br>') || '<span style="color:var(--text-dim)">not a participant</span>'}</div>
         <div class="actions">
@@ -1361,6 +1641,23 @@ function renderProjects(){
         </div>
       </div>` : ''}`;
     }).join('');
+
+  // Interfaces: global aggregation, duplicate ids flagged for rationalization.
+  const idCounts = {};
+  INTERFACES.forEach(i => { idCounts[i.id] = (idCounts[i.id] || 0) + 1; });
+  const ifaceRows = INTERFACES.map(i => {
+    const providers = MARKERS.filter(m => m.provides.includes(i.id));
+    const consumers = MARKERS.filter(m => m.uses.includes(i.id));
+    const on = projIface === i.id;
+    return `<div class="prow ${on?'participant':''}" data-iface="${esc(i.id)}" role="button" tabindex="0" title="Click to thread providers/consumers in the tree">
+      <span class="kindchip k-${esc(i.kind || 'other')}">${esc(i.kind || '?')}</span>
+      <span class="pname mono">${esc(i.id)}</span>
+      ${idCounts[i.id] > 1 ? '<span class="dupflag">duplicate id — rationalize</span>' : ''}
+      ${i.endpoint ? `<span class="useb mono">${esc(i.endpoint)}</span>` : ''}
+      <span class="pdesc">${esc(i.description)}</span>
+      <span class="uses"><span class="useb prov">▲ ${providers.length}</span><span class="useb">${consumers.length} consumer${consumers.length===1?'':'s'}</span></span>
+    </div>`;
+  }).join('');
 
   $('view-projects').innerHTML = `
     <div class="projtools">
@@ -1378,17 +1675,27 @@ function renderProjects(){
       <button class="btn" id="rescan" style="margin-left:auto">Rescan Markers</button>
     </div>
     ${uc ? `<div class="sub" style="color:var(--text-dim);margin:0 0 8px;font-size:12.5px"><b style="color:var(--thread)">USE-CASE:</b> ${esc(uc.desc)} · participants numbered, others dimmed · <span class="mono">${esc(uc.file)}</span></div>` : ''}
+    ${projIface ? `<div class="sub" style="color:var(--text-dim);margin:0 0 8px;font-size:12.5px"><b style="color:var(--thread)">INTERFACE THREAD:</b> <span class="mono">${esc(projIface)}</span> · ▲ providers and consumers highlighted — a derived thread, no authoring needed · click the interface again to clear</div>` : ''}
     <div class="legendbar">
       ${LEVELS.map((l,i) => `<button class="lvlchip ${projDepth===i?'active':''}" data-depth="${i}"
         style="background:var(--lvl-${l}-bg);color:var(--lvl-${l}-fg)">${l} · ${counts[i]}</button>`).join('')}
       <span class="lhint">click a level to collapse below it · markers: <span class="mono">**/*.iter.md</span> with <span class="mono">level:</span> frontmatter</span>
     </div>
-    <div class="ptree">${rows || '<div class="empty">No markers found — check scan roots in Project Settings.</div>'}</div>`;
+    <div class="ptree">${rows || '<div class="empty">No markers found — check scan roots in Project Settings.</div>'}</div>
+    <h3 style="margin:16px 0 6px;font-size:13.5px">Interfaces <span style="color:var(--text-dim);font-weight:500;font-size:12px">— global: aggregated across all scan roots, referenced by nodes via <span class="mono">provides:</span> / <span class="mono">uses:</span>, never owned by the tree</span></h3>
+    <div class="ptree">${ifaceRows || '<div class="empty">No interfaces declared yet — add a marker with <span class="mono">interface:</span> frontmatter.</div>'}</div>`;
 
-  $('projUc').addEventListener('change', e => { projUC = +e.target.value; renderProjects(); });
+  $('projUc').addEventListener('change', e => { projUC = +e.target.value; projIface = ''; renderProjects(); });
   $('projOrder').addEventListener('change', e => { projOrder = e.target.value; renderProjects(); });
-  $('rescan').addEventListener('click', () =>
-    toast('Scanned 2 roots: 16 nodes, 2 use-cases, 5 plain context docs (mock)'));
+  $('rescan').addEventListener('click', async () => {
+    if (!LIVE) { toast('Scanned 2 roots: 16 nodes, 3 interfaces, 2 use-cases, 5 plain docs (mock)'); return; }
+    try {
+      const scan = await api('/api/markers/rescan', { method: 'POST' });
+      projLoaded = false;
+      await renderProjects();
+      toast(`Scanned ${scan.roots.length} root(s): ${scan.nodes.length} nodes, ${scan.interfaces.length} interfaces, ${scan.usecases.length} use-cases, ${scan.plain.length} plain docs`);
+    } catch (e) { toast('Rescan failed: ' + e.message); }
+  });
 }
 
 function markerAncestors(key){
@@ -1402,9 +1709,21 @@ function projClick(e){
   const mk_ = e.target.closest('[data-mkworkitem]');
   if (mk_) {
     const m = MARKERS.find(x => x.key === mk_.dataset.mkworkitem);
-    const ctx = [m.path, ...markerAncestors(m.key).map(a => a.path)];
+    // Context = this node's marker + ancestor chain + the contracts it touches.
+    const ifaceFiles = INTERFACES
+      .filter(i => m.uses.includes(i.id) || m.provides.includes(i.id))
+      .map(i => i.file);
+    const ctx = [m.path, ...markerAncestors(m.key).map(a => a.path), ...ifaceFiles];
     openForm('create', mk({ codepath: m.dir, context: ctx, testfiles: [`${m.dir}/test/testgroups.iter.md`],
       title: '', mainwork: '', source: 'user' }));
+    return true;
+  }
+  const ifr = e.target.closest('[data-iface]');
+  if (ifr) {
+    const id = ifr.dataset.iface;
+    projIface = projIface === id ? '' : id;
+    projUC = -1;
+    renderProjects();
     return true;
   }
   const vm = e.target.closest('[data-viewmarker]');
@@ -1453,13 +1772,22 @@ document.addEventListener('click', (e) => {
 const PROJSET = {
   project_name: ['Paydaay Core Product', 'display name: sidebar, Projects root row'],
   url_slug: ['pdy-dev', 'hostname + tab title + favicon tint: http://pdy-dev.localhost:{port}/'],
-  scan_roots: ['~/dev/paydaay-core\n~/dev/paydaay-shared', 'directories searched for markers — one per line; may be outside this repo'],
+  scan_roots: ['.', 'directories searched for markers — one per line; may be outside this repo'],
   marker_glob: ['**/*.iter.md', 'ONE glob finds every iterapp file; frontmatter declares each file’s role (see legend above)'],
   testgroups_glob: ['**/testgroups.iter.md', 'test-group files aligned to nodes'],
-  default_context: ['{marker}\n{ancestor_markers}\n{codepath}/**/*bizreq.iter.md\n{codepath}/**/*techreq.iter.md', 'context prefilled on Create-WorkItem-from-node — one entry per line; placeholders in the legend above'],
+  default_context: ['{marker}\n{ancestor_markers}\n{interfaces}', 'context prefilled on Create-WorkItem-from-node — one entry per line; placeholders in the legend above'],
 };
+const PS_MULTILINE = ['scan_roots', 'default_context'];
 
-function renderIaSettings(){
+async function renderIaSettings(){
+  let live = null;
+  if (LIVE) {
+    try { live = await api('/api/projectsettings'); } catch (e) { toast('Settings: ' + e.message); }
+  }
+  const val = (k, fallback) => {
+    if (!live || live[k] === undefined) return fallback;
+    return Array.isArray(live[k]) ? live[k].join('\n') : String(live[k]);
+  };
   $('view-iasettings').innerHTML = `<div class="setform"><div class="setgroup">
     <h3>Project Settings</h3>
     <div class="sub">Marker discovery and Create-WorkItem defaults — stored in <span class="mono">.iter/projects.json</span></div>
@@ -1467,24 +1795,40 @@ function renderIaSettings(){
       <b>How markers work:</b> any file matching <span class="mono">marker_glob</span> is iterapp-meaningful;
       its <b>frontmatter declares its role</b> —
       <span class="mono">level:</span> → a node on the Projects map ·
+      <span class="mono">interface:</span> → a globally-aggregated interface contract ·
       <span class="mono">participants:</span> → a use-case thread ·
-      neither → a plain context doc (bizreq, techreq, testgroups, notes), attachable but never a map node.<br>
+      none → a plain context doc (bizreq, techreq, testgroups, notes), attachable but never a map node.<br>
       <b>Placeholders in default_context:</b>
       <span class="mono">{marker}</span> = the clicked node’s own .iter.md file ·
       <span class="mono">{ancestor_markers}</span> = markers of that node’s parent chain up to the project root ·
-      <span class="mono">{codepath}</span> = the node’s directory (anchors a glob to the work item’s own tree —
-      without it, globs search from the project root).
+      <span class="mono">{interfaces}</span> = the contract files for everything in the node’s uses:/provides: ·
+      <span class="mono">{codepath}</span> = the node’s directory (anchors a glob to the work item’s own tree).
     </div>
-    ${Object.entries(PROJSET).map(([k,[v,why]]) => v.includes('\n')
-      ? `<div class="setrow wide"><label>${k}</label><textarea rows="${v.split('\n').length + 1}" data-ps="${k}">${esc(v)}</textarea></div>
-         <div class="setrow wide"><span></span><span class="why">${why}</span></div>`
-      : `<div class="setrow"><label>${k}</label><input type="text" data-ps="${k}" value="${esc(v)}"><span class="why">${why}</span></div>`).join('')}
+    ${Object.entries(PROJSET).map(([k,[v,why]]) => {
+      const value = val(k, v);
+      return PS_MULTILINE.includes(k)
+        ? `<div class="setrow wide"><label>${k}</label><textarea rows="${value.split('\n').length + 1}" data-ps="${k}">${esc(value)}</textarea></div>
+           <div class="setrow wide"><span></span><span class="why">${why}</span></div>`
+        : `<div class="setrow"><label>${k}</label><input type="text" data-ps="${k}" value="${esc(value)}"><span class="why">${why}</span></div>`;
+    }).join('')}
     <div class="setfoot">
       <button class="btn" id="psReset">Reset</button>
       <button class="btn primary" id="psSave">Save projects.json</button>
     </div></div></div>`;
-  $('psSave').addEventListener('click', () => toast('projects.json saved (mock) — rescan to apply new globs'));
-  $('psReset').addEventListener('click', () => { renderIaSettings(); toast('Reset (unsaved)'); });
+  $('psSave').addEventListener('click', () => {
+    if (!LIVE) { toast('projects.json saved (mock) — rescan to apply new globs'); return; }
+    const out = {};
+    document.querySelectorAll('[data-ps]').forEach(el => {
+      const k = el.dataset.ps;
+      out[k] = PS_MULTILINE.includes(k)
+        ? el.value.split('\n').map(s => s.trim()).filter(Boolean)
+        : el.value.trim();
+    });
+    api('/api/projectsettings', { method: 'PUT', body: JSON.stringify(out) })
+      .then(() => { toast('projects.json saved — rescan to apply new globs'); projLoaded = false; })
+      .catch(e => toast('Save failed: ' + e.message));
+  });
+  $('psReset').addEventListener('click', () => { renderIaSettings(); toast('Reloaded from disk'); });
 }
 
 /* -------------------------------------------------- multi-server identity */
@@ -1505,33 +1849,66 @@ function slugColor(slug){
 
 /* favicon: an SVG dot tinted by slug hash, carrying the slug's initial —
    with ten tabs open, color beats text */
-(function setFavicon(){
+let faviconLink = null;
+function setFavicon(slug){
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
-    <circle cx="8" cy="8" r="7" fill="${slugColor(SLUG)}"/>
+    <circle cx="8" cy="8" r="7" fill="${slugColor(slug)}"/>
     <text x="8" y="11.6" font-size="9.5" text-anchor="middle" fill="#fff"
-      font-family="sans-serif" font-weight="700">${SLUG[0].toUpperCase()}</text></svg>`;
-  const link = document.createElement('link');
-  link.rel = 'icon';
-  link.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
-  document.head.appendChild(link);
-})();
+      font-family="sans-serif" font-weight="700">${(slug[0] || 'i').toUpperCase()}</text></svg>`;
+  if (!faviconLink) {
+    faviconLink = document.createElement('link');
+    faviconLink.rel = 'icon';
+    document.head.appendChild(faviconLink);
+  }
+  faviconLink.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
+}
+setFavicon(SLUG);
 
-(function renderServers(){
-  $('serverSwitch').innerHTML = SERVERS.map(s => `
+let servers = SERVERS;
+
+async function renderServers(){
+  if (LIVE) {
+    try {
+      const rows = await api('/api/servers');
+      servers = rows.map(r => ({
+        name: r.project_name, slug: r.url_slug, port: r.port,
+        current: String(r.port) === location.port,
+      }));
+    } catch (e) { servers = []; }
+  }
+  $('serverSwitch').innerHTML = servers.map(s => `
     <a href="#" class="srv ${s.current ? 'here' : ''}" data-server="${esc(s.slug)}"
        title="http://${esc(s.slug)}.localhost:${s.port}/">
       <span class="dot" style="background:${slugColor(s.slug)}"></span>
-      ${esc(s.slug)}${s.current ? '' : ''}
-      <small>:${s.port}</small></a>`).join('');
-  $('serverSwitch').addEventListener('click', (e) => {
-    const a = e.target.closest('[data-server]');
-    if (!a) return;
-    e.preventDefault();
-    const s = SERVERS.find(x => x.slug === a.dataset.server);
-    toast(s.current ? 'This server' : `(mock) would open http://${s.slug}.localhost:${s.port}/`);
-  });
-})();
+      ${esc(s.slug)}
+      <small>:${s.port}</small></a>`).join('')
+    || '<span style="color:var(--text-dim);font-size:11.5px;padding:2px 9px">only this one</span>';
+}
+
+$('serverSwitch').addEventListener('click', (e) => {
+  const a = e.target.closest('[data-server]');
+  if (!a) return;
+  e.preventDefault();
+  const s = servers.find(x => x.slug === a.dataset.server);
+  if (!s || s.current) { toast('This server'); return; }
+  if (LIVE) window.open(`http://localhost:${s.port}/`, '_blank');
+  else toast(`(mock) would open http://${s.slug}.localhost:${s.port}/`);
+});
 
 render();
 navTo(location.hash.replace(/^#\//,'') || 'workitems');
+renderServers();
+if (LIVE) {
+  loadAll().then(refreshEngine);
+  setInterval(refreshEngine, 5000);
+  const es = new EventSource('/api/events');
+  let debounce;
+  es.onmessage = () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => {
+      loadAll().then(refreshEngine);
+      if (document.getElementById('view-dashboard').classList.contains('active')) renderDashboard();
+    }, 250);
+  };
+}
 </script>

@@ -157,33 +157,38 @@ impl Queue {
         }
     }
 
-    pub fn save(&self, items: &[WorkItem]) -> std::io::Result<()> {
+    /// The ONE mutation path: hold the record lock across load → modify → write, so
+    /// concurrent writers (engine workers, the API server, `iter add` from agents)
+    /// can never save over each other's changes.
+    pub fn with_lock<T>(&self, f: impl FnOnce(&mut Vec<WorkItem>) -> T) -> std::io::Result<T> {
         let _guard = locks::acquire_file_lock(
             &self.open_path,
             self.cfg.engine.queue_lock_retry_ms,
             self.cfg.engine.queue_lock_break_sec,
         )?;
+        let mut items = self.load();
+        let result = f(&mut items);
         let mut text = String::new();
-        for item in items {
+        for item in &items {
             text.push_str(&serde_json::to_string(item).expect("workitem serializes"));
             text.push('\n');
         }
         let tmp = self.open_path.with_extension("jsonl.tmp");
         std::fs::write(&tmp, &text)?;
         std::fs::rename(&tmp, &self.open_path)?;
-        Ok(())
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
+    pub fn save(&self, items: &[WorkItem]) -> std::io::Result<()> {
+        let replacement: Vec<WorkItem> = items.to_vec();
+        self.with_lock(move |list| *list = replacement)
     }
 
     /// Append one item under the record-lock protocol (external-producer path).
     pub fn append(&self, item: &WorkItem) -> std::io::Result<()> {
-        let _guard = locks::acquire_file_lock(
-            &self.open_path,
-            self.cfg.engine.queue_lock_retry_ms,
-            self.cfg.engine.queue_lock_break_sec,
-        )?;
-        let mut line = serde_json::to_string(item).expect("workitem serializes");
-        line.push('\n');
-        append_to(&self.open_path, &line)
+        let item = item.clone();
+        self.with_lock(move |items| items.push(item))
     }
 
     pub fn append_closed(&self, item: &WorkItem) -> std::io::Result<()> {
@@ -192,22 +197,28 @@ impl Queue {
         append_to(&self.closed_path, &line)
     }
 
-    /// Load, apply `f` to the item with `workid`, save. Returns false if not found.
+    pub fn load_closed(&self) -> Vec<WorkItem> {
+        let text = std::fs::read_to_string(&self.closed_path).unwrap_or_default();
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<WorkItem>(l).ok())
+            .collect()
+    }
+
+    /// Apply `f` to the item with `workid` under the lock. Returns false if not found.
     pub fn mutate(&self, workid: &str, f: impl FnOnce(&mut WorkItem)) -> std::io::Result<bool> {
-        let mut items = self.load();
-        let Some(item) = items.iter_mut().find(|i| i.workid == workid) else {
-            return Ok(false);
-        };
-        f(item);
-        self.save(&items)?;
-        Ok(true)
+        self.with_lock(|items| match items.iter_mut().find(|i| i.workid == workid) {
+            Some(item) => {
+                f(item);
+                true
+            }
+            None => false,
+        })
     }
 
     /// Close an item out: remove from the open queue, append to the closed file.
     pub fn close(&self, item: &WorkItem) -> std::io::Result<()> {
-        let mut items = self.load();
-        items.retain(|i| i.workid != item.workid);
-        self.save(&items)?;
+        self.with_lock(|items| items.retain(|i| i.workid != item.workid))?;
         self.append_closed(item)
     }
 }
@@ -220,19 +231,17 @@ fn append_to(path: &Path, line: &str) -> std::io::Result<()> {
 
 /// Startup crash recovery: any in-progress item was orphaned by a dead engine.
 pub fn recover_orphans(queue: &Queue) -> std::io::Result<usize> {
-    let mut items = queue.load();
-    let mut count = 0;
-    for item in items.iter_mut() {
-        if item.state == STATE_IN_PROGRESS {
-            item.state = STATE_QUEUED.into();
-            item.lasterror = format!("orphaned in-progress at engine startup {}", now_iso());
-            count += 1;
+    queue.with_lock(|items| {
+        let mut count = 0;
+        for item in items.iter_mut() {
+            if item.state == STATE_IN_PROGRESS {
+                item.state = STATE_QUEUED.into();
+                item.lasterror = format!("orphaned in-progress at engine startup {}", now_iso());
+                count += 1;
+            }
         }
-    }
-    if count > 0 {
-        queue.save(&items)?;
-    }
-    Ok(count)
+        count
+    })
 }
 
 #[cfg(test)]
