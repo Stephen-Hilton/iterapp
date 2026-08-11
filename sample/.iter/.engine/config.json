@@ -1,0 +1,23 @@
+{
+    "engine": {
+        "tick_interval_sec": 5,
+        "agent_stagger_ms": 100,
+        "queue_lock_retry_ms": 50,
+        "queue_lock_break_sec": 60,
+        "codepath_lock_timeout_sec": 3600,
+        "codepath_conflict_backoff_sec": 15,
+        "max_total_agents": 8,
+        "max_open_workitems": 200,
+        "retry_backoff_sec": 300,
+        "max_attempts": 3
+    },
+    "globalsettings": {
+        "test_min": 20,
+        "test_max": 100,
+        "test_default_path": "./test*/",
+        "log_default_path": "./logs/{YYYYMMDD-hh}.log",
+        "log_level": "info",
+        "log_max_size_mb": 10,
+        "log_max_files": 50
+    }
+}

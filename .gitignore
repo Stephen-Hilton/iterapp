@@ -1,0 +1,12 @@
+# Rust
+/target
+
+# iterloop runtime artifacts
+*.iter.lock
+.iter/.engine/stop.signal
+**/.iter/.engine/stop.signal
+workitems.jsonl.lock
+logs/
+
+# OS
+.DS_Store
