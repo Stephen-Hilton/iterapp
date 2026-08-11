@@ -1,0 +1,306 @@
+# Iterloop Web App — Feature Specification (v1: Work Items page)
+
+A local web interface wrapped around the iterloop engine. One executable serves both:
+the engine loop and a small web server presenting a localhost URL for maintenance and
+investigation (per the deployment note in [iterloop.md](iterloop.md)).
+
+Source mockup: Google Slides, slide 1 ("IterLoop / Work Items"). Slide 2 ("IterApp /
+Projects" — the C4 project hierarchy with use-case filtering) is a future page; it is
+inventoried here but **out of scope** for this build.
+
+## Priorities (locked 2026-08-11)
+
+1. Easy to use, intuitive, highly interactive.
+2. Information dense but fast to understand — important details legible at a glance.
+3. Big summary buttons on top double as filters when clicked.
+4. Work-item detail slides down in place when a row is clicked.
+5. Iterate on a standalone HTML mockup first (`src/webapp/mockup.html`); merge into the
+   Rust binary only after the design settles.
+
+## Page inventory
+
+| Page | Status |
+|---|---|
+| **Work Items** (slide 1) | **specified below; mockup complete** |
+| **Dashboard** | **initial version specified below** — queue history, productivity metrics |
+| **Iterloop Settings** | **initial version specified below** — edit engine/global config |
+| **Projects** (slide 2 / Code Canvas visual) | **initial version specified below** — marker-file project model |
+| **Project Settings** (ITERAPP → Settings) | **initial version specified below** — scan roots, marker globs |
+
+## Layout — Work Items page
+
+### Chrome
+- **Header**: `IterLoop / Work Items` title, left. Right: **engine state chip**
+  (`Running` / `Paused` / `Stopped` / `Draining`), colored, always visible. Clicking it
+  offers the engine controls (pause = write `stop.signal` drain; resume = clear).
+- **Left sidebar**: two nav groups — ITERLOOP (Dashboard, Work Items, Settings) and
+  ITERAPP (Projects, Settings). Current page highlighted. Collapsible on narrow screens.
+
+### Summary buttons (top strip)
+Seven large colored buttons, each showing label + live count:
+
+| Button | Color | Filter |
+|---|---|---|
+| Total | purple | all items (open + closed) |
+| ✅ Complete | green | `complete` (from closed file) |
+| ⚙ In-Progress | amber | `in-progress` |
+| ⏱ Queued | blue | `queued` |
+| 📋 ToDo | pink | `todo` |
+| ✖ Failed | red | `failed` (open retry-eligible AND terminally closed) |
+| ⏸ Paused | orange | `paused` |
+
+Behavior: click = toggle that state filter (multi-select; Total resets to all). Active
+filters render pressed/inset. Counts update live. Below the strip, right-aligned:
+**Sort selector**, **Collapse All**, and **New WorkItem**.
+
+Sort options: **State** (default: lifecycle groups, effective priority within),
+**Date Requested** (newest first), **Date Completed** (incomplete on top, then newest
+completion first), **Priority** (effective, error-source boost included), **Agent
+Assigned** (type), **Requested By** (source).
+
+### Work-item row (collapsed)
+One dense two-line row per item, ordered by state group then priority. Left to right,
+top to bottom (exact order locked):
+
+1. **Big state icon** — instant read of overall state (✅ ⚙ ⏱ 📋 ✖ ⏸), colored block
+   spanning both lines.
+2. **Title** — across the entire top line, single line, ellipsized.
+3. Badge row: **state** (colored pill) · **agent type** that does/did the work (`Code`)
+   · **P:7** priority · **R:3** risk · **source** entity that requested it (`Plan`
+   agent, any agent, or `user`) · **T:98/98 – 100%** test results as X/Y and percent ·
+   **A:1** attempts · **Requested:** ISO-8601 creation datetime · **ID:** last segment
+   of the UUID.
+4. **Actions** button — right edge, spans both lines, opens the context-aware menu.
+
+Row click (anywhere except Actions) toggles the slide-down detail.
+
+### Actions menu (context-aware by state)
+
+| Condition | Action | Effect |
+|---|---|---|
+| `in-progress` | **Clone only** | the engine is loosely coupled to the queue: while an agent runs the item, queue-side Complete/Pause/Delete wouldn't change engine behavior, so the menu offers only Clone (with a note explaining why) |
+| `todo` or `paused` | **Queue** | state → `queued` |
+| not `complete` / not `in-progress` | **Complete** | state → `complete`, close out |
+| not `complete` / not `in-progress` | **Pause & Edit** | state → `paused`, opens the edit lightbox; remembers the prior state as the save default |
+| `failed` | **Requeue (Retry)** | state → `queued` *(suggested addition — one-click retry instead of Pause→Queue; cut if unwanted)* |
+| `complete` | **Create Follow-up Request** | opens New WorkItem form pre-filled: same codepath/context/testfiles, `source` = user, title "Follow-up: …", empty mainwork |
+| any | **Clone** | duplicates every request element, new workid, state `todo` |
+| any | **Delete** | removes the work item (confirm dialog; hard delete from jsonl) |
+
+### Slide-down detail (expanded row)
+Slides open beneath the row; multiple rows may be open at once (Collapse All closes
+everything). Contents, top to bottom (mirrors the mockup):
+
+- **CodePath** — monospace, read-only in view mode, **always displayed absolute**.
+  Users may enter a relative path in the form; the UI (and later the API) resolves it
+  against the project root and stores it absolute — for clarity first, safety second.
+  `context` and `testfiles` stay relative (they read against the visible codepath),
+  unless they point outside it (e.g. a project-central or machine-central assignment).
+  Right-aligned: **full UUID**.
+- **Prework** — the full pool of `.iter/prepostwork/*` names rendered as pill toggles;
+  assigned steps highlighted, unassigned dimmed. View mode: read-only. Inline literal
+  prompts (not matching a file) render as an extra pill with a tooltip.
+- **Request** — the `mainwork` prompt, full text. Grows with content (both Request and
+  Output can run hundreds of lines) up to ~60% of the viewport, then scrolls — never a
+  two-line peephole.
+- **Postwork** — same pill treatment as Prework.
+- **Output** — the concatenated agent output, scrollable, monospace.
+- **Details buttons** → lightboxes:
+  - **View Test Details** — per-group results from the item's `testfiles`
+    (`testgroups.iter.md` blocks): group label, lastrun, result, counts, scripts.
+  - **View Time Records** — the `times` object as a timeline (added → start →
+    preworkdone → mainworkdone → postworkdone → closed) with computed durations.
+  - **View Context and Prompts** — `context` patterns + resolved files, source
+    instructions applied, and the composed turn sequence (labels + prompts).
+  - **View Logs** — engine log lines tagged with this item's worker (`[code#N]`).
+
+### New WorkItem / Edit form
+Same lightbox for create, edit (Pause & Edit), clone, and follow-up — identical layout
+to the slide-down detail, except **(A)** every field is editable and **(B)** the header
+badges become an editable section: title, type (agent selector from `.iter/agents/`),
+priority + risk sliders (0–10), source (defaults `user`), codepath, context patterns
+(one per line), testfiles. Prework/Postwork pills toggle on click; a free-text row
+appends inline literal steps. One form, one footer for every mode:
+`Cancel · [Create|Save] and set to · [Queued | ToDo | Paused]`. The selector chooses
+the state the item lands in; only the default differs — create/clone/follow-up default
+to **Queued**, Pause & Edit defaults to the item's state **before** it was paused
+(falling back to Queued if that state isn't a pre-processing one, e.g. failed). Output,
+times, and attempts are never editable.
+
+## Other pages (initial versions, locked 2026-08-11)
+
+All pages share the chrome (sidebar, engine chip) and live in the same single-page app;
+the sidebar routes client-side (`#/dashboard`, `#/workitems`, …).
+
+### Dashboard
+
+High-level queue history and productivity metrics. Everything derives from
+`workitems_closed.jsonl` (+ the open queue for "now" numbers) — no new storage.
+
+- **Stat tiles**: Success rate (7d, complete ÷ closed), Completions/hour (7d avg),
+  Median cycle time (added → closed), Active agents now, Open queue depth, Handoff
+  share (% of closed items with `agent:` source — how self-directed the loop is).
+- **Trend window** (locked 2026-08-11): selector offering **7 / 14 / 30 days**
+  (default 14) plus **custom start/end date** pickers; all panels share the window.
+- **Completions per day** — bar panel over the selected window.
+- **Failures per day** — its own small panel under the same x-axis. *Deliberately not
+  stacked with completions: the green/red pair fails colorblind-separation checks when
+  adjacent (validated, deutan ΔE 2.8) — small multiples read correctly for everyone.*
+- **Completions by agent type** — horizontal bars, last 7d, direct value labels.
+- Hover tooltips on all bars; each chart offers a table view for accessibility.
+- API: `GET /api/history?days=N` returns per-day buckets the server computes from the
+  closed file.
+
+### Iterloop Settings
+
+A form over `.iter/.engine/config.json`, one field per key, grouped **engine** vs
+**globalsettings**, with the same defaults the engine uses. Save writes the file
+atomically (same tmp+rename as the queue); the engine picks changes up on its next
+tick (agents/config are re-read per tick already). Numeric fields validate ranges;
+unknown keys found in the file are preserved untouched.
+
+### Projects
+
+Model and maintain large project codebases that iterloop builds from — the Code
+Canvas visual (hierarchy rows, colored level chips, use-case thread), but with a
+decisive data-model difference: **content lives in distributed in-code marker files,
+not a central definition file**, and the page is **loosely coupled to the work-item
+queue** — its one write-path into execution is submitting work items.
+
+**Marker files.** A node exists because a marker file exists near the code it
+describes, e.g. `./src/some/path/some_file_name.iter.context.md`:
+
+```markdown
+---
+name: Evidence Vault
+level: component          # free-form label; project/context/container/component suggested, not enforced
+description: "10-word summary shown in the hierarchy row"
+parent: core-intake       # OPTIONAL — overrides the default (nearest ancestor marker by directory)
+uses: [postgres, vault]   # shared resources / interfaces, shown as badges
+---
+Free markdown body: THE context handed to agents working under this node —
+requirements, interfaces, constraints. The marker IS the context file.
+```
+
+- **Hierarchy is derived, not declared**: nearest-ancestor-marker by directory nesting
+  builds the tree; `parent:` overrides for cross-cutting nodes. This keeps the data
+  distributed AND decouples structure from a strict C4 hierarchy — nest contexts in
+  contexts, skip levels, invent levels; the page renders whatever depth exists.
+- **Levels are free-form, C4 by default** (locked 2026-08-11): out of the box the
+  vocabulary is `project / context / container / component` — zero configuration, and
+  that's the whole story for most users. Advanced users may define custom levels
+  (name + chip color, ordered) in Project Settings; any `level:` value not in the
+  list still renders, with a neutral chip. Explaining it stays one sentence: *"use
+  the C4 names, or define your own list in Project Settings."*
+- **Read-only by design** (locked 2026-08-11): the page never edits marker files.
+  Changing the model = a work item that edits the marker — the loop maintains its own
+  map. The one write path into execution is Create WorkItem.
+- **Use-cases are their own marker type** (`*.iter.usecase.md`): a name, description,
+  and an ordered participant list (`- 2.1 core-intake/orchestrator`). The red thread
+  and step numbers render from it; structure files never mention use-cases.
+- **Discovery by search**: the engine scans configured roots for the marker globs
+  (Project Settings) and caches to `.iter/.engine/markers.json`; a **Rescan** button
+  (and later a file-watcher) refreshes. Ultimate flexibility: adding a node to the
+  model = dropping a file in the tree, same extensibility rule as `.iter/` itself.
+- **Queue coupling (loose, one-way)**: every node row offers **Create WorkItem** —
+  opens the standard form prefilled with `codepath` = the marker's directory and
+  `context` = the marker file plus its ancestor chain. The marker body becomes agent
+  context automatically; processing then flows through the normal queue.
+- Page furniture: level-chip legend (doubles as depth filter), order-by
+  (Hierarchy | Level | Name), use-case filter (participants highlighted with step
+  numbers, non-participants dimmed), per-row expand with marker path / codepath /
+  uses / View Marker lightbox.
+- API: `GET /api/markers`, `POST /api/markers/rescan`.
+
+**Why markers beat a central file here** (suggestions, adopted in this spec): the
+marker doubles as the agent-context document, so the model and the prompts can't
+drift apart; `testgroups.iter.md` naturally sits beside its component's marker,
+aligning the test tree with the model; and git ownership of a node follows the code
+it describes (a component team owns its marker like its code).
+
+### Project Settings (ITERAPP → Settings)
+
+Kept — it earns its place as the home of marker discovery config: project name,
+**scan roots** (multiple; can point outside the repo), **marker glob** (default
+`**/*.iter.context.md`), **use-case glob** (default `**/*.iter.usecase.md`),
+default context attachments for Create-WorkItem-from-node, the testgroups glob, and
+(advanced) **custom level definitions** — ordered `{name, color}` list overriding the
+C4 default vocabulary. Stored in `.iter/projects.json` (extensible area —
+user-editable, engine-read).
+
+## Data mapping
+
+Everything renders from existing engine files — no schema change required except one:
+
+| UI element | Source |
+|---|---|
+| Summary counts, rows | `.iter/.engine/workitems.jsonl` + `workitems_closed.jsonl` |
+| Engine state chip | `stop.signal` presence/content + engine liveness |
+| Prework/postwork pill pool | `.iter/prepostwork/*` filenames (minus extension) |
+| Agent type selector | `.iter/agents/*.md` basenames |
+| Test results badge | **new engine behavior**: on close-out, the engine parses the item's `testgroups.iter.md` blocks and stamps a `tests` summary onto the workitem (`{"passed":98,"total":98}`); UI shows `T:98/98 – 100%`. Until then: blank badge (`T:–`) |
+| Time records | `times` object |
+| Logs lightbox | engine log file filtered by worker tag |
+
+## API (merge phase)
+
+Served by the same binary — `iterloop serve --project <p> [--port 9779]`, or
+`iterloop run --serve` to run engine + web server together. Localhost only by default.
+A deterministic local port also gives scripts/agents a stable insert path.
+
+```
+GET    /api/state                      engine state + counts
+GET    /api/workitems?state=…          open + closed items, filterable
+POST   /api/workitems                  insert (same validation as `iterloop add`: warn
+                                       on unknown type, 409 at max_open_workitems)
+GET    /api/workitems/{id}             one item, full detail
+PATCH  /api/workitems/{id}             edit request fields (only todo/paused items)
+POST   /api/workitems/{id}/action      {queue|complete|pause|clone|followup|delete}
+GET    /api/meta                       agents, prepostwork pool, config
+GET    /api/workitems/{id}/tests       parsed testgroups for the item
+GET    /api/workitems/{id}/logs        matching engine log lines
+GET    /api/events                     SSE stream: queue changes, state transitions
+                                       (drives live counts + row updates)
+GET    /api/history?days=N             per-day closed-item buckets (dashboard)
+GET    /api/config                     engine + global settings
+PUT    /api/config                     write config.json (atomic tmp+rename)
+GET    /api/markers                    scanned project model (nodes + use-cases)
+POST   /api/markers/rescan             re-run marker discovery
+GET    /api/projectsettings            .iter/projects.json
+PUT    /api/projectsettings            write it back
+```
+
+All mutations go through the same record-lock protocol as `iterloop add`; the web
+server is just another external producer, so engine and UI can't corrupt the queue.
+
+## Build plan
+
+- [x] **W0 — digest mockup, write this spec** (2026-08-11)
+- [ ] **W1 — static interactive mockup** (`src/webapp/mockup.html`): single
+      self-contained HTML file, ~15 fake work items across all states; working summary
+      filters, slide-down, context-aware Actions (mutating in-page state), all four
+      lightboxes, New/Edit/Clone/Follow-up form, Collapse All, engine chip. Publish for
+      review; iterate to perfection.
+- [ ] **W1b — remaining pages in the mockup**: client-side router; Dashboard (tiles +
+      three chart panels, fake history); Iterloop Settings form; Projects hierarchy
+      with fake markers, use-case thread, depth legend, Create-WorkItem-from-node;
+      Project Settings form.
+- [ ] **W2 — freeze the design**: fold review feedback back into this spec; extract the
+      final CSS/JS structure the Rust server will embed.
+- [ ] **W3 — API layer**: `serve` subcommand (axum or tiny-http), endpoints above,
+      static page embedded via `include_str!`; `run --serve` runs both. Engine stamps
+      the `tests` summary on close-out.
+- [ ] **W4 — wire the page to the API**: replace fake data with `/api/*` + SSE live
+      updates; empty/error states; confirm dialogs on delete.
+- [ ] **W5 — E2E tests**: API tests with the fake runner (insert via POST during a run,
+      action transitions, cap refusal); a scripted browser smoke pass.
+
+## Open questions
+
+1. Terminal `failed` items live in the closed file — should Requeue/Clone reopen them
+   (copy back to the open queue with attempts reset)? (Mockup assumes yes for Clone,
+   Requeue only for open failed.)
+2. Datetime display: engine stores ISO-8601 UTC; show UTC (locked ISO look) or local
+   with a toggle? (Mockup: ISO UTC.)
+3. Delete semantics: hard-delete from jsonl, or move to closed with a `deleted` marker
+   for auditability? (Mockup: hard delete with confirm.)

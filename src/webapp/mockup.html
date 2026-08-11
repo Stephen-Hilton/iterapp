@@ -1,0 +1,1468 @@
+<title>IterLoop / Work Items</title>
+<style>
+  :root {
+    --bg: #f2f4f7;
+    --surface: #ffffff;
+    --surface2: #eaedf2;
+    --border: #d4d9e1;
+    --text: #191d24;
+    --text-dim: #5b6472;
+    --accent: #4557d0;
+    --accent-fg: #ffffff;
+    --shadow: 0 8px 28px rgba(20, 26, 40, 0.16);
+    --row-shadow: 0 1px 2px rgba(20, 26, 40, 0.07);
+
+    --s-total-bg: #7c3aed;   --s-total-fg: #ffffff;
+    --s-complete-bg: #1a9a4a; --s-complete-fg: #ffffff;
+    --s-progress-bg: #e8a71c; --s-progress-fg: #241a02;
+    --s-queued-bg: #2f7fd6;  --s-queued-fg: #ffffff;
+    --s-todo-bg: #d4589e;    --s-todo-fg: #ffffff;
+    --s-failed-bg: #d43a3a;  --s-failed-fg: #ffffff;
+    --s-paused-bg: #e07020;  --s-paused-fg: #ffffff;
+
+    --pill-on-bg: #4557d0;   --pill-on-fg: #ffffff;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161b;
+      --surface: #1d2027;
+      --surface2: #262a33;
+      --border: #363c48;
+      --text: #e8eaef;
+      --text-dim: #98a0ae;
+      --accent: #7986e8;
+      --accent-fg: #10121a;
+      --shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+      --row-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+      --s-progress-bg: #d99a15; --s-progress-fg: #1c1400;
+      --pill-on-bg: #6474e8; --pill-on-fg: #0e1118;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161b;
+    --surface: #1d2027;
+    --surface2: #262a33;
+    --border: #363c48;
+    --text: #e8eaef;
+    --text-dim: #98a0ae;
+    --accent: #7986e8;
+    --accent-fg: #10121a;
+    --shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+    --row-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --s-progress-bg: #d99a15; --s-progress-fg: #1c1400;
+    --pill-on-bg: #6474e8; --pill-on-fg: #0e1118;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .app { display: grid; grid-template-columns: 190px 1fr; min-height: 100vh; }
+
+  /* ---------- sidebar ---------- */
+  .side {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 18px 14px;
+  }
+  .side h1 { font-size: 17px; margin: 0 0 20px; letter-spacing: 0.2px; }
+  .side h1 .loop { color: var(--accent); }
+  .navgroup { margin-bottom: 22px; }
+  .navgroup .navhead {
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.12em;
+    color: var(--text-dim); text-transform: uppercase; margin-bottom: 6px;
+  }
+  .nav a {
+    display: block; padding: 5px 9px; border-radius: 6px;
+    color: var(--text-dim); text-decoration: none; margin-bottom: 1px;
+  }
+  .nav a:hover { background: var(--surface2); color: var(--text); }
+  .nav a.here { background: var(--surface2); color: var(--text); font-weight: 600; }
+
+  /* ---------- main ---------- */
+  .main { padding: 16px 22px 60px; min-width: 0; }
+  .topbar { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+  .topbar h2 { font-size: 18px; margin: 0; flex: 1; }
+  .enginechip {
+    display: inline-flex; align-items: center; gap: 8px;
+    border: 1px solid var(--border); background: var(--surface);
+    border-radius: 999px; padding: 5px 14px 5px 10px; font-weight: 600;
+  }
+  .enginechip .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .enginechip[data-engine="running"] .dot { background: var(--s-complete-bg); box-shadow: 0 0 0 3px rgba(26,154,74,.22); }
+  .enginechip[data-engine="paused"]  .dot { background: var(--s-paused-bg);  box-shadow: 0 0 0 3px rgba(224,112,32,.25); }
+  .enginechip .lbl { color: var(--text-dim); font-weight: 500; }
+
+  /* ---------- summary strip ---------- */
+  .summary { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; }
+  .sumbtn {
+    border: none; border-radius: 9px; padding: 9px 6px 7px;
+    display: grid; justify-items: center; gap: 1px;
+    box-shadow: var(--row-shadow);
+    transition: transform 60ms ease, filter 120ms ease, opacity 120ms ease;
+  }
+  .sumbtn .n { font-size: 21px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .sumbtn .t { font-size: 11.5px; font-weight: 600; opacity: 0.92; }
+  .sumbtn:hover { filter: brightness(1.06); }
+  .sumbtn:active { transform: translateY(1px); }
+  .summary.filtered .sumbtn:not(.on):not(.total) { opacity: 0.42; }
+  .sumbtn.on { box-shadow: inset 0 0 0 3px rgba(255,255,255,0.85), 0 0 0 2px var(--text); }
+
+  .toolrow { display: flex; justify-content: flex-end; gap: 8px; margin: 12px 0; align-items: center; }
+  .toolrow .hint { margin-right: auto; color: var(--text-dim); font-size: 12.5px; }
+  .sortlbl { display: inline-flex; align-items: center; gap: 7px; color: var(--text-dim); font-size: 12.5px; font-weight: 600; }
+  .sortlbl select {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 6px 8px; font: inherit; font-weight: 600;
+  }
+  .pathhint { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); margin-top: 5px; }
+  .btn {
+    border: 1px solid var(--border); background: var(--surface);
+    border-radius: 7px; padding: 6px 14px; font-weight: 600;
+  }
+  .btn:hover { background: var(--surface2); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+  .btn.primary:hover { filter: brightness(1.1); }
+  .btn.danger { color: var(--s-failed-bg); border-color: var(--s-failed-bg); }
+
+  /* ---------- work item rows ---------- */
+  .rows { display: grid; gap: 7px; }
+  .item {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 9px; box-shadow: var(--row-shadow); overflow: visible;
+  }
+  .rowhead {
+    display: grid; grid-template-columns: 46px 1fr auto; align-items: stretch;
+    cursor: pointer; border-radius: 9px;
+  }
+  .item.open .rowhead { border-radius: 9px 9px 0 0; }
+  .rowhead:hover { background: color-mix(in srgb, var(--surface2) 55%, var(--surface)); }
+  .stateicon {
+    display: grid; place-items: center; font-size: 21px; font-weight: 700;
+    border-radius: 8px 0 0 8px; color: #fff;
+  }
+  .item.open .stateicon { border-radius: 8px 0 0 0; }
+  .rowmid { padding: 7px 12px 7px 12px; min-width: 0; }
+  .title {
+    font-weight: 650; font-size: 13.5px; color: var(--accent);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .badges { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; align-items: center; }
+  .chip {
+    font-size: 11px; font-weight: 700; padding: 1.5px 8px; border-radius: 5px;
+    white-space: nowrap; font-variant-numeric: tabular-nums;
+  }
+  .chip.neutral { background: var(--surface2); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
+  .chip.kv { background: var(--surface2); border: 1px solid var(--border); }
+  .chip.meta { background: none; border: none; color: var(--text-dim); font-weight: 500; padding: 1.5px 2px; }
+  .chip.meta b { color: var(--text); font-weight: 600; }
+  .chip.mono { font-family: var(--mono); font-weight: 500; }
+  .actwrap { position: relative; display: grid; align-items: center; padding: 0 10px; }
+  .actbtn {
+    background: var(--accent); color: var(--accent-fg); border: none;
+    border-radius: 7px; padding: 7px 12px; font-weight: 700; font-size: 12.5px;
+  }
+  .actmenu {
+    position: absolute; right: 8px; top: calc(100% - 6px); z-index: 30;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+    box-shadow: var(--shadow); min-width: 210px; padding: 5px; display: none;
+  }
+  .actmenu.open { display: block; }
+  .actmenu button {
+    display: block; width: 100%; text-align: left; background: none; border: none;
+    padding: 7px 10px; border-radius: 6px; font-weight: 550;
+  }
+  .actmenu button:hover { background: var(--surface2); }
+  .actmenu button.danger { color: var(--s-failed-bg); }
+  .actmenu .sep { height: 1px; background: var(--border); margin: 4px 6px; }
+
+  /* ---------- slide-down detail ---------- */
+  .detailwrap { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 200ms ease; }
+  .item.open .detailwrap { grid-template-rows: 1fr; }
+  @media (prefers-reduced-motion: reduce) { .detailwrap { transition: none; } }
+  .detail { overflow: hidden; }
+  .detail-inner {
+    border-top: 1px solid var(--border); padding: 14px 16px 16px;
+    display: grid; grid-template-columns: 92px 1fr; gap: 10px 14px; align-items: start;
+  }
+  .dlabel { color: var(--text-dim); font-size: 12px; font-weight: 650; padding-top: 4px; }
+  .dvalrow { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .codepath {
+    font-family: var(--mono); font-size: 12.5px; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; flex: 1; min-width: 200px;
+  }
+  .fullid { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill {
+    font-size: 11.5px; font-weight: 600; border-radius: 999px; padding: 3px 11px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text-dim);
+  }
+  .pill.on { background: var(--pill-on-bg); border-color: var(--pill-on-bg); color: var(--pill-on-fg); }
+  .pill.inline-lit { border-style: dashed; font-style: italic; max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pill.toggle:hover { border-color: var(--accent); color: var(--text); }
+  .pill.toggle.on:hover { filter: brightness(1.1); color: var(--pill-on-fg); }
+  .textblock {
+    background: var(--surface2); border: 1px solid var(--border); border-radius: 7px;
+    padding: 9px 12px; font-size: 12.5px; max-height: 60vh; overflow: auto; white-space: pre-wrap;
+  }
+  .textblock.mono { font-family: var(--mono); font-size: 12px; }
+  .detailbtns { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* ---------- lightbox ---------- */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(12, 15, 22, 0.55); z-index: 100;
+    display: none; align-items: flex-start; justify-content: center; padding: 5vh 16px;
+  }
+  .overlay.open { display: flex; }
+  .lightbox {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: var(--shadow); width: min(860px, 100%); max-height: 88vh;
+    display: flex; flex-direction: column;
+  }
+  .lb-head {
+    display: flex; align-items: center; gap: 10px; padding: 13px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .lb-head h3 { margin: 0; font-size: 15px; flex: 1; }
+  .lb-head .x { background: none; border: none; font-size: 18px; color: var(--text-dim); padding: 2px 8px; border-radius: 6px; }
+  .lb-head .x:hover { background: var(--surface2); color: var(--text); }
+  .lb-body { padding: 16px 18px; overflow: auto; }
+  .lb-foot { padding: 12px 18px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; align-items: center; }
+  .lb-foot select {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 6px 8px; font: inherit; font-weight: 600;
+  }
+  .savegroup { display: inline-flex; gap: 6px; align-items: center; }
+  .actmenu .note { display: block; padding: 4px 10px 6px; font-size: 11.5px; color: var(--text-dim); }
+
+  table.t { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  table.t th { text-align: left; color: var(--text-dim); font-weight: 650; padding: 5px 10px; border-bottom: 1px solid var(--border); }
+  table.t td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  table.t td.mono, .mono { font-family: var(--mono); }
+
+  .timeline { display: grid; gap: 0; }
+  .tl { display: grid; grid-template-columns: 130px 190px 1fr; gap: 10px; padding: 7px 4px; border-bottom: 1px solid var(--border); font-size: 12.5px; align-items: baseline; }
+  .tl .st { font-weight: 650; }
+  .tl .ts { font-family: var(--mono); font-size: 12px; }
+  .tl .du { color: var(--text-dim); }
+
+  /* ---------- edit form ---------- */
+  .form { display: grid; grid-template-columns: 110px 1fr; gap: 11px 14px; align-items: center; }
+  .form .flabel { color: var(--text-dim); font-size: 12px; font-weight: 650; }
+  .form .top-align { align-self: start; padding-top: 6px; }
+  .form input[type="text"], .form textarea, .form select {
+    width: 100%; background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 7px; padding: 7px 10px; font: inherit;
+  }
+  .form textarea { font-family: var(--mono); font-size: 12.5px; resize: vertical; }
+  .form .inline { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  .form .inline label { display: flex; gap: 7px; align-items: center; color: var(--text-dim); font-size: 12.5px; font-weight: 600; }
+  .form input[type="range"] { accent-color: var(--accent); width: 130px; }
+  .rangeval { font-variant-numeric: tabular-nums; font-weight: 700; min-width: 2ch; color: var(--text); }
+
+  .toast {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: var(--bg); padding: 9px 18px; border-radius: 999px;
+    font-weight: 600; font-size: 13px; z-index: 200; opacity: 0; pointer-events: none;
+    transition: opacity 160ms ease;
+  }
+  .toast.show { opacity: 1; }
+
+  .empty { text-align: center; color: var(--text-dim); padding: 46px 0 30px; }
+
+  /* ---------- views / router ---------- */
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* ---------- dashboard ---------- */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 14px; }
+  .tile {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+    box-shadow: var(--row-shadow); padding: 11px 14px 9px;
+  }
+  .tile .tn { font-size: 24px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .tile .tn small { font-size: 13px; font-weight: 650; color: var(--text-dim); }
+  .tile .tl2 { font-size: 11.5px; color: var(--text-dim); font-weight: 600; margin-top: 1px; }
+  .panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+    box-shadow: var(--row-shadow); padding: 13px 16px 8px; margin-bottom: 10px;
+  }
+  .panel h3 { margin: 0 0 2px; font-size: 13.5px; }
+  .panel .sub { color: var(--text-dim); font-size: 11.5px; margin-bottom: 8px; }
+  .panel svg { display: block; width: 100%; height: auto; }
+  .panel details { margin: 4px 0 6px; }
+  .panel summary { color: var(--text-dim); font-size: 11.5px; cursor: pointer; }
+  .chartgrid line { stroke: var(--border); stroke-width: 1; }
+  .chartaxis text { fill: var(--text-dim); font-size: 10px; font-family: var(--sans); font-variant-numeric: tabular-nums; }
+  .bar { rx: 2; }
+  .bar:hover { filter: brightness(1.15); }
+  .charttip {
+    position: fixed; z-index: 300; pointer-events: none; display: none;
+    background: var(--text); color: var(--bg); font-size: 12px; font-weight: 600;
+    padding: 4px 9px; border-radius: 6px; white-space: nowrap;
+  }
+  .dashsplit { display: grid; grid-template-columns: 3fr 2fr; gap: 10px; align-items: start; }
+  @media (max-width: 1100px) { .dashsplit { grid-template-columns: 1fr; } }
+  .hbar { display: grid; grid-template-columns: 90px 1fr 40px; gap: 9px; align-items: center; padding: 4px 0; }
+  .hbar .hname { font-size: 12px; font-weight: 600; text-align: right; color: var(--text-dim); }
+  .hbar .htrack { background: var(--surface2); border-radius: 4px; height: 14px; }
+  .hbar .hfill { background: var(--accent); border-radius: 4px; height: 14px; min-width: 2px; }
+  .hbar .hval { font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+  /* ---------- settings forms ---------- */
+  .setform { max-width: 720px; }
+  .setgroup {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+    box-shadow: var(--row-shadow); padding: 14px 18px; margin-bottom: 10px;
+  }
+  .setgroup h3 { margin: 0 0 4px; font-size: 13.5px; }
+  .setgroup .sub { color: var(--text-dim); font-size: 12px; margin-bottom: 12px; }
+  .setrow { display: grid; grid-template-columns: 250px 160px 1fr; gap: 10px; align-items: center; padding: 4px 0; }
+  .setrow label { font-size: 12.5px; font-weight: 600; font-family: var(--mono); }
+  .setrow input, .setrow select, .setrow textarea {
+    background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 6px 10px; font: inherit; font-variant-numeric: tabular-nums;
+  }
+  .setrow .why { color: var(--text-dim); font-size: 11.5px; }
+  .setrow.wide { grid-template-columns: 250px 1fr; }
+  .setrow.wide textarea { font-family: var(--mono); font-size: 12px; }
+  .setfoot { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+
+  /* ---------- projects ---------- */
+  :root {
+    --lvl-project-bg: #cdedd6; --lvl-project-fg: #14532d;
+    --lvl-context-bg: #d5e6fa; --lvl-context-fg: #1e3a8a;
+    --lvl-container-bg: #f9d8ea; --lvl-container-fg: #831858;
+    --lvl-component-bg: #fde3c8; --lvl-component-fg: #7c3d05;
+    --thread: #c22a2e; --thread-bg: #fdf0f0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --lvl-project-bg: #1e3a28; --lvl-project-fg: #9fdcb4;
+      --lvl-context-bg: #1e3050; --lvl-context-fg: #a9c6f5;
+      --lvl-container-bg: #46203a; --lvl-container-fg: #f0aed3;
+      --lvl-component-bg: #4a3418; --lvl-component-fg: #f5c893;
+      --thread: #e05a5e; --thread-bg: #2a1b1b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --lvl-project-bg: #1e3a28; --lvl-project-fg: #9fdcb4;
+    --lvl-context-bg: #1e3050; --lvl-context-fg: #a9c6f5;
+    --lvl-container-bg: #46203a; --lvl-container-fg: #f0aed3;
+    --lvl-component-bg: #4a3418; --lvl-component-fg: #f5c893;
+    --thread: #e05a5e; --thread-bg: #2a1b1b;
+  }
+  .projtools { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .projtools label { display: inline-flex; gap: 7px; align-items: center; color: var(--text-dim); font-size: 12.5px; font-weight: 600; }
+  .projtools select {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 6px 8px; font: inherit; font-weight: 600; max-width: 340px;
+  }
+  .legendbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .lvlchip {
+    font-size: 11px; font-weight: 700; padding: 2px 10px; border-radius: 999px;
+    border: 1px solid transparent; cursor: pointer;
+  }
+  .lvlchip:hover { border-color: var(--text-dim); }
+  .lvlchip.active { border-color: var(--thread); box-shadow: 0 0 0 1px var(--thread); }
+  .legendbar .lhint { color: var(--text-dim); font-size: 11.5px; }
+  .ptree { background: var(--surface); border: 1px solid var(--border); border-radius: 9px; box-shadow: var(--row-shadow); overflow: hidden; }
+  .prow {
+    display: flex; align-items: center; gap: 8px; padding: 4px 12px 4px 8px;
+    border-bottom: 1px solid var(--border); cursor: pointer; min-height: 30px;
+  }
+  .prow:last-child { border-bottom: none; }
+  .prow:hover { background: color-mix(in srgb, var(--surface2) 55%, var(--surface)); }
+  .prow.dimmed { opacity: 0.38; }
+  .prow.participant { border-left: 3px solid var(--thread); padding-left: 5px; }
+  .prow .lvltag { flex: none; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 8px; }
+  .prow .pname { font-weight: 650; white-space: nowrap; }
+  .prow .pdesc { color: var(--text-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 40px; }
+  .prow .uses { display: flex; gap: 4px; flex: none; }
+  .prow .useb { font-size: 10px; padding: 1px 7px; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text-dim); font-family: var(--mono); }
+  .prow .step { flex: none; background: var(--thread); color: #fff; font-weight: 800; font-size: 11px; min-width: 30px; text-align: center; border-radius: 5px; padding: 1px 6px; font-variant-numeric: tabular-nums; }
+  .pdetail { border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--surface2) 40%, var(--surface)); padding: 10px 16px 12px; display: grid; grid-template-columns: 96px 1fr; gap: 7px 12px; font-size: 12.5px; cursor: default; }
+  .pdetail .dlabel { padding-top: 0; }
+  .pdetail .actions { grid-column: 2; display: flex; gap: 8px; margin-top: 3px; }
+
+  @media (max-width: 900px) {
+    .app { grid-template-columns: 1fr; }
+    .side { display: none; }
+    .summary { grid-template-columns: repeat(4, 1fr); }
+  }
+</style>
+
+<div class="app">
+  <aside class="side">
+    <h1>Iter<span class="loop">Loop</span></h1>
+    <div class="navgroup">
+      <div class="navhead">Iterloop</div>
+      <nav class="nav">
+        <a href="#/dashboard" data-view="dashboard">Dashboard</a>
+        <a href="#/workitems" data-view="workitems" class="here">Work Items</a>
+        <a href="#/ilsettings" data-view="ilsettings">Settings</a>
+      </nav>
+    </div>
+    <div class="navgroup">
+      <div class="navhead">Iterapp</div>
+      <nav class="nav">
+        <a href="#/projects" data-view="projects">Projects</a>
+        <a href="#/iasettings" data-view="iasettings">Settings</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <h2 id="pageTitle">Work Items</h2>
+      <button class="enginechip" id="engineChip" data-engine="running" title="Click to pause/resume the engine">
+        <span class="dot"></span><span class="lbl">IterLoop:</span><span id="engineState">Running</span>
+      </button>
+    </div>
+
+    <div class="view active" id="view-workitems">
+    <div class="summary" id="summary"></div>
+
+    <div class="toolrow">
+      <span class="hint" id="filterHint"></span>
+      <label class="sortlbl">Sort:
+        <select id="sortBy">
+          <option value="state">State</option>
+          <option value="requested">Date Requested</option>
+          <option value="completed">Date Completed</option>
+          <option value="priority">Priority</option>
+          <option value="agent">Agent Assigned</option>
+          <option value="source">Requested By</option>
+        </select>
+      </label>
+      <button class="btn" id="collapseAll">Collapse All</button>
+      <button class="btn primary" id="newItem">New WorkItem</button>
+    </div>
+
+    <div class="rows" id="rows"></div>
+    </div><!-- /view-workitems -->
+
+    <div class="view" id="view-dashboard"></div>
+    <div class="view" id="view-ilsettings"></div>
+    <div class="view" id="view-projects"></div>
+    <div class="view" id="view-iasettings"></div>
+  </main>
+</div>
+
+<div class="overlay" id="overlay" role="dialog" aria-modal="true">
+  <div class="lightbox">
+    <div class="lb-head"><h3 id="lbTitle"></h3><button class="x" id="lbClose" aria-label="Close">✕</button></div>
+    <div class="lb-body" id="lbBody"></div>
+    <div class="lb-foot" id="lbFoot"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="charttip" id="charttip"></div>
+
+<script>
+'use strict';
+
+/* ------------------------------------------------------------------ data */
+
+const PREPOST = ['deploy','git-commit','git-pr','git-pull','git-push','iterloop-stop','iterloop-wait-for-stop'];
+const AGENTS = ['plan','code','test','testwriter','refactor','ingest'];
+const PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // supplied by /api/meta once wired
+const HOME = '/Users/stephen.hilton';
+
+/* codepath is entered relative but always resolved and shown absolute */
+function absCodepath(cp){
+  cp = (cp || '.').trim();
+  if (cp.startsWith('/')) return cp.replace(/\/+$/,'') || '/';
+  if (cp === '~') return HOME;
+  if (cp.startsWith('~/')) return HOME + '/' + cp.slice(2).replace(/\/+$/,'');
+  cp = cp.replace(/^\.\//,'').replace(/\/+$/,'');
+  return cp === '' || cp === '.' ? PROJECT_ROOT : PROJECT_ROOT + '/' + cp;
+}
+
+const STATES = {
+  'in-progress': { label:'In-Progress', icon:'⟳', bg:'var(--s-progress-bg)', fg:'var(--s-progress-fg)', order:0 },
+  'queued':      { label:'Queued',      icon:'◷', bg:'var(--s-queued-bg)',   fg:'var(--s-queued-fg)',   order:1 },
+  'todo':        { label:'ToDo',        icon:'☐', bg:'var(--s-todo-bg)',     fg:'var(--s-todo-fg)',     order:2 },
+  'paused':      { label:'Paused',      icon:'❙❙', bg:'var(--s-paused-bg)',  fg:'var(--s-paused-fg)',   order:3 },
+  'failed':      { label:'Failed',      icon:'✕', bg:'var(--s-failed-bg)',   fg:'var(--s-failed-fg)',   order:4 },
+  'complete':    { label:'Complete',    icon:'✓', bg:'var(--s-complete-bg)', fg:'var(--s-complete-fg)', order:5 },
+};
+
+let seq = 0;
+function uuid() {
+  seq += 1;
+  const tail = (Date.now().toString(16) + Math.random().toString(16).slice(2)).slice(0, 12);
+  return `${rnd8()}-${rnd4()}-4${rnd4().slice(1)}-8${rnd4().slice(1)}-${tail}`;
+}
+function rnd8(){ return Math.random().toString(16).slice(2,10); }
+function rnd4(){ return Math.random().toString(16).slice(2,6); }
+function nowIso(){ return new Date().toISOString().replace(/\.\d+Z$/, 'Z'); }
+
+function mk(over) {
+  return Object.assign({
+    workid: uuid(), title:'', type:'code', state:'todo', source:'user',
+    priority:5, risk:0, codepath:'./src',
+    context:['./bizreq.md','./techreq.md'], testfiles:['./test/testgroups.iter.md'],
+    prework:[], mainwork:'', postwork:[], output:'', attempts:0, lasterror:'',
+    tests:null,
+    times:{ added:nowIso(), start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'' },
+  }, over);
+}
+
+let items = [
+  mk({ title:'Add --shout flag to greet: uppercase the entire greeting line per BR-4',
+    type:'code', state:'complete', source:'user', priority:6, risk:2, codepath:'./src',
+    prework:['git-pull'], postwork:['git-commit'],
+    mainwork:'Implement BR-4: add a --shout flag to src/greet.sh that uppercases the entire greeting line. Usage: ./src/greet.sh --shout [name]. Without the flag, behavior is unchanged (TR-1..TR-4 still hold). Invalid flags must exit non-zero with a one-line stderr message per TR-4. Acceptance: ./src/greet.sh --shout Ada prints HELLO, ADA! and exits 0; existing test groups still pass.',
+    output:'[prework:git-pull] Repository up to date on main (a41f20c).\n[mainwork] Added --shout handling to greet.sh: parses leading flag, uppercases via tr, rejects unknown flags with exit 2 + one-line stderr. All 3 existing test scripts pass (7/7 assertions). Created follow-up work item for testwriter to add --shout coverage.\n[postwork:git-commit] Committed 1 file: src/greet.sh (b7e91d3) "add --shout flag to greet".\n[selfcheck] All agent-definition instructions completed. Handoff item created for uncovered flag tests.',
+    attempts:1, tests:{passed:98,total:98},
+    times:{ added:'2026-08-11T14:23:56Z', start:'2026-08-11T14:33:29Z', preworkdone:'2026-08-11T14:34:02Z', mainworkdone:'2026-08-11T15:35:17Z', postworkdone:'2026-08-11T15:36:44Z', closed:'2026-08-11T15:37:04Z' } }),
+  mk({ title:'Add --shout and invalid-flag test coverage to the contract group',
+    type:'testwriter', state:'complete', source:'agent: code', priority:5, risk:1, codepath:'./test',
+    prework:[], postwork:['git-commit'],
+    mainwork:'Extend the contract test group per its generation prompt: --shout uppercases the greeting; invalid flag -x exits non-zero with exactly one line on stderr. Add cases as testscript04.sh, register in the contract group testlist, keep all scripts deterministic.',
+    output:'[mainwork] Wrote testscript04.sh (20 assertions: shout casing, multi-word names, flag ordering, stderr discipline) and testscript05.sh (18 contract edge cases). Registered both in testgroups.iter.md; created a new "shout" group. Handed off a test item to execute the groups.\n[postwork:git-commit] Committed 3 files (4c210aa).\n[selfcheck] Complete; test counts within test_min/test_max bounds.',
+    attempts:1, tests:{passed:38,total:38},
+    times:{ added:'2026-08-11T14:36:20Z', start:'2026-08-11T14:36:25Z', preworkdone:'2026-08-11T14:36:25Z', mainworkdone:'2026-08-11T15:38:00Z', postworkdone:'2026-08-11T15:40:12Z', closed:'2026-08-11T15:40:54Z' } }),
+  mk({ title:'Execute shout and contract test groups; record results in testgroups block',
+    type:'test', state:'complete', source:'agent: testwriter', priority:5, risk:0, codepath:'.',
+    prework:['Verify ./src/greet.sh is executable; if it is not, run chmod +x on it and report that you did so.'],
+    postwork:[],
+    mainwork:'Run every test group listed in test/testgroups.iter.md, update each group\'s lastrun/result/counts in the iterapp:testgroups block, report per-group results. Follow routing rules for failures.',
+    output:'[prework:inline] greet.sh already executable; nothing to do.\n[mainwork] default greeting 2/2 · named greeting 3/3 · contract 20/20 · shout 20/20. All groups green; testgroups block stamps updated.\n[selfcheck] Complete.',
+    attempts:1, tests:{passed:45,total:45},
+    times:{ added:'2026-08-11T15:38:55Z', start:'2026-08-11T15:40:54Z', preworkdone:'2026-08-11T15:41:20Z', mainworkdone:'2026-08-11T15:41:34Z', postworkdone:'2026-08-11T15:41:34Z', closed:'2026-08-11T15:41:59Z' } }),
+  mk({ title:'Ingest greet requirements: verify BR/TR normalization and flag ambiguities',
+    type:'ingest', state:'complete', source:'user', priority:7, risk:1, codepath:'.',
+    mainwork:'Read bizreq.md and techreq.md and confirm they are normalized per iterapp conventions (stable requirement IDs, one requirement per bullet, interfaces called out). Flag any ambiguities.',
+    output:'[mainwork] BR-1..BR-5 and TR-1..TR-5 already normalized. Ambiguity flagged: BR-3 "friendly" is subjective — only pinned by the exclamation-mark rule.\n[selfcheck] Complete.',
+    attempts:1, tests:{passed:7,total:7},
+    times:{ added:'2026-08-11T00:00:00Z', start:'2026-08-11T00:01:00Z', preworkdone:'2026-08-11T00:01:00Z', mainworkdone:'2026-08-11T00:03:40Z', postworkdone:'2026-08-11T00:03:40Z', closed:'2026-08-11T00:03:41Z' } }),
+  mk({ title:'Implement --lang flag slice 1: greeting table and lookup for en/es/fr',
+    type:'code', state:'in-progress', source:'agent: plan', priority:6, risk:3, codepath:'./src',
+    prework:['git-pull'], postwork:['git-commit','git-push'],
+    mainwork:'Slice 1 of the BR-5 localization plan: add a --lang <code> flag with a greeting table for en, es, fr inside greet.sh (TR-1: stay one POSIX script). Unknown code exits 2 with one stderr line listing supported codes. Default remains English. Acceptance: ./src/greet.sh --lang es Ada prints "¡Hola, Ada!".',
+    output:'', attempts:1,
+    times:{ added:'2026-08-11T16:02:11Z', start:'2026-08-11T16:04:03Z', preworkdone:'2026-08-11T16:04:41Z', mainworkdone:'', postworkdone:'', closed:'' } }),
+  mk({ title:'Write localization test group: casing, accents, unknown-code contract',
+    type:'testwriter', state:'in-progress', source:'agent: plan', priority:5, risk:1, codepath:'./test',
+    mainwork:'Create a "localization" test group covering: es/fr greetings exact match (accents intact), --lang with --shout composition, unknown code exit contract. Tests are expected to fail until slice 1 lands.',
+    output:'', attempts:1,
+    times:{ added:'2026-08-11T16:02:12Z', start:'2026-08-11T16:04:51Z', preworkdone:'2026-08-11T16:04:51Z', mainworkdone:'', postworkdone:'', closed:'' } }),
+  mk({ title:'Implement --lang slice 2: locale file override via GREET_LOCALE_DIR',
+    type:'code', state:'queued', source:'agent: plan', priority:5, risk:4, codepath:'./src',
+    prework:['git-pull'], postwork:['git-commit'],
+    mainwork:'Slice 2 of BR-5: allow an optional GREET_LOCALE_DIR env var pointing at *.greeting files that extend the built-in table. Missing dir is silently ignored; malformed file exits 3 with the offending path on stderr.',
+    times:{ added:'2026-08-11T16:02:13Z', start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'' } }),
+  mk({ title:'Run full regression after localization slices merge',
+    type:'test', state:'queued', source:'agent: plan', priority:4, risk:0, codepath:'.',
+    mainwork:'Run all test groups including the new localization group once slices 1 and 2 are complete. Update all lastrun stamps; route failures per agent definition.',
+    times:{ added:'2026-08-11T16:02:14Z' } }),
+  mk({ title:'Refactor greet.sh flag parsing into a single case loop before more flags land',
+    type:'refactor', state:'queued', source:'agent: code', priority:4, risk:2, codepath:'./src',
+    prework:['git-pull'], postwork:['git-commit'],
+    mainwork:'Behavior-preserving: consolidate the ad-hoc flag checks (--shout, --lang) into one while/case parse loop so the next flag is a one-line addition. All groups must pass before and after with identical counts.',
+    times:{ added:'2026-08-11T16:10:40Z' } }),
+  mk({ title:'Plan BR-6: greeting history log with rotation (bizreq draft v2)',
+    type:'plan', state:'queued', source:'user', priority:3, risk:5, codepath:'.',
+    mainwork:'Draft BR-6 adds an opt-in greeting history. Plan parallelizable slices with tests: log write path, rotation policy, privacy note in README. Constraints TR-1/TR-2 hold. Create follow-on code and testwriter items.',
+    times:{ added:'2026-08-11T16:15:00Z' } }),
+  mk({ title:'Add farewell subcommand: greet.sh bye [name] mirrors greeting contract',
+    type:'code', state:'todo', source:'user', priority:5, risk:2, codepath:'./src',
+    prework:['git-pull'], postwork:['git-commit','git-pr'],
+    mainwork:'Draft: add a "bye" subcommand mirroring the greeting contract (BR-2 analogue: default "Goodbye, World!"). Composes with --shout and --lang. Held in todo until bizreq BR-7 is approved.',
+    times:{ added:'2026-08-11T16:20:30Z' } }),
+  mk({ title:'Migrate paydaay-notify repo onto iterapp: seed .iter and component test groups',
+    type:'ingest', state:'todo', source:'user', priority:6, risk:6, codepath:'.',
+    context:['./bizreq.md','~/dev/global/rules/*req*.md'],
+    mainwork:'Survey ~/dev/paydaay-notify, init .iter from the template, and create code + testwriter items per component (sender, scheduler, templates) so each can run in parallel. Held until repo access is confirmed.',
+    times:{ added:'2026-08-11T16:22:00Z' } }),
+  mk({ title:'Fix: contract group flaky on machines where sh is dash (printf %s escaping)',
+    type:'code', state:'failed', source:'error', priority:7, risk:3, codepath:'./test',
+    prework:['git-pull'], postwork:['git-commit'],
+    mainwork:'testscript05.sh assertion 11 fails under dash: printf escaping differs from zsh/bash sh. Reproduce under dash first, fix the script to be POSIX-portable, and add a regression case. Reported by nightly run 2026-08-11T09:00Z.',
+    output:'[prework:git-pull] Repository up to date.\n[mainwork] Reproduced under dash. Attempted fix broke assertion 4 under zsh; reverted. Needs a portable quoting approach.',
+    attempts:2, lasterror:'mainwork failed: exit 1: fix regressed assertion 4 under zsh; reverted', tests:{passed:37,total:38},
+    times:{ added:'2026-08-11T09:05:00Z', start:'2026-08-11T12:40:00Z', preworkdone:'2026-08-11T12:40:31Z', mainworkdone:'', postworkdone:'', closed:'' } }),
+  mk({ title:'Deploy greet 1.1.0 to the demo host after localization ships',
+    type:'code', state:'paused', source:'user', priority:2, risk:7, codepath:'.',
+    prework:['iterloop-wait-for-stop'], postwork:['deploy','git-pr'],
+    mainwork:'Tag 1.1.0 and run the deploy step against the demo host. Paused until BR-5 slices complete and the E2E speed test is green.',
+    times:{ added:'2026-08-11T16:30:00Z' } }),
+];
+
+/* one terminally-failed closed item to exercise the Failed count from the archive */
+items.push(mk({ title:'Spike: rewrite greet in awk for speed (abandoned after 3 attempts)',
+  type:'refactor', state:'failed', source:'user', priority:1, risk:8, codepath:'./src',
+  mainwork:'Explore whether an awk implementation is meaningfully faster than sh for greet. Keep behavior identical.',
+  output:'[mainwork] awk variant passes greetings but breaks TR-2 (adds a gawk dependency on two target platforms). No portable win found.',
+  attempts:3, lasterror:'attempts exhausted: no TR-2-compliant speedup found', tests:{passed:5,total:7},
+  times:{ added:'2026-08-10T22:00:00Z', start:'2026-08-11T02:11:00Z', preworkdone:'2026-08-11T02:11:00Z', mainworkdone:'', postworkdone:'', closed:'2026-08-11T03:05:22Z' } }));
+
+/* ------------------------------------------------------------------ state */
+
+let activeFilters = new Set();          // empty = all
+let openIds = new Set([items[1].workid]); // start with one open, like the slide
+let engineRunning = true;
+let sortBy = 'state';
+
+/* ------------------------------------------------------------------ render */
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function shortId(item){ return item.workid.split('-').pop(); }
+function pct(t){ return t && t.total ? Math.round(100 * t.passed / t.total) : null; }
+
+function testChip(item){
+  const t = item.tests;
+  if (!t) return '<span class="chip kv mono" title="No test results recorded yet">T:–</span>';
+  const p = pct(t);
+  const bg = p === 100 ? 'var(--s-complete-bg)' : (p >= 60 ? 'var(--s-progress-bg)' : 'var(--s-failed-bg)');
+  const fg = p >= 60 && p < 100 ? 'var(--s-progress-fg)' : '#fff';
+  return `<span class="chip mono" style="background:${bg};color:${fg}" title="Tests passed / total">T:${t.passed}/${t.total} · ${p}%</span>`;
+}
+
+function sourceLabel(src){
+  if (src === 'user') return 'User';
+  if (src === 'error') return 'Error';
+  const m = src.match(/^agent:\s*(\w+)/);
+  return m ? m[1][0].toUpperCase() + m[1].slice(1) : src;
+}
+
+function summaryCounts(){
+  const c = { total: items.length };
+  for (const s of Object.keys(STATES)) c[s] = items.filter(i => i.state === s).length;
+  return c;
+}
+
+function renderSummary(){
+  const c = summaryCounts();
+  const defs = [
+    ['total','Total','var(--s-total-bg)','var(--s-total-fg)'],
+    ['complete','✓ Complete','var(--s-complete-bg)','var(--s-complete-fg)'],
+    ['in-progress','⟳ In-Progress','var(--s-progress-bg)','var(--s-progress-fg)'],
+    ['queued','◷ Queued','var(--s-queued-bg)','var(--s-queued-fg)'],
+    ['todo','☐ ToDo','var(--s-todo-bg)','var(--s-todo-fg)'],
+    ['failed','✕ Failed','var(--s-failed-bg)','var(--s-failed-fg)'],
+    ['paused','❙❙ Paused','var(--s-paused-bg)','var(--s-paused-fg)'],
+  ];
+  $('summary').className = 'summary' + (activeFilters.size ? ' filtered' : '');
+  $('summary').innerHTML = defs.map(([key,label,bg,fg]) => {
+    const on = key !== 'total' && activeFilters.has(key);
+    const n = key === 'total' ? c.total : c[key];
+    return `<button class="sumbtn ${on?'on':''} ${key==='total'?'total':''}" data-filter="${key}"
+      style="background:${bg};color:${fg}" aria-pressed="${on}"
+      title="${key==='total' ? 'Show all work items' : 'Filter to ' + label.replace(/^\S+ /,'') + ' items'}">
+      <span class="n">${n}</span><span class="t">${label}</span></button>`;
+  }).join('');
+  $('filterHint').textContent = activeFilters.size
+    ? `Filtered: ${[...activeFilters].map(s => STATES[s].label).join(' + ')} — click Total to clear`
+    : `${c.total} work items · click a summary button to filter`;
+}
+
+function effPrio(i){ return i.priority + (i.source==='error' ? 2 : 0); }
+function byState(a,b){
+  return STATES[a.state].order - STATES[b.state].order
+    || effPrio(b) - effPrio(a)
+    || a.times.added.localeCompare(b.times.added);
+}
+
+function visibleItems(){
+  const list = activeFilters.size ? items.filter(i => activeFilters.has(i.state)) : items.slice();
+  const cmp = {
+    state: byState,
+    requested: (a,b) => b.times.added.localeCompare(a.times.added),
+    completed: (a,b) => {
+      const ac = a.times.closed, bc = b.times.closed;
+      if (!ac && !bc) return byState(a,b);          // both incomplete: on top, state order
+      if (!ac) return -1;
+      if (!bc) return 1;
+      return bc.localeCompare(ac);                  // newest completion first
+    },
+    priority: (a,b) => effPrio(b) - effPrio(a) || a.times.added.localeCompare(b.times.added),
+    agent: (a,b) => a.type.localeCompare(b.type) || byState(a,b),
+    source: (a,b) => sourceLabel(a.source).localeCompare(sourceLabel(b.source)) || byState(a,b),
+  }[sortBy] || byState;
+  return list.sort(cmp);
+}
+
+function pillRow(assigned, editable, phase){
+  const inlineLits = assigned.filter(x => !PREPOST.includes(x));
+  const pool = PREPOST.map(name => {
+    const on = assigned.includes(name);
+    return `<button class="pill ${on?'on':''} ${editable?'toggle':''}" ${editable?`data-toggle="${phase}" data-name="${esc(name)}"`:'disabled tabindex="-1" style="cursor:default"'}>${esc(name)}</button>`;
+  });
+  const lits = inlineLits.map(t =>
+    `<span class="pill on inline-lit" title="Inline literal step: ${esc(t)}">“${esc(t)}”</span>`);
+  return `<div class="pills">${pool.join('')}${lits.join('')}</div>`;
+}
+
+function renderRows(){
+  const list = visibleItems();
+  if (!list.length) {
+    $('rows').innerHTML = `<div class="empty">No work items match this filter.</div>`;
+    return;
+  }
+  $('rows').innerHTML = list.map(item => {
+    const st = STATES[item.state];
+    const open = openIds.has(item.workid);
+    return `
+    <div class="item ${open?'open':''}" data-id="${item.workid}">
+      <div class="rowhead" data-rowclick="${item.workid}" role="button" tabindex="0"
+           aria-expanded="${open}" aria-label="Toggle detail for: ${esc(item.title)}">
+        <div class="stateicon" style="background:${st.bg};color:${st.fg}">${st.icon}</div>
+        <div class="rowmid">
+          <div class="title">${esc(item.title)}</div>
+          <div class="badges">
+            <span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span>
+            <span class="chip neutral" title="Agent type that does the work">${esc(item.type[0].toUpperCase()+item.type.slice(1))}</span>
+            <span class="chip mono" style="background:var(--s-paused-bg);color:#fff" title="Priority 0–10">P:${item.priority}</span>
+            <span class="chip kv mono" title="Risk 0–10">R:${item.risk}</span>
+            <span class="chip" style="background:var(--s-queued-bg);color:#fff" title="Requested by">${esc(sourceLabel(item.source))}</span>
+            ${testChip(item)}
+            <span class="chip kv mono" title="Attempts">A:${item.attempts}</span>
+            <span class="chip meta mono">Requested: <b>${esc(item.times.added)}</b></span>
+            <span class="chip meta mono">ID: <b>${esc(shortId(item))}</b></span>
+          </div>
+        </div>
+        <div class="actwrap">
+          <button class="actbtn" data-actions="${item.workid}" aria-haspopup="menu">Actions ▾</button>
+          <div class="actmenu" data-menu="${item.workid}" role="menu">${actionButtons(item)}</div>
+        </div>
+      </div>
+      <div class="detailwrap"><div class="detail"><div class="detail-inner">
+        <div class="dlabel">CodePath</div>
+        <div class="dvalrow"><span class="codepath" title="Lock scope and agent working directory">${esc(absCodepath(item.codepath))}</span>
+          <span class="fullid">ID: ${esc(item.workid)}</span></div>
+        <div class="dlabel">Prework</div><div>${pillRow(item.prework,false,'prework')}</div>
+        <div class="dlabel">Request</div><div class="textblock">${esc(item.mainwork)||'<i>—</i>'}</div>
+        <div class="dlabel">Postwork</div><div>${pillRow(item.postwork,false,'postwork')}</div>
+        <div class="dlabel">Output</div><div class="textblock mono">${esc(item.output)||'<i>no output yet</i>'}</div>
+        <div class="dlabel">Details</div>
+        <div class="detailbtns">
+          <button class="btn" data-lb="tests" data-id="${item.workid}">View Test Details</button>
+          <button class="btn" data-lb="times" data-id="${item.workid}">View Time Records</button>
+          <button class="btn" data-lb="context" data-id="${item.workid}">View Context and Prompts</button>
+          <button class="btn" data-lb="logs" data-id="${item.workid}">View Logs</button>
+        </div>
+      </div></div></div>
+    </div>`;
+  }).join('');
+}
+
+function actionButtons(item){
+  const s = item.state;
+  if (s === 'in-progress') {
+    // The engine is loosely coupled to the queue: while an agent is running this item,
+    // queue-side state changes wouldn't alter engine behavior — so only Clone is real.
+    return `<button data-act="clone" data-id="${item.workid}" role="menuitem">Clone</button>
+      <div class="sep"></div>
+      <span class="note">Agent is running — the engine owns this item until it finishes.</span>`;
+  }
+  const b = [];
+  if (s === 'todo' || s === 'paused') b.push(['queue','Queue']);
+  if (s === 'failed') b.push(['queue','Requeue (Retry)']);
+  if (s !== 'complete') { b.push(['complete','Complete']); b.push(['pauseedit','Pause &amp; Edit']); }
+  if (s === 'complete') b.push(['followup','Create Follow-up Request']);
+  b.push(['clone','Clone']);
+  const rows = b.map(([a,l]) => `<button data-act="${a}" data-id="${item.workid}" role="menuitem">${l}</button>`);
+  rows.push('<div class="sep"></div>');
+  rows.push(`<button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete</button>`);
+  return rows.join('');
+}
+
+function render(){ renderSummary(); renderRows(); }
+
+/* ------------------------------------------------------------------ toast */
+let toastTimer;
+function toast(msg){
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 1900);
+}
+
+/* ------------------------------------------------------------------ lightboxes */
+
+function openLb(title, bodyHtml, footHtml){
+  $('lbTitle').textContent = title;
+  $('lbBody').innerHTML = bodyHtml;
+  $('lbFoot').innerHTML = footHtml || '<button class="btn" data-lbclose>Close</button>';
+  $('overlay').classList.add('open');
+}
+function closeLb(){ $('overlay').classList.remove('open'); }
+
+function fakeGroups(item){
+  if (!item.tests) return [];
+  const half = Math.floor(item.tests.total/2);
+  return [
+    { label:'default greeting', lastrun:item.times.mainworkdone||item.times.added, result:'passed', counts:'2/2', testlist:['testscript01.sh'] },
+    { label:'named greeting', lastrun:item.times.mainworkdone||item.times.added, result:'passed', counts:'3/3', testlist:['testscript02.sh'] },
+    { label:'contract', lastrun:item.times.mainworkdone||item.times.added,
+      result: item.tests.passed === item.tests.total ? 'passed' : 'failed',
+      counts:`${item.tests.passed - 5}/${item.tests.total - 5}`, testlist:['testscript03.sh','testscript05.sh'] },
+    { label:'shout', lastrun:item.times.mainworkdone||item.times.added, result:'passed', counts:`${Math.min(half,20)}/${Math.min(half,20)}`, testlist:['testscript04.sh'] },
+  ];
+}
+
+function lbTests(item){
+  const groups = fakeGroups(item);
+  if (!groups.length) return openLb('Test Details — ' + shortId(item),
+    `<p style="color:var(--text-dim)">No test results recorded for this work item yet. The engine stamps results from <span class="mono">testgroups.iter.md</span> at close-out.</p>`);
+  const rows = groups.map(g => {
+    const ok = g.result === 'passed';
+    return `<tr>
+      <td><b>${esc(g.label)}</b></td>
+      <td><span class="chip" style="background:${ok?'var(--s-complete-bg)':'var(--s-failed-bg)'};color:#fff">${g.result}</span></td>
+      <td class="mono">${esc(g.counts)}</td>
+      <td class="mono">${esc(g.lastrun)}</td>
+      <td class="mono">${g.testlist.map(esc).join(', ')}</td></tr>`;
+  }).join('');
+  openLb('Test Details — ' + shortId(item),
+    `<table class="t"><thead><tr><th>Group</th><th>Result</th><th>Counts</th><th>Last run</th><th>Scripts</th></tr></thead><tbody>${rows}</tbody></table>
+     <p style="color:var(--text-dim);font-size:12px;margin-bottom:0">Source: <span class="mono">${item.testfiles.map(esc).join(' · ')}</span></p>`);
+}
+
+function dur(a,b){
+  if (!a || !b) return '';
+  const ms = new Date(b) - new Date(a);
+  if (ms < 0) return '';
+  const s = Math.round(ms/1000);
+  if (s < 90) return s + 's';
+  if (s < 5400) return Math.round(s/60) + 'm ' + (s%60) + 's';
+  return (s/3600).toFixed(1) + 'h';
+}
+
+function lbTimes(item){
+  const t = item.times;
+  const steps = [
+    ['Added', t.added, ''],
+    ['Started', t.start, dur(t.added, t.start) && `waited ${dur(t.added,t.start)} in queue`],
+    ['Prework done', t.preworkdone, dur(t.start,t.preworkdone) && `prework ${dur(t.start,t.preworkdone)}`],
+    ['Mainwork done', t.mainworkdone, dur(t.preworkdone,t.mainworkdone) && `mainwork ${dur(t.preworkdone,t.mainworkdone)}`],
+    ['Postwork done', t.postworkdone, dur(t.mainworkdone,t.postworkdone) && `postwork ${dur(t.mainworkdone,t.postworkdone)}`],
+    ['Closed', t.closed, dur(t.added,t.closed) && `total ${dur(t.added,t.closed)}`],
+  ];
+  const rows = steps.map(([label, ts, note]) =>
+    `<div class="tl"><span class="st">${label}</span><span class="ts">${ts ? esc(ts) : '—'}</span><span class="du">${note||''}</span></div>`).join('');
+  openLb('Time Records — ' + shortId(item),
+    `<div class="timeline">${rows}</div>
+     <p style="color:var(--text-dim);font-size:12px;margin-bottom:0">Attempts: <b>${item.attempts}</b>${item.lasterror ? ` · last error: <span class="mono">${esc(item.lasterror)}</span>` : ''}</p>`);
+}
+
+function lbContext(item){
+  const resolved = item.context.map(p => p.replace('./', PROJECT_ROOT + '/').replace('~/', HOME + '/'));
+  openLb('Context and Prompts — ' + shortId(item), `
+    <h4 style="margin:0 0 6px">Context patterns → resolved files</h4>
+    <table class="t"><tbody>${item.context.map((p,i) =>
+      `<tr><td class="mono">${esc(p)}</td><td class="mono" style="color:var(--text-dim)">${esc(resolved[i])}</td></tr>`).join('')}</tbody></table>
+    <h4 style="margin:16px 0 6px">Source instructions applied</h4>
+    <p style="margin:0" class="mono" style="font-size:12px">.iter/source/${item.source==='user'?'user':(item.source==='error'?'error':'agent')}.md${item.source.startsWith('agent') ? ` <span style="color:var(--text-dim)">({type} = ${esc(sourceLabel(item.source).toLowerCase())})</span>`:''}</p>
+    <h4 style="margin:16px 0 6px">Composed turn sequence</h4>
+    <table class="t"><thead><tr><th>#</th><th>Turn</th><th>Prompt source</th></tr></thead><tbody>
+      ${[
+        ...item.prework.map((p,i)=>[`${i+1}`, PREPOST.includes(p)?`prework:${p}`:'prework:inline', PREPOST.includes(p)?`.iter/prepostwork/${p}.md`:'inline literal from work item']),
+        [`${item.prework.length+1}`, 'mainwork (+ spin-up on first turn)', 'work item request + agent definition + source instructions + context list'],
+        ...item.postwork.map((p,i)=>[`${item.prework.length+2+i}`, `postwork:${p}`, `.iter/prepostwork/${p}.md`]),
+        [`${item.prework.length+item.postwork.length+2}`, 'selfcheck', 'engine-composed: re-read agent definition, confirm completion'],
+      ].map(([n,t2,s]) => `<tr><td class="mono">${n}</td><td><b>${esc(t2)}</b></td><td style="color:var(--text-dim)">${esc(s)}</td></tr>`).join('')}
+    </tbody></table>`);
+}
+
+function lbLogs(item){
+  const tag = `${item.type}#${(seq % 7) + 1}`;
+  const lines = [];
+  const push = (ts, lvl, msg) => ts && lines.push(`${ts.slice(11,19)} ${lvl}  [${tag}]  ${msg}`);
+  push(item.times.start, 'INFO ', `picked ${shortId(item)} "${item.title.slice(0,44)}…" (prio ${item.priority}, source ${item.source}, attempt ${item.attempts||1})`);
+  push(item.times.start, 'INFO ', `codepath lock acquired: ${item.codepath}`);
+  item.prework.forEach(p => push(item.times.preworkdone, 'INFO ', `prework:${PREPOST.includes(p)?p:'inline(…)'} done`));
+  push(item.times.mainworkdone, 'INFO ', 'mainwork done');
+  item.postwork.forEach(p => push(item.times.postworkdone, 'INFO ', `postwork:${p} done`));
+  if (item.state === 'failed') push(item.times.start, 'ERROR', item.lasterror || 'mainwork failed');
+  if (item.state === 'complete') push(item.times.closed, 'INFO ', `complete → workitems_closed.jsonl; lock released (${shortId(item)})`);
+  if (!lines.length) lines.push('(no engine activity yet — item has not been picked up)');
+  openLb('Engine Logs — ' + shortId(item),
+    `<div class="textblock mono" style="max-height:52vh">${esc(lines.join('\n'))}</div>`);
+}
+
+/* ------------------------------------------------------------------ edit / create form */
+
+let draft = null;   // { mode:'create'|'edit'|'clone'|'followup', base:workid|null, data:{...} }
+
+function openForm(mode, source, priorState){
+  // create with a source = prefilled create (e.g. Create WorkItem from a Projects node)
+  const d = source ? JSON.parse(JSON.stringify(source)) : mk({});
+  if (mode === 'clone') { d.workid = uuid(); d.state='todo'; d.attempts=0; d.output=''; d.tests=null; d.lasterror='';
+    d.times = { added:nowIso(), start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'' }; }
+  if (mode === 'followup') {
+    const parent = source;
+    Object.assign(d, mk({ title:'Follow-up: ' + parent.title.slice(0,60), type:parent.type,
+      codepath:parent.codepath, context:parent.context.slice(), testfiles:parent.testfiles.slice(),
+      mainwork:`Follow-up to ${shortId(parent)} ("${parent.title.slice(0,60)}").\n\n` , source:'user' }));
+  }
+  draft = { mode, base: mode==='edit' ? source.workid : null, data: d };
+  const titleMap = { create:'New WorkItem', edit:'Edit WorkItem — ' + shortId(d), clone:'Clone WorkItem', followup:'Create Follow-up Request' };
+
+  const agentOpts = AGENTS.map(a => `<option value="${a}" ${d.type===a?'selected':''}>${a}</option>`).join('');
+  const srcOpts = ['user','error',...AGENTS.map(a=>'agent: '+a)]
+    .map(s => `<option value="${esc(s)}" ${d.source===s?'selected':''}>${esc(s)}</option>`).join('');
+
+  openLb(titleMap[mode], `
+    <div class="form" id="editForm">
+      <span class="flabel">Title</span>
+      <input type="text" id="f_title" value="${esc(d.title)}" placeholder="Short description, 20–40 chars">
+      <span class="flabel">Agent</span>
+      <div class="inline">
+        <select id="f_type">${agentOpts}</select>
+        <label>Priority <input type="range" id="f_priority" min="0" max="10" value="${d.priority}"
+          oninput="document.getElementById('pv').textContent=this.value"><span class="rangeval" id="pv">${d.priority}</span></label>
+        <label>Risk <input type="range" id="f_risk" min="0" max="10" value="${d.risk}"
+          oninput="document.getElementById('rv').textContent=this.value"><span class="rangeval" id="rv">${d.risk}</span></label>
+      </div>
+      <span class="flabel">Source</span>
+      <div class="inline"><select id="f_source">${srcOpts}</select>
+        <span style="color:var(--text-dim);font-size:12px">who requested this work</span></div>
+      <span class="flabel">CodePath</span>
+      <div>
+        <input type="text" id="f_codepath" class="mono" value="${esc(d.codepath)}"
+          placeholder="relative (./src) or absolute — resolved to absolute on save">
+        <div class="pathhint" id="f_pathhint">→ ${esc(absCodepath(d.codepath))}</div>
+      </div>
+      <span class="flabel top-align">Context</span>
+      <textarea id="f_context" rows="2" placeholder="one glob or path per line">${esc(d.context.join('\n'))}</textarea>
+      <span class="flabel top-align">Test files</span>
+      <textarea id="f_testfiles" rows="1">${esc(d.testfiles.join('\n'))}</textarea>
+      <span class="flabel top-align">Prework</span>
+      <div>${pillRow(d.prework, true, 'prework')}
+        <input type="text" id="f_prelit" class="mono" style="margin-top:7px;width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:6px 10px;color:var(--text)"
+          placeholder="…or type an inline literal prework step and press Enter"></div>
+      <span class="flabel top-align">Request</span>
+      <textarea id="f_mainwork" rows="7" placeholder="The mainwork prompt: exactly what needs to be done, acceptance criteria included.">${esc(d.mainwork)}</textarea>
+      <span class="flabel top-align">Postwork</span>
+      <div>${pillRow(d.postwork, true, 'postwork')}
+        <input type="text" id="f_postlit" class="mono" style="margin-top:7px;width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:6px 10px;color:var(--text)"
+          placeholder="…or type an inline literal postwork step and press Enter"></div>
+    </div>`,
+    (() => {
+      // Default target state: new items default to queued; pause & edit defaults to the
+      // item's state before pausing. The selector lets either land anywhere pre-processing.
+      const SAVE_STATES = [['queued','Queued'],['todo','ToDo'],['paused','Paused']];
+      const def = mode === 'edit'
+        ? (SAVE_STATES.some(([v]) => v === priorState) ? priorState : 'queued')
+        : 'queued';
+      const opts = SAVE_STATES.map(([v,l]) => `<option value="${v}" ${v===def?'selected':''}>${l}</option>`).join('');
+      return `<span style="margin-right:auto;color:var(--text-dim);font-size:12.5px">Saves the work item into the selected state — <b>Queued</b> is immediately eligible.</span>
+         <button class="btn" data-lbclose>Cancel</button>
+         <span class="savegroup">
+           <button class="btn primary" id="saveGo">${mode === 'edit' ? 'Save and set to' : 'Create and set to'}</button>
+           <select id="f_savestate" aria-label="State to save the work item into">${opts}</select>
+         </span>`;
+    })());
+
+  $('f_prelit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('prework', e.target); }});
+  $('f_postlit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('postwork', e.target); }});
+  $('f_codepath').addEventListener('input', e => { $('f_pathhint').textContent = '→ ' + absCodepath(e.target.value); });
+  $('saveGo').addEventListener('click', () => saveDraft($('f_savestate').value));
+}
+
+function addLit(phase, input){
+  const v = input.value.trim();
+  if (!v) return;
+  draft.data[phase].push(v);
+  input.closest('div').querySelector('.pills').insertAdjacentHTML('beforeend',
+    `<span class="pill on inline-lit" title="Inline literal step: ${esc(v)}">“${esc(v)}”</span>`);
+  input.value = '';
+}
+
+function saveDraft(targetState){
+  const d = draft.data;
+  d.title = $('f_title').value.trim() || '(untitled work item)';
+  d.type = $('f_type').value;
+  d.priority = +$('f_priority').value;
+  d.risk = +$('f_risk').value;
+  d.source = $('f_source').value;
+  d.codepath = absCodepath($('f_codepath').value);   // entered relative, stored absolute
+  d.context = $('f_context').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  d.testfiles = $('f_testfiles').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  d.mainwork = $('f_mainwork').value;
+  d.state = targetState;
+  if (draft.mode === 'edit') {
+    const idx = items.findIndex(i => i.workid === draft.base);
+    items[idx] = d;
+    toast(`Saved as ${targetState}`);
+  } else {
+    items.unshift(d);
+    openIds.add(d.workid);
+    const what = draft.mode === 'followup' ? 'Follow-up' : draft.mode === 'clone' ? 'Clone' : 'WorkItem';
+    toast(`${what} created as ${targetState}`);
+  }
+  draft = null;
+  closeLb(); render();
+}
+
+/* ------------------------------------------------------------------ actions */
+
+function doAction(act, id){
+  const item = items.find(i => i.workid === id);
+  if (!item) return;
+  switch (act) {
+    case 'queue':
+      item.state = 'queued'; item.lasterror = '';
+      toast(`Queued ${shortId(item)}`); break;
+    case 'complete':
+      item.state = 'complete'; item.times.closed = nowIso();
+      toast(`Marked ${shortId(item)} complete`); break;
+    case 'pauseedit': {
+      const prior = item.state;
+      item.state = 'paused'; render();
+      openForm('edit', item, prior);
+      toast(`Paused ${shortId(item)} for editing`); return;
+    }
+    case 'clone':
+      openForm('clone', item); return;
+    case 'followup':
+      openForm('followup', item); return;
+    case 'delete':
+      openLb('Delete work item?', `
+        <p style="margin-top:0">This permanently removes <b>${esc(item.title)}</b>
+        <span class="mono">(${shortId(item)})</span> from the queue. The engine keeps no copy.</p>`,
+        `<button class="btn" data-lbclose>Cancel</button>
+         <button class="btn danger" id="confirmDelete">Delete</button>`);
+      $('confirmDelete').addEventListener('click', () => {
+        items = items.filter(i => i.workid !== id);
+        openIds.delete(id);
+        closeLb(); render(); toast('Deleted');
+      });
+      return;
+  }
+  render();
+}
+
+/* ------------------------------------------------------------------ events */
+
+document.addEventListener('click', (e) => {
+  const t = e.target.closest('button, [data-rowclick]');
+
+  // close any open action menu when clicking elsewhere
+  if (!e.target.closest('.actmenu') && !e.target.closest('[data-actions]')) {
+    document.querySelectorAll('.actmenu.open').forEach(m => m.classList.remove('open'));
+  }
+  if (!t) return;
+
+  if (t.dataset.filter) {
+    const f = t.dataset.filter;
+    if (f === 'total') activeFilters.clear();
+    else activeFilters.has(f) ? activeFilters.delete(f) : activeFilters.add(f);
+    render(); return;
+  }
+  if (t.dataset.actions) {
+    const menu = document.querySelector(`[data-menu="${t.dataset.actions}"]`);
+    const was = menu.classList.contains('open');
+    document.querySelectorAll('.actmenu.open').forEach(m => m.classList.remove('open'));
+    if (!was) menu.classList.add('open');
+    return;
+  }
+  if (t.dataset.act) { doAction(t.dataset.act, t.dataset.id); return; }
+  if (t.dataset.lb) {
+    const item = items.find(i => i.workid === t.dataset.id);
+    ({tests:lbTests, times:lbTimes, context:lbContext, logs:lbLogs})[t.dataset.lb](item);
+    return;
+  }
+  if (t.dataset.toggle && draft) {
+    const list = draft.data[t.dataset.toggle];
+    const name = t.dataset.name;
+    const i = list.indexOf(name);
+    i >= 0 ? list.splice(i,1) : list.push(name);
+    t.classList.toggle('on', i < 0);
+    return;
+  }
+  if (t.hasAttribute('data-lbclose') || t.id === 'lbClose') { draft = null; closeLb(); return; }
+  if (t.id === 'collapseAll') { openIds.clear(); render(); return; }
+  if (t.id === 'newItem') { openForm('create', null); return; }
+  if (t.id === 'engineChip' || t.closest('#engineChip')) {
+    engineRunning = !engineRunning;
+    const chip = $('engineChip');
+    chip.dataset.engine = engineRunning ? 'running' : 'paused';
+    $('engineState').textContent = engineRunning ? 'Running' : 'Paused';
+    toast(engineRunning ? 'Engine resumed (stop.signal cleared)' : 'Engine pausing (drain): finishing in-flight work');
+    return;
+  }
+
+  const rowId = t.dataset.rowclick;
+  if (rowId && !e.target.closest('.actwrap')) {
+    openIds.has(rowId) ? openIds.delete(rowId) : openIds.add(rowId);
+    render(); return;
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if ($('overlay').classList.contains('open')) { draft = null; closeLb(); }
+    document.querySelectorAll('.actmenu.open').forEach(m => m.classList.remove('open'));
+  }
+  if (e.key === 'Enter' && e.target.hasAttribute('data-rowclick')) e.target.click();
+});
+
+$('overlay').addEventListener('click', (e) => { if (e.target === $('overlay')) { draft = null; closeLb(); } });
+$('sortBy').addEventListener('change', (e) => { sortBy = e.target.value; render(); });
+
+/* ================================================================== views */
+
+const VIEWS = { workitems:'Work Items', dashboard:'Dashboard', ilsettings:'Iterloop Settings',
+                projects:'Projects', iasettings:'Project Settings' };
+
+function navTo(view){
+  if (!VIEWS[view]) view = 'workitems';
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
+  document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('here', a.dataset.view === view));
+  $('pageTitle').textContent = VIEWS[view];
+  if (view === 'dashboard') renderDashboard();
+  if (view === 'ilsettings') renderIlSettings();
+  if (view === 'projects') renderProjects();
+  if (view === 'iasettings') renderIaSettings();
+}
+window.addEventListener('hashchange', () => navTo(location.hash.replace(/^#\//,'')));
+
+/* ------------------------------------------------------------- dashboard */
+/* Fake 14-day history — in the wired version this is GET /api/history?days=14,
+   computed server-side from workitems_closed.jsonl. */
+const HIST = {
+  comp: [18,22,25,19,28,31,24,27,33,29,35,38,32,41],
+  fail: [ 2, 1, 0, 3, 1, 2, 1, 0, 2, 1, 1, 3, 0, 1],
+  byAgent: [['code',86],['testwriter',52],['test',49],['plan',18],['refactor',12],['ingest',7]],
+};
+function histLabels(){
+  const out = [];
+  for (let i = HIST.comp.length - 1; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 86400000);
+    out.push(`${d.getMonth()+1}/${String(d.getDate()).padStart(2,'0')}`);
+  }
+  return out;
+}
+
+/* single-series bar panel: thin marks, faint grid, hover tooltip, table view */
+function barPanel(title, sub, data, labels, color, height){
+  const W = 640, H = height, padL = 30, padB = 18, padT = 8;
+  const max = Math.max(...data, 1);
+  const step = (W - padL) / data.length;
+  const bw = Math.min(step * 0.66, 34);
+  const ticks = [0, Math.round(max/2), max];
+  const gy = v => padT + (H - padT - padB) * (1 - v / max);
+  const grid = ticks.map(v => `<line x1="${padL}" x2="${W}" y1="${gy(v)}" y2="${gy(v)}"/>`).join('');
+  const ylab = ticks.map(v => `<text x="${padL-6}" y="${gy(v)+3}" text-anchor="end">${v}</text>`).join('');
+  const bars = data.map((v,i) => {
+    const x = padL + i*step + (step-bw)/2, y = gy(v);
+    return `<rect class="bar" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}"
+      height="${Math.max(H - padB - y, 1).toFixed(1)}" rx="2" fill="${color}"
+      data-tip="${labels[i]}: ${v}"></rect>`;
+  }).join('');
+  const xlab = labels.map((l,i) => i % 2 ? '' :
+    `<text x="${(padL + i*step + step/2).toFixed(1)}" y="${H-4}" text-anchor="middle">${l}</text>`).join('');
+  const tableRows = labels.map((l,i) => `<tr><td>${l}</td><td class="mono">${data[i]}</td></tr>`).join('');
+  return `<div class="panel"><h3>${title}</h3><div class="sub">${sub}</div>
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${title}">
+      <g class="chartgrid">${grid}</g><g class="chartaxis">${ylab}${xlab}</g>${bars}
+    </svg>
+    <details><summary>View as table</summary>
+      <table class="t"><thead><tr><th>Day</th><th>Count</th></tr></thead><tbody>${tableRows}</tbody></table>
+    </details></div>`;
+}
+
+function renderDashboard(){
+  const c7 = HIST.comp.slice(-7).reduce((a,b)=>a+b,0);
+  const f7 = HIST.fail.slice(-7).reduce((a,b)=>a+b,0);
+  const cAll = HIST.comp.reduce((a,b)=>a+b,0), fAll = HIST.fail.reduce((a,b)=>a+b,0);
+  const running = items.filter(i => i.state === 'in-progress').length;
+  const tiles = [
+    [`${Math.round(100*c7/(c7+f7))}<small>%</small>`, 'Success rate · 7d'],
+    [`${(c7/168).toFixed(1)}<small>/hr</small>`, 'Completions per hour · 7d avg'],
+    [`24<small>m</small>`, 'Median cycle time · added → closed'],
+    [`${running}`, 'Agents running now'],
+    [`${items.length}`, 'Open work items'],
+    [`38<small>%</small>`, 'Agent-created handoffs · share of closed'],
+  ];
+  const labels = histLabels();
+  const agentMax = Math.max(...HIST.byAgent.map(a => a[1]));
+  $('view-dashboard').innerHTML = `
+    <div class="tiles">${tiles.map(([n,l]) => `<div class="tile"><div class="tn">${n}</div><div class="tl2">${l}</div></div>`).join('')}</div>
+    <div class="dashsplit">
+      <div>
+        ${barPanel('Completions per day', `last 14 days · ${cAll} closed complete`, HIST.comp, labels, 'var(--s-complete-bg)', 170)}
+        ${barPanel('Failures per day', `last 14 days · ${fAll} closed failed (kept separate from completions — the pair isn't colorblind-safe stacked)`, HIST.fail, labels, 'var(--s-failed-bg)', 96)}
+      </div>
+      <div class="panel"><h3>Completions by agent</h3><div class="sub">last 7 days</div>
+        ${HIST.byAgent.map(([name,v]) =>
+          `<div class="hbar"><span class="hname">${name}</span><div class="htrack"><div class="hfill" style="width:${Math.round(100*v/agentMax)}%"></div></div><span class="hval">${v}</span></div>`).join('')}
+      </div>
+    </div>`;
+}
+
+/* chart tooltips (delegated) */
+document.addEventListener('mousemove', (e) => {
+  const bar = e.target.closest('.bar');
+  const tip = $('charttip');
+  if (bar && bar.dataset.tip) {
+    tip.textContent = bar.dataset.tip;
+    tip.style.display = 'block';
+    tip.style.left = (e.clientX + 12) + 'px';
+    tip.style.top = (e.clientY - 28) + 'px';
+  } else tip.style.display = 'none';
+});
+
+/* ------------------------------------------------------- iterloop settings */
+const CONFIG = {
+  engine: {
+    tick_interval_sec: [5, 'seconds between scheduler ticks'],
+    agent_stagger_ms: [100, 'delay between agent spawns in one tick'],
+    queue_lock_retry_ms: [50, 'record-lock retry interval'],
+    queue_lock_break_sec: [60, 'ghost-lock breaker window'],
+    codepath_lock_timeout_sec: [3600, 'codepath lock lifetime'],
+    codepath_conflict_backoff_sec: [15, 'wait before re-picking a lock-blocked item'],
+    max_total_agents: [8, 'global concurrent agent cap'],
+    max_open_workitems: [200, 'queue cap; iterloop add refuses beyond this'],
+    retry_backoff_sec: [300, 'wait before a failed item retries'],
+    max_attempts: [3, 'attempts before terminal failure'],
+  },
+  globalsettings: {
+    test_min: [20, 'minimum tests per group (testwriter floor)'],
+    test_max: [100, 'maximum tests per group'],
+    test_default_path: ['./test*/', 'where test groups live by default'],
+    log_default_path: ['./logs/{YYYYMMDD-hh}.log', 'engine log file pattern'],
+    log_level: ['info', 'debug | info | warn | error'],
+    log_max_size_mb: [10, 'rotate log at this size'],
+    log_max_files: [50, 'rotated files kept'],
+  },
+};
+
+function renderIlSettings(){
+  const group = (name, obj, sub) => `<div class="setgroup"><h3>${name}</h3><div class="sub">${sub}</div>
+    ${Object.entries(obj).map(([k,[v,why]]) =>
+      `<div class="setrow"><label>${k}</label>
+       <input type="text" data-cfg="${name}.${k}" value="${esc(String(v))}">
+       <span class="why">${why}</span></div>`).join('')}</div>`;
+  $('view-ilsettings').innerHTML = `<div class="setform">
+    ${group('engine', CONFIG.engine, 'Scheduler, locking, and retry behavior — .iter/.engine/config.json')}
+    ${group('globalsettings', CONFIG.globalsettings, 'Testing and logging defaults')}
+    <div class="setfoot">
+      <button class="btn" id="cfgReset">Reset to Defaults</button>
+      <button class="btn primary" id="cfgSave">Save config.json</button>
+    </div></div>`;
+  $('cfgSave').addEventListener('click', () =>
+    toast('config.json saved (mock) — engine applies it on its next tick'));
+  $('cfgReset').addEventListener('click', () => { renderIlSettings(); toast('Reset to defaults (unsaved)'); });
+}
+
+/* ---------------------------------------------------------------- projects */
+/* Fake scan results — in the wired version: GET /api/markers, built by scanning
+   the configured roots for *.iter.context.md / *.iter.usecase.md marker files. */
+const LEVELS = ['project','context','container','component'];
+const MARKERS = [
+  { key:'',                              level:'project',   name:'Paydaay Core Product',            desc:'Wage-access platform: intake, novation, and payout orchestration', uses:[] },
+  { key:'infra',                         level:'context',   name:'Shared Infrastructure',           desc:'Cross-product platform services shared by every container', uses:[] },
+  { key:'infra/seccomm',                 level:'context',   name:'Security and Communications',     desc:'Identity, authorization, and edge traffic for all products', uses:[] },
+  { key:'infra/seccomm/gateway',         level:'container', name:'API Gateway & JWTs (Kong)',       desc:'Single ingress; terminates TLS, mints and validates JWTs', uses:['kong','jwt'] },
+  { key:'infra/seccomm/authn',           level:'container', name:'Authentication (TBD)',            desc:'Login and session issuance; provider selection still open', uses:['tbd'] },
+  { key:'infra/seccomm/authz',           level:'container', name:'Authorization (OPA)',             desc:'Policy decisions via OPA sidecars; bundle-distributed rules', uses:['opa'] },
+  { key:'core',                          level:'context',   name:'Core Product',                    desc:'The revenue path: intake through novation to payout', uses:[] },
+  { key:'core/intake',                   level:'container', name:'Core Intake',                     desc:'Receives, validates, and routes inbound wage-access requests', uses:['postgres','kafka'] },
+  { key:'core/intake/orchestrator',      level:'component', name:'Orchestrator',                    desc:'Drives each request through its state machine', uses:[] },
+  { key:'core/intake/emancipator',       level:'component', name:'Emancipator',                     desc:'Releases cleared funds and emits settlement events', uses:[] },
+  { key:'core/intake/evidence-vault',    level:'component', name:'Evidence Vault (m08)',            desc:'Immutable store for consent and verification artifacts', uses:['vault'] },
+  { key:'core/intake/ewo-origination',   level:'component', name:'EWO Origination (m28)',           desc:'Creates earned-wage obligations from verified shifts', uses:[] },
+  { key:'core/intake/onvl-novation',     level:'component', name:'ONVL Novation Gate (m33)',        desc:'Novates obligations to capital providers under ONVL terms', uses:[] },
+  { key:'core/payout',                   level:'container', name:'Payout Rails',                    desc:'Disbursement over RTP and ACH with fallback ordering', uses:['kafka','rtp'] },
+  { key:'core/payout/rail-selector',     level:'component', name:'Rail Selector',                   desc:'Chooses cheapest rail meeting the promised arrival time', uses:[] },
+  { key:'core/payout/ledger',            level:'component', name:'Ledger',                          desc:'Double-entry record of every movement; source of truth', uses:['postgres'] },
+];
+MARKERS.forEach(m => {
+  m.depth = m.key ? m.key.split('/').length : 0;
+  m.dir = m.key ? `./${m.key}` : '.';
+  m.path = `${m.dir}/${(m.name.split(' ')[0] || 'node').toLowerCase().replace(/[^a-z0-9]/g,'')}.iter.context.md`;
+});
+
+const USECASES = [
+  { name:'Capital provider logs in to modify a Sentinel',
+    desc:'Edge auth through policy check, then an orchestrated intake change',
+    file:'./usecases/modify-sentinel.iter.usecase.md',
+    steps:{ 'infra/seccomm/gateway':'1.1', 'infra/seccomm/authn':'1.2', 'infra/seccomm/authz':'1.3',
+            'core/intake':'2', 'core/intake/orchestrator':'2.1', 'core/intake/emancipator':'2.2' } },
+  { name:'Worker requests early wage payout',
+    desc:'Verified shift becomes an obligation, novates, and pays out',
+    file:'./usecases/early-payout.iter.usecase.md',
+    steps:{ 'infra/seccomm/gateway':'1', 'core/intake':'2', 'core/intake/ewo-origination':'2.1',
+            'core/intake/onvl-novation':'2.2', 'core/payout':'3', 'core/payout/rail-selector':'3.1',
+            'core/payout/ledger':'3.2' } },
+];
+
+let projUC = -1;          // -1 = no use-case filter
+let projOrder = 'hierarchy';
+let projDepth = null;     // null = all levels; else index into LEVELS
+let openMarker = null;
+
+function orderedMarkers(){
+  const list = MARKERS.slice();
+  if (projOrder === 'level') list.sort((a,b) => LEVELS.indexOf(a.level) - LEVELS.indexOf(b.level) || a.name.localeCompare(b.name));
+  if (projOrder === 'name') list.sort((a,b) => a.name.localeCompare(b.name));
+  return list;
+}
+
+function renderProjects(){
+  const uc = projUC >= 0 ? USECASES[projUC] : null;
+  const counts = LEVELS.map(l => MARKERS.filter(m => m.level === l).length);
+  const rows = orderedMarkers()
+    .filter(m => projDepth === null || LEVELS.indexOf(m.level) <= projDepth)
+    .map(m => {
+      const step = uc && uc.steps[m.key];
+      const dim = uc && !step;
+      const indent = projOrder === 'hierarchy' ? m.depth * 22 : 0;
+      const open = openMarker === m.key;
+      return `
+      <div class="prow ${dim?'dimmed':''} ${step?'participant':''}" data-marker="${esc(m.key)}"
+           role="button" tabindex="0" style="padding-left:${8+indent}px">
+        <span class="lvltag" style="background:var(--lvl-${m.level}-bg, var(--surface2));color:var(--lvl-${m.level}-fg, var(--text))">${esc(m.level)}</span>
+        <span class="pname">${esc(m.name)}</span>
+        <span class="pdesc">${esc(m.desc)}</span>
+        <span class="uses">${m.uses.map(u => `<span class="useb">${esc(u)}</span>`).join('')}</span>
+        ${step ? `<span class="step">${esc(step)}</span>` : ''}
+      </div>
+      ${open ? `<div class="pdetail">
+        <div class="dlabel">Marker</div><div class="mono">${esc(m.path)}</div>
+        <div class="dlabel">CodePath</div><div class="mono">${esc(absCodepath(m.dir))}</div>
+        <div class="dlabel">Uses</div><div>${m.uses.length ? m.uses.map(u=>`<span class="useb">${esc(u)}</span>`).join(' ') : '<span style="color:var(--text-dim)">—</span>'}</div>
+        <div class="dlabel">Use-cases</div><div>${USECASES.filter(u=>u.steps[m.key]).map(u=>`${esc(u.name)} <b class="mono">(${u.steps[m.key]})</b>`).join('<br>') || '<span style="color:var(--text-dim)">not a participant</span>'}</div>
+        <div class="actions">
+          <button class="btn primary" data-mkworkitem="${esc(m.key)}">Create WorkItem here</button>
+          <button class="btn" data-viewmarker="${esc(m.key)}">View Marker File</button>
+        </div>
+      </div>` : ''}`;
+    }).join('');
+
+  $('view-projects').innerHTML = `
+    <div class="projtools">
+      <label>Filter by use-case:
+        <select id="projUc">
+          <option value="-1">— all nodes —</option>
+          ${USECASES.map((u,i) => `<option value="${i}" ${i===projUC?'selected':''}>${esc(u.name)}</option>`).join('')}
+        </select></label>
+      <label>Order by:
+        <select id="projOrder">
+          <option value="hierarchy" ${projOrder==='hierarchy'?'selected':''}>Hierarchy</option>
+          <option value="level" ${projOrder==='level'?'selected':''}>Level</option>
+          <option value="name" ${projOrder==='name'?'selected':''}>Name</option>
+        </select></label>
+      <button class="btn" id="rescan" style="margin-left:auto">Rescan Markers</button>
+    </div>
+    ${uc ? `<div class="sub" style="color:var(--text-dim);margin:0 0 8px;font-size:12.5px"><b style="color:var(--thread)">USE-CASE:</b> ${esc(uc.desc)} · participants numbered, others dimmed · <span class="mono">${esc(uc.file)}</span></div>` : ''}
+    <div class="legendbar">
+      ${LEVELS.map((l,i) => `<button class="lvlchip ${projDepth===i?'active':''}" data-depth="${i}"
+        style="background:var(--lvl-${l}-bg);color:var(--lvl-${l}-fg)">${l} · ${counts[i]}</button>`).join('')}
+      <span class="lhint">click a level to collapse below it · markers: <span class="mono">**/*.iter.context.md</span></span>
+    </div>
+    <div class="ptree">${rows || '<div class="empty">No markers found — check scan roots in Project Settings.</div>'}</div>`;
+
+  $('projUc').addEventListener('change', e => { projUC = +e.target.value; renderProjects(); });
+  $('projOrder').addEventListener('change', e => { projOrder = e.target.value; renderProjects(); });
+  $('rescan').addEventListener('click', () =>
+    toast('Scanned 2 roots: 16 context markers, 2 use-case markers (mock)'));
+}
+
+function markerAncestors(key){
+  const out = [];
+  let k = key;
+  while (k) { k = k.includes('/') ? k.slice(0, k.lastIndexOf('/')) : ''; const a = MARKERS.find(m => m.key === k); if (a) out.push(a); }
+  return out;
+}
+
+function projClick(e){
+  const mk_ = e.target.closest('[data-mkworkitem]');
+  if (mk_) {
+    const m = MARKERS.find(x => x.key === mk_.dataset.mkworkitem);
+    const ctx = [m.path, ...markerAncestors(m.key).map(a => a.path)];
+    openForm('create', mk({ codepath: m.dir, context: ctx, testfiles: [`${m.dir}/test/testgroups.iter.md`],
+      title: '', mainwork: '', source: 'user' }));
+    return true;
+  }
+  const vm = e.target.closest('[data-viewmarker]');
+  if (vm) {
+    const m = MARKERS.find(x => x.key === vm.dataset.viewmarker);
+    openLb('Marker — ' + m.path, `<div class="textblock mono" style="max-height:60vh">${esc(
+`---
+name: ${m.name}
+level: ${m.level}
+description: "${m.desc}"${m.uses.length ? `\nuses: [${m.uses.join(', ')}]` : ''}
+---
+
+# ${m.name}
+
+${m.desc}.
+
+## Requirements
+- (the marker body IS the context handed to agents working under ${absCodepath(m.dir)})
+- Interfaces, constraints, and conventions for this node live here, beside the code.
+
+## Interfaces
+- See parent context markers for shared contracts.`)}</div>`);
+    return true;
+  }
+  const chip = e.target.closest('[data-depth]');
+  if (chip) {
+    const d = +chip.dataset.depth;
+    projDepth = projDepth === d ? null : d;
+    renderProjects();
+    return true;
+  }
+  const row = e.target.closest('[data-marker]');
+  if (row) {
+    const key = row.dataset.marker;
+    openMarker = openMarker === key ? null : key;
+    renderProjects();
+    return true;
+  }
+  return false;
+}
+document.addEventListener('click', (e) => {
+  if (document.getElementById('view-projects').classList.contains('active')) projClick(e);
+});
+
+/* --------------------------------------------------------- project settings */
+const PROJSET = {
+  project_name: ['Paydaay Core Product', 'display name for the Projects page'],
+  scan_roots: ['~/dev/paydaay-core\n~/dev/paydaay-shared', 'directories searched for markers (one per line; may be outside this repo)'],
+  marker_glob: ['**/*.iter.context.md', 'structure/context marker files'],
+  usecase_glob: ['**/*.iter.usecase.md', 'use-case thread definitions'],
+  testgroups_glob: ['**/testgroups.iter.md', 'test-group files aligned to nodes'],
+  default_context: ['{marker}\n{ancestor_markers}\n./bizreq.md', 'context prefilled on Create-WorkItem-from-node'],
+};
+
+function renderIaSettings(){
+  $('view-iasettings').innerHTML = `<div class="setform"><div class="setgroup">
+    <h3>Project Settings</h3>
+    <div class="sub">Marker discovery and Create-WorkItem defaults — stored in <span class="mono">.iter/projects.json</span></div>
+    ${Object.entries(PROJSET).map(([k,[v,why]]) => v.includes('\n')
+      ? `<div class="setrow wide"><label>${k}</label><textarea rows="${v.split('\n').length + 1}" data-ps="${k}">${esc(v)}</textarea></div>
+         <div class="setrow wide"><span></span><span class="why">${why}</span></div>`
+      : `<div class="setrow"><label>${k}</label><input type="text" data-ps="${k}" value="${esc(v)}"><span class="why">${why}</span></div>`).join('')}
+    <div class="setfoot">
+      <button class="btn" id="psReset">Reset</button>
+      <button class="btn primary" id="psSave">Save projects.json</button>
+    </div></div></div>`;
+  $('psSave').addEventListener('click', () => toast('projects.json saved (mock) — rescan to apply new globs'));
+  $('psReset').addEventListener('click', () => { renderIaSettings(); toast('Reset (unsaved)'); });
+}
+
+render();
+navTo(location.hash.replace(/^#\//,'') || 'workitems');
+</script>
