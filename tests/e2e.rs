@@ -283,27 +283,63 @@ fn stop_drain_via_cli() {
 }
 
 #[test]
-fn init_copies_template() {
+fn init_embedded_template_and_heal() {
     let dest = std::env::temp_dir().join(format!("iterloop-e2e-init-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dest);
     std::fs::create_dir_all(&dest).unwrap();
 
-    let out = Command::new(BIN)
-        .args(["init", dest.to_str().unwrap(), "--from", template_dir().to_str().unwrap()])
-        .output()
-        .unwrap();
+    // No --from, no env: the template embedded in the binary scaffolds everything.
+    let out = Command::new(BIN).args(["init", dest.to_str().unwrap()]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(dest.join(".iter/agents/code.md").is_file());
     assert!(dest.join(".iter/.engine/config.json").is_file());
     assert!(dest.join(".iter/prepostwork/git-pull.md").is_file());
     assert!(dest.join(".iter/source/agent.md").is_file());
 
-    // Refuses to overwrite an existing .iter.
-    let out2 = Command::new(BIN)
+    // Idempotent + healing: user edits survive, deleted files come back.
+    std::fs::write(dest.join(".iter/agents/code.md"), "user customization").unwrap();
+    std::fs::remove_file(dest.join(".iter/source/error.md")).unwrap();
+    let out2 = Command::new(BIN).args(["init", dest.to_str().unwrap()]).output().unwrap();
+    assert!(out2.status.success());
+    assert!(String::from_utf8_lossy(&out2.stdout).contains("1 file(s) added"));
+    assert_eq!(
+        std::fs::read_to_string(dest.join(".iter/agents/code.md")).unwrap(),
+        "user customization"
+    );
+    assert!(dest.join(".iter/source/error.md").is_file());
+
+    // --from a directory still works, same add-missing-only semantics.
+    let out3 = Command::new(BIN)
         .args(["init", dest.to_str().unwrap(), "--from", template_dir().to_str().unwrap()])
         .output()
         .unwrap();
-    assert_eq!(out2.status.code(), Some(1));
+    assert!(out3.status.success());
+    assert_eq!(
+        std::fs::read_to_string(dest.join(".iter/agents/code.md")).unwrap(),
+        "user customization",
+        "--from must not overwrite either"
+    );
+
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn copy_binary_and_run_scaffolds_project() {
+    // The deployment story: an empty directory, `iterloop run` — the .iter tree
+    // appears from the embedded template and the engine starts clean.
+    let dest = std::env::temp_dir().join(format!("iterloop-e2e-scaffold-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let out = Command::new(BIN)
+        .args(["run", "--project", dest.to_str().unwrap(), "--until-idle"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("missing .iter file"), "run must report the scaffold: {}", stdout);
+    assert!(dest.join(".iter/agents/plan.md").is_file());
+    assert!(dest.join(".iter/.engine/workitems.jsonl").is_file());
 
     let _ = std::fs::remove_dir_all(&dest);
 }

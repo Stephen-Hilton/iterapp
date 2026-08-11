@@ -5,6 +5,7 @@ mod locks;
 mod logging;
 mod runner;
 mod scheduler;
+mod template;
 /// Used by unit tests today; the engine itself reads testgroups in v2 scheduling.
 #[allow(dead_code)]
 mod testgroups;
@@ -92,6 +93,15 @@ fn main() {
 }
 
 fn cmd_run(project: PathBuf, once: bool, until_idle: bool) -> i32 {
+    // Copy-the-binary deployment: heal any missing .iter/ files before starting.
+    match template::ensure_project(&project) {
+        Ok(0) => {}
+        Ok(n) => println!("initialized {} missing .iter file(s) in {}", n, project.display()),
+        Err(e) => {
+            eprintln!("error: cannot initialize .iter in {}: {}", project.display(), e);
+            return 1;
+        }
+    }
     let cfg = config::load(&project);
     let log_file = if cfg.globalsettings.log_default_path.is_empty() {
         None
@@ -292,24 +302,26 @@ fn cmd_stop(project: PathBuf, wait: bool) -> i32 {
 }
 
 fn cmd_init(dest: PathBuf, from: Option<PathBuf>) -> i32 {
-    let template = from
-        .or_else(|| std::env::var_os("ITERAPP_TEMPLATE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("src/.iter"));
-    if !template.is_dir() {
-        eprintln!(
-            "error: template {} not found; pass --from <dir> or set ITERAPP_TEMPLATE",
-            template.display()
-        );
-        return 1;
-    }
-    let target = dest.join(".iter");
-    if target.exists() {
-        eprintln!("error: {} already exists; refusing to overwrite", target.display());
-        return 1;
-    }
-    match copy_dir(&template, &target) {
+    // Idempotent: adds whatever is missing, never overwrites what exists.
+    // Default source is the template EMBEDDED in this binary (self-contained deploy);
+    // --from <dir> (or ITERAPP_TEMPLATE) merges from a directory instead.
+    let external = from.or_else(|| std::env::var_os("ITERAPP_TEMPLATE").map(PathBuf::from));
+    let result = match &external {
+        Some(dir) if dir.is_dir() => merge_dir(dir, &dest.join(".iter")),
+        Some(dir) => {
+            eprintln!("error: template {} not found", dir.display());
+            return 1;
+        }
+        None => template::ensure_project(&dest),
+    };
+    match result {
         Ok(n) => {
-            println!("initialized {} ({} files from {})", target.display(), n, template.display());
+            println!(
+                "initialized {} — {} file(s) added{} (existing files untouched)",
+                dest.join(".iter").display(),
+                n,
+                external.as_ref().map(|d| format!(" from {}", d.display())).unwrap_or_default()
+            );
             0
         }
         Err(e) => {
@@ -319,7 +331,8 @@ fn cmd_init(dest: PathBuf, from: Option<PathBuf>) -> i32 {
     }
 }
 
-fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<usize> {
+/// Copy src into dst recursively, skipping files that already exist in dst.
+fn merge_dir(src: &Path, dst: &Path) -> std::io::Result<usize> {
     std::fs::create_dir_all(dst)?;
     let mut count = 0;
     for entry in std::fs::read_dir(src)? {
@@ -327,8 +340,8 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<usize> {
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
-            count += copy_dir(&from, &to)?;
-        } else {
+            count += merge_dir(&from, &to)?;
+        } else if !to.exists() {
             std::fs::copy(&from, &to)?;
             count += 1;
         }

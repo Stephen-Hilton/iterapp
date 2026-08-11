@@ -5,13 +5,29 @@ work items and delegates each to a purpose-built headless Claude Code agent. Age
 pre/post work steps, and source instructions are all markdown files — adding a file adds
 a capability. Full specification: [`src/features/iterloop.md`](src/features/iterloop.md).
 
+## Deploy = copy one file
+
+`iterloop` is a single self-contained binary — the `.iter/` template ships embedded
+inside it. Drop it into any project directory and start it; missing `.iter/`
+folders and files are created on the spot (existing files are never overwritten):
+
+```bash
+cargo build --release
+cp target/release/iterloop ~/dev/myproject/
+cd ~/dev/myproject && ./iterloop run     # scaffolds .iter/ if absent, starts the loop
+```
+
+The binary is per-platform (build on the OS/arch you deploy to), and agent
+execution shells out to `claude` (plus `git`/`gh` for those prepostwork steps) —
+those must be on PATH; everything else is in the one file.
+
 ## Quickstart
 
 ```bash
 cargo build
 
-# initialize a target project (copies the src/.iter template)
-./target/debug/iterloop init ~/dev/myproject --from src/.iter
+# initialize a target project (embedded template; --from <dir> to use your own)
+./target/debug/iterloop init ~/dev/myproject
 
 # add a work item
 ./target/debug/iterloop add --project ~/dev/myproject \
