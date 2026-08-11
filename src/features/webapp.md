@@ -235,7 +235,8 @@ it describes (a component team owns its marker like its code).
 ### Project Settings (ITERAPP → Settings)
 
 Kept — it earns its place as the home of marker discovery config: project name,
-**scan roots** (multiple; can point outside the repo), the single **marker glob**
+**url_slug** (hostname + branding: `{slug}.localhost:{port}`, tab title, favicon
+tint), **scan roots** (multiple; can point outside the repo), the single **marker glob**
 (default `**/*.iter.md`; role sorted by frontmatter, see Projects), the
 **testgroups glob**, **default_context**, and (advanced) **custom level
 definitions** — ordered `{name, color}` list overriding the C4 default vocabulary.
@@ -279,6 +280,43 @@ Everything renders from existing engine files — no schema change required exce
 | Time records | `times` object |
 | Logs lightbox | engine log file filtered by worker tag |
 
+## Serving & URLs (locked 2026-08-11)
+
+Multiple engines run concurrently — different project directories, different PIDs —
+and must neither collide nor blur together.
+
+**Ports — deterministic auto-assignment.** `serve.port: "auto"` (default, in
+config.json) hashes the project's absolute path into a range (default 9700–9899);
+on the rare clash with an unrelated process, probe upward to the next free port.
+Same project → same port every restart, with zero coordination — which keeps insert
+targets deterministic for agents, prework scripts, and cron
+(`http://pdy-dev.localhost:9741/api/workitems`). Explicit `serve.port: 9779`
+overrides for fixed well-known ports. *(Hostnames don't prevent collisions —
+`*.localhost` names all resolve to 127.0.0.1; the port is what the OS arbitrates.)*
+
+**Hostnames — cosmetic, free.** Browsers resolve any `*.localhost` subdomain to
+loopback with no OS config, so the `url_slug` gives readable URLs:
+`http://pdy-dev.localhost:9741/`. The server also answers plain
+`http://localhost:9741/`. Privileged ports (dropping `:9741`) and TLS are both
+**skipped by decision** — loopback `localhost`/`*.localhost` are already secure
+contexts in browsers, so https buys nothing here.
+
+**Server registry — discovery across engines.** Each `iterloop serve` writes
+`{project_name, url_slug, path, port, pid, started}` to `~/.iterapp/servers.json`
+on startup and removes itself on shutdown; readers drop rows whose pid is gone.
+Powers `iterloop servers` (CLI list) and the sidebar's **Running Servers** switcher
+(`GET /api/servers`), so every webapp links to every other one even if a hash moved
+a port.
+
+**Telling projects apart — four branding surfaces**, ordered by how much they help
+with ten open tabs:
+1. Browser tab `<title>`: `{url_slug} · IterLoop`.
+2. Favicon tinted per project — an SVG dot data-URI colored by slug hash, with the
+   slug's initial; color beats text across many tabs.
+3. Sidebar: `{project_name}` + `{url_slug}.localhost:{port}` under the wordmark, on
+   every page.
+4. Projects page root row carries `{project_name}` (never a generic "Project").
+
 ## API (merge phase)
 
 Served by the same binary — `iterloop serve --project <p> [--port 9779]`, or
@@ -305,6 +343,8 @@ GET    /api/markers                    scanned project model (nodes + use-cases)
 POST   /api/markers/rescan             re-run marker discovery
 GET    /api/projectsettings            .iter/projects.json
 PUT    /api/projectsettings            write it back
+GET    /api/servers                    live rows from ~/.iterapp/servers.json
+                                       (pid-checked) — the Running Servers switcher
 ```
 
 All mutations go through the same record-lock protocol as `iterloop add`; the web

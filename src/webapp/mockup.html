@@ -1,4 +1,4 @@
-<title>IterLoop / Work Items</title>
+<title>pdy-dev · IterLoop</title>
 <style>
   :root {
     --bg: #f2f4f7;
@@ -78,8 +78,14 @@
     border-right: 1px solid var(--border);
     padding: 18px 14px;
   }
-  .side h1 { font-size: 17px; margin: 0 0 20px; letter-spacing: 0.2px; }
+  .side h1 { font-size: 17px; margin: 0 0 6px; letter-spacing: 0.2px; }
   .side h1 .loop { color: var(--accent); }
+  .projbrand { display: grid; gap: 1px; margin: 0 0 18px; }
+  .projbrand b { font-size: 12px; }
+  .projbrand span { font-size: 10.5px; color: var(--text-dim); font-family: var(--mono); }
+  .nav .srv { display: flex; align-items: center; gap: 7px; }
+  .nav .srv .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .nav .srv small { color: var(--text-dim); font-family: var(--mono); font-size: 10px; margin-left: auto; }
   .navgroup { margin-bottom: 22px; }
   .navgroup .navhead {
     font-size: 10.5px; font-weight: 700; letter-spacing: 0.12em;
@@ -408,6 +414,7 @@
 <div class="app">
   <aside class="side">
     <h1>Iter<span class="loop">Loop</span></h1>
+    <div class="projbrand"><b>Paydaay Core Product</b><span>pdy-dev.localhost:9741</span></div>
     <div class="navgroup">
       <div class="navhead">Iterloop</div>
       <nav class="nav">
@@ -422,6 +429,10 @@
         <a href="#/projects" data-view="projects">Projects</a>
         <a href="#/iasettings" data-view="iasettings">Settings</a>
       </nav>
+    </div>
+    <div class="navgroup">
+      <div class="navhead">Running Servers</div>
+      <nav class="nav" id="serverSwitch"></nav>
     </div>
   </aside>
 
@@ -1440,7 +1451,8 @@ document.addEventListener('click', (e) => {
 
 /* --------------------------------------------------------- project settings */
 const PROJSET = {
-  project_name: ['Paydaay Core Product', 'display name for the Projects page'],
+  project_name: ['Paydaay Core Product', 'display name: sidebar, Projects root row'],
+  url_slug: ['pdy-dev', 'hostname + tab title + favicon tint: http://pdy-dev.localhost:{port}/'],
   scan_roots: ['~/dev/paydaay-core\n~/dev/paydaay-shared', 'directories searched for markers — one per line; may be outside this repo'],
   marker_glob: ['**/*.iter.md', 'ONE glob finds every iterapp file; frontmatter declares each file’s role (see legend above)'],
   testgroups_glob: ['**/testgroups.iter.md', 'test-group files aligned to nodes'],
@@ -1474,6 +1486,51 @@ function renderIaSettings(){
   $('psSave').addEventListener('click', () => toast('projects.json saved (mock) — rescan to apply new globs'));
   $('psReset').addEventListener('click', () => { renderIaSettings(); toast('Reset (unsaved)'); });
 }
+
+/* -------------------------------------------------- multi-server identity */
+/* In the wired version: url_slug + project_name from /api/projectsettings, the
+   server list from /api/servers (backed by ~/.iterapp/servers.json, pid-checked). */
+const SLUG = 'pdy-dev';
+const SERVERS = [
+  { name:'Paydaay Core Product', slug:'pdy-dev', port:9741, current:true },
+  { name:'greet (sample)',       slug:'greet',   port:9812 },
+  { name:'paydaay-notify',       slug:'notify',  port:9733 },
+];
+
+function slugColor(slug){
+  let h = 0;
+  for (const c of slug) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return `hsl(${h % 360}, 62%, 42%)`;
+}
+
+/* favicon: an SVG dot tinted by slug hash, carrying the slug's initial —
+   with ten tabs open, color beats text */
+(function setFavicon(){
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+    <circle cx="8" cy="8" r="7" fill="${slugColor(SLUG)}"/>
+    <text x="8" y="11.6" font-size="9.5" text-anchor="middle" fill="#fff"
+      font-family="sans-serif" font-weight="700">${SLUG[0].toUpperCase()}</text></svg>`;
+  const link = document.createElement('link');
+  link.rel = 'icon';
+  link.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
+  document.head.appendChild(link);
+})();
+
+(function renderServers(){
+  $('serverSwitch').innerHTML = SERVERS.map(s => `
+    <a href="#" class="srv ${s.current ? 'here' : ''}" data-server="${esc(s.slug)}"
+       title="http://${esc(s.slug)}.localhost:${s.port}/">
+      <span class="dot" style="background:${slugColor(s.slug)}"></span>
+      ${esc(s.slug)}${s.current ? '' : ''}
+      <small>:${s.port}</small></a>`).join('');
+  $('serverSwitch').addEventListener('click', (e) => {
+    const a = e.target.closest('[data-server]');
+    if (!a) return;
+    e.preventDefault();
+    const s = SERVERS.find(x => x.slug === a.dataset.server);
+    toast(s.current ? 'This server' : `(mock) would open http://${s.slug}.localhost:${s.port}/`);
+  });
+})();
 
 render();
 navTo(location.hash.replace(/^#\//,'') || 'workitems');
