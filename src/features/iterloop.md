@@ -239,6 +239,11 @@ existence check, `{codepath}` / `~` substitution) and hands the resulting concre
 list into the built prompt. The agent then reads the files itself as part of spin-up —
 the engine does not inline file contents into the prompt.
 
+**The path rule** (one rule, everywhere): every path may be a glob; relative paths
+start at the **project root** (the directory holding `.iter/`); `~` = home;
+`{codepath}` anchors a pattern to the work item's own code. Codepath itself is always
+stored absolute.
+
 ### 6. Test structure — `testgroups.iter.md` and `workitem.testfiles`
 
 Tests live **with the code being modified** — the one data structure that must. Test

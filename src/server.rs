@@ -126,7 +126,7 @@ pub fn project_settings(project_root: &Path) -> Value {
         "scan_roots": ["."],
         "marker_glob": "**/*.iter.md",
         "testgroups_glob": "**/testgroups.iter.md",
-        "default_context": ["{marker}", "{ancestor_markers}"],
+        "default_context": ["{marker}", "{ancestor_markers}", "{interfaces}"],
     });
     if let Ok(text) = std::fs::read_to_string(project_root.join(".iter/projects.json")) {
         if let Ok(Value::Object(saved)) = serde_json::from_str::<Value>(&text) {
@@ -376,6 +376,7 @@ fn api_meta(project: &Path) -> Resp {
             "project_root": project.canonicalize().unwrap_or_else(|_| project.to_path_buf()).to_string_lossy(),
             "project_name": settings["project_name"],
             "url_slug": settings["url_slug"],
+            "default_context": settings["default_context"],
         }),
     )
 }

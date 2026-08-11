@@ -543,11 +543,20 @@ function rnd8(){ return Math.random().toString(16).slice(2,10); }
 function rnd4(){ return Math.random().toString(16).slice(2,6); }
 function nowIso(){ return new Date().toISOString().replace(/\.\d+Z$/, 'Z'); }
 
+/* THE PATH RULE (one rule, everywhere): every path may be a glob; relative paths
+   start at the PROJECT ROOT (where .iter/ lives); ~ = home; {codepath} anchors a
+   line to the work item's own code; codepaths are always stored absolute. */
+let DEFAULT_CONTEXT = ['{marker}', '{ancestor_markers}', '{interfaces}'];
+function literalContextLines(){
+  // the non-placeholder lines of default_context — what a blank New WorkItem inherits
+  return DEFAULT_CONTEXT.filter(l => !/\{(marker|ancestor_markers|interfaces)\}/.test(l));
+}
+
 function mk(over) {
   return Object.assign({
     workid: uuid(), title:'', type:'code', state:'todo', source:'user',
     priority:5, risk:0, codepath:'./src',
-    context:['./bizreq.md','./techreq.md'], testfiles:['./test/testgroups.iter.md'],
+    context:[], testfiles:[],
     prework:[], mainwork:'', postwork:[], output:'', attempts:0, lasterror:'',
     tests:null,
     times:{ added:nowIso(), start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'' },
@@ -662,6 +671,9 @@ async function loadAll(){
     PREPOST.length = 0;
     meta.prepostwork.forEach(p => PREPOST.push(p));
     PROJECT_ROOT = meta.project_root;
+    if (Array.isArray(meta.default_context) && meta.default_context.length) {
+      DEFAULT_CONTEXT = meta.default_context;
+    }
     items = [...list.open, ...list.closed.slice().reverse()];
     const brand = document.querySelector('.projbrand');
     brand.querySelector('b').textContent = meta.project_name;
@@ -1001,6 +1013,7 @@ let draft = null;   // { mode:'create'|'edit'|'clone'|'followup', base:workid|nu
 function openForm(mode, source, priorState){
   // create with a source = prefilled create (e.g. Create WorkItem from a Projects node)
   const d = source ? JSON.parse(JSON.stringify(source)) : mk({});
+  if (mode === 'create' && !source) d.context = literalContextLines();
   if (mode === 'clone') { d.workid = uuid(); d.state='todo'; d.attempts=0; d.output=''; d.tests=null; d.lasterror='';
     d.times = { added:nowIso(), start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'' }; }
   if (mode === 'followup') {
@@ -1038,7 +1051,10 @@ function openForm(mode, source, priorState){
         <div class="pathhint" id="f_pathhint">→ ${esc(absCodepath(d.codepath))}</div>
       </div>
       <span class="flabel top-align">Context</span>
-      <textarea id="f_context" rows="2" placeholder="one glob or path per line">${esc(d.context.join('\n'))}</textarea>
+      <div>
+        <textarea id="f_context" rows="2" style="width:100%" placeholder="one path or glob per line">${esc(d.context.join('\n'))}</textarea>
+        <div class="pathhint">one rule: globs ok anywhere · relative paths start at the project root · ~ = home · {codepath} = this work item’s code</div>
+      </div>
       <span class="flabel top-align">Test files</span>
       <textarea id="f_testfiles" rows="1">${esc(d.testfiles.join('\n'))}</textarea>
       <span class="flabel top-align">Prework</span>
@@ -1775,13 +1791,19 @@ function projClick(e){
   const mk_ = e.target.closest('[data-mkworkitem]');
   if (mk_) {
     const m = MARKERS.find(x => x.key === mk_.dataset.mkworkitem);
-    // Context = this node's marker + ancestor chain + the contracts it touches.
-    const ifaceFiles = INTERFACES
-      .filter(i => m.uses.includes(i.id) || m.provides.includes(i.id))
-      .map(i => i.file);
-    const ctx = [m.path, ...markerAncestors(m.key).map(a => a.path), ...ifaceFiles];
-    openForm('create', mk({ codepath: m.dir, context: ctx, testfiles: [`${m.dir}/test/testgroups.iter.md`],
-      title: '', mainwork: '', source: 'user' }));
+    // Expand the default_context TEMPLATE from Project Settings — placeholders
+    // resolve here; literal lines (and {codepath} lines) pass through for the engine.
+    const ctx = [];
+    for (const line of DEFAULT_CONTEXT) {
+      if (line === '{marker}') ctx.push(m.path);
+      else if (line === '{ancestor_markers}') markerAncestors(m.key).forEach(a => ctx.push(a.path));
+      else if (line === '{interfaces}') INTERFACES
+        .filter(i => m.uses.includes(i.id) || m.provides.includes(i.id))
+        .forEach(i => ctx.push(i.file));
+      else ctx.push(line);
+    }
+    openForm('create', mk({ codepath: m.dir, context: [...new Set(ctx)],
+      testfiles: [`${m.dir}/test/testgroups.iter.md`], title: '', mainwork: '', source: 'user' }));
     return true;
   }
   const ifr = e.target.closest('[data-ifacerow]');
@@ -1859,6 +1881,7 @@ const PROJSET = {
   default_context: ['{marker}\n{ancestor_markers}\n{interfaces}', 'context prefilled on Create-WorkItem-from-node — one entry per line; placeholders in the legend above'],
 };
 const PS_MULTILINE = ['scan_roots', 'default_context'];
+if (!LIVE) DEFAULT_CONTEXT = PROJSET.default_context[0].split('\n');
 
 async function renderIaSettings(){
   let live = null;

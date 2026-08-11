@@ -127,6 +127,21 @@ to **Queued**, Pause & Edit defaults to the item's state **before** it was pause
 (falling back to Queued if that state isn't a pre-processing one, e.g. failed). Output,
 times, and attempts are never editable.
 
+### The path rule (locked 2026-08-11)
+
+One rule everywhere a path appears — work-item `context` and `testfiles`,
+`scan_roots`, `default_context`:
+
+> **Every path may be a glob. Relative paths start at the project root (the
+> directory holding `.iter/` — where `./iter start` ran). `~` = home.
+> `{codepath}` anchors a line to the work item's own code.**
+
+One storage exception: **codepath itself is always stored absolute** (enter it
+however you like; the UI resolves and shows the result before you save). A blank
+New WorkItem prefills its context from `default_context`'s literal lines —
+nothing is hardcoded; Create-from-node expands the full template (placeholders
+included). The rule is printed in the form itself so nobody has to guess.
+
 ## Other pages (initial versions, locked 2026-08-11)
 
 All pages share the chrome (sidebar, engine chip) and live in the same single-page app;
