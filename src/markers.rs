@@ -19,6 +19,7 @@ pub struct Node {
     pub dir: String,  // absolute directory (codepath for Create-WorkItem)
     pub path: String, // absolute marker file path
     pub depth: usize,
+    pub body: String, // the marker body — the context document itself
 }
 
 /// Interfaces are contracts BETWEEN nodes, so they aggregate globally (the file may
@@ -30,7 +31,8 @@ pub struct Interface {
     pub kind: String,     // http|grpc|kafka|sql|file|cli|library|… (free-form)
     pub endpoint: String, // machine-usable address, when the kind has one
     pub description: String,
-    pub file: String, // absolute marker file path (the contract body lives here)
+    pub file: String, // absolute marker file path
+    pub body: String, // the contract itself — often a long multi-line document
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -51,13 +53,23 @@ pub struct Scan {
     pub roots: Vec<String>,
 }
 
-/// Flat `key: value` frontmatter between `---` fences; returns (map, participant lines).
-fn frontmatter(content: &str) -> (HashMap<String, String>, Vec<String>) {
+/// Body cap per marker in scan responses: contracts can be long multi-line JSON
+/// documents and the UI shows them in full, but a runaway file shouldn't bloat the API.
+const BODY_CAP: usize = 65536;
+
+/// Flat `key: value` frontmatter between `---` fences; returns
+/// (map, participant lines, body — everything after the closing fence).
+fn frontmatter(content: &str) -> (HashMap<String, String>, Vec<String>, String) {
     let mut map = HashMap::new();
     let mut participants = Vec::new();
     let trimmed = content.trim_start();
-    let Some(rest) = trimmed.strip_prefix("---") else { return (map, participants) };
-    let Some(end) = rest.find("\n---") else { return (map, participants) };
+    let Some(rest) = trimmed.strip_prefix("---") else { return (map, participants, String::new()) };
+    let Some(end) = rest.find("\n---") else { return (map, participants, String::new()) };
+    let mut body = rest[end + 4..].trim_start_matches('-').trim().to_string();
+    if body.len() > BODY_CAP {
+        body.truncate(BODY_CAP);
+        body.push_str("\n… (truncated — read the full file on disk)");
+    }
     let mut in_participants = false;
     for line in rest[..end].lines() {
         let raw = line.trim_end();
@@ -79,7 +91,7 @@ fn frontmatter(content: &str) -> (HashMap<String, String>, Vec<String>) {
             map.insert(key, val);
         }
     }
-    (map, participants)
+    (map, participants, body)
 }
 
 fn parse_list(val: &str) -> Vec<String> {
@@ -106,7 +118,7 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(&path) else { continue };
-            let (front, participants) = frontmatter(&content);
+            let (front, participants, body) = frontmatter(&content);
             let rel_dir = path
                 .parent()
                 .and_then(|d| d.strip_prefix(&project_root).ok().or_else(|| d.strip_prefix(&root).ok()))
@@ -128,6 +140,7 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                     provides: front.get("provides").map(|v| parse_list(v)).unwrap_or_default(),
                     dir: dir_abs,
                     path: path.to_string_lossy().into_owned(),
+                    body,
                 });
             } else if front.contains_key("interface") {
                 result.interfaces.push(Interface {
@@ -136,6 +149,7 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                     endpoint: front.get("endpoint").cloned().unwrap_or_default(),
                     description: front.get("description").cloned().unwrap_or_default(),
                     file: path.to_string_lossy().into_owned(),
+                    body,
                 });
             } else if !participants.is_empty() {
                 // participant line: "<step> <node key>", e.g. "2.1 core/intake"
@@ -203,6 +217,8 @@ mod tests {
         assert_eq!(scan.interfaces.len(), 1, "interface: files aggregate globally");
         assert_eq!(scan.interfaces[0].id, "evidence-api");
         assert_eq!(scan.interfaces[0].kind, "http");
+        assert_eq!(scan.interfaces[0].body, "contract body", "the contract itself rides along");
+        assert_eq!(scan.nodes[1].body, "context body");
         assert_eq!(scan.nodes[0].key, "");
         assert_eq!(scan.nodes[0].name, "My Project");
         assert_eq!(scan.nodes[1].key, "core/intake");

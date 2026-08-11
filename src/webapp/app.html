@@ -396,6 +396,7 @@
   .prow.dimmed { opacity: 0.38; }
   .prow.participant { border-left: 3px solid var(--thread); padding-left: 5px; }
   .prow .lvltag { flex: none; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 8px; }
+  .prow .chev { flex: none; width: 13px; text-align: center; color: var(--text-dim); font-size: 11px; }
   .prow .pname { font-weight: 650; white-space: nowrap; }
   .prow .pdesc { color: var(--text-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 40px; }
   .prow .uses { display: flex; gap: 4px; flex: none; }
@@ -1546,9 +1547,61 @@ MARKERS.find(m => m.key === 'core/intake/emancipator').uses.push('payout-events'
 /* Interfaces: contracts BETWEEN nodes — aggregated globally (marker files can live
    anywhere), referenced from nodes via uses:/provides:, never owned by the tree. */
 let INTERFACES = [
-  { id:'evidence-api',  kind:'http',  endpoint:'POST /v1/evidence', description:'Store and retrieve consent artifacts', file:'./core/intake/evidence-vault/evidence-api.iter.md' },
-  { id:'payout-events', kind:'kafka', endpoint:'topic: payouts.v2', description:'Settlement lifecycle events for downstream consumers', file:'./interfaces/payout-events.iter.md' },
-  { id:'payout-events', kind:'kafka', endpoint:'topic: payouts.v1', description:'LEGACY duplicate — rationalize with payouts.v2', file:'./core/payout/payout-events.iter.md' },
+  { id:'evidence-api',  kind:'http',  endpoint:'POST /v1/evidence', description:'Store and retrieve consent artifacts', file:'./core/intake/evidence-vault/evidence-api.iter.md',
+    body:`# evidence-api — contract
+
+Store and retrieve immutable consent/verification artifacts. Writes are append-only;
+a stored artifact can never be modified, only superseded.
+
+## Request — POST /v1/evidence
+{
+  "artifact": {
+    "worker_id": "wrk_8842",
+    "kind": "consent | shift_verification | identity",
+    "captured_at": "2026-08-11T14:23:56Z",
+    "payload_sha256": "9f8e7d6c…",
+    "payload_uri": "s3://pdy-evidence/2026/08/11/9f8e7d6c",
+    "source": { "system": "core-intake", "version": "2.14.0" }
+  },
+  "idempotency_key": "wrk_8842:consent:2026-08-11"
+}
+
+## Response — 201
+{
+  "evidence_id": "ev_01J9XQ…",
+  "stored_at": "2026-08-11T14:23:57Z",
+  "supersedes": null
+}
+
+## Errors
+- 409 idempotency_key seen with DIFFERENT payload_sha256 → body names the conflict
+- 422 unknown kind, missing sha, or unreachable payload_uri
+- Consumers MUST treat evidence_id as opaque; ordering comes from stored_at only.` },
+  { id:'payout-events', kind:'kafka', endpoint:'topic: payouts.v2', description:'Settlement lifecycle events for downstream consumers', file:'./interfaces/payout-events.iter.md',
+    body:`# payout-events — contract (v2)
+
+Every settlement state change, exactly-once per (payout_id, state).
+
+## Event envelope
+{
+  "schema": "payouts.v2",
+  "payout_id": "pay_7731",
+  "state": "initiated | rail_selected | sent | settled | returned",
+  "occurred_at": "2026-08-11T15:02:11Z",
+  "rail": "rtp | ach",
+  "amount_minor": 12500,
+  "currency": "USD",
+  "trace": { "workitem": "6f1d2c3a…", "ledger_txn": "txn_99a1" }
+}
+
+Keys: payout_id (partition key). Retention: 30d. Consumers must tolerate
+out-of-order states and dedupe on (payout_id, state).` },
+  { id:'payout-events', kind:'kafka', endpoint:'topic: payouts.v1', description:'LEGACY duplicate — rationalize with payouts.v2', file:'./core/payout/payout-events.iter.md',
+    body:`# payout-events — LEGACY v1 topic
+
+Same intent as payouts.v2 but flat envelope, no trace block, at-least-once.
+Kept only while the reconciliation batch still reads it. RATIONALIZE: migrate the
+batch to v2 and delete this file — the duplicate id flag goes away with it.` },
 ];
 
 let USECASES = [
@@ -1567,6 +1620,7 @@ let USECASES = [
 
 let projUC = -1;          // -1 = no use-case filter
 let projIface = '';       // '' = no interface thread; else an interface id
+let openIface = -1;       // index into INTERFACES of the expanded contract row
 let projOrder = 'hierarchy';
 let projDepth = null;     // null = all levels; else index into LEVELS
 let openMarker = null;
@@ -1578,10 +1632,10 @@ async function loadProjects(){
   MARKERS = scan.nodes.map(n => ({
     key: n.key, level: n.level || 'node', name: n.name, desc: n.description,
     uses: n.uses || [], provides: n.provides || [], depth: n.depth,
-    dir: n.dir, path: n.path,
+    dir: n.dir, path: n.path, body: n.body || '',
   }));
   USECASES = scan.usecases.map(u => ({ name: u.name, desc: u.description, file: u.file, steps: u.steps }));
-  INTERFACES = scan.interfaces.map(i => ({ id: i.id, kind: i.kind, endpoint: i.endpoint, description: i.description, file: i.file }));
+  INTERFACES = scan.interfaces.map(i => ({ id: i.id, kind: i.kind, endpoint: i.endpoint, description: i.description, file: i.file, body: i.body || '' }));
   projLoaded = true;
   return scan;
 }
@@ -1645,18 +1699,30 @@ async function renderProjects(){
   // Interfaces: global aggregation, duplicate ids flagged for rationalization.
   const idCounts = {};
   INTERFACES.forEach(i => { idCounts[i.id] = (idCounts[i.id] || 0) + 1; });
-  const ifaceRows = INTERFACES.map(i => {
+  const ifaceRows = INTERFACES.map((i, idx) => {
     const providers = MARKERS.filter(m => m.provides.includes(i.id));
     const consumers = MARKERS.filter(m => m.uses.includes(i.id));
     const on = projIface === i.id;
-    return `<div class="prow ${on?'participant':''}" data-iface="${esc(i.id)}" role="button" tabindex="0" title="Click to thread providers/consumers in the tree">
+    const open = openIface === idx;
+    return `<div class="prow ${on?'participant':''}" data-ifacerow="${idx}" role="button" tabindex="0"
+        aria-expanded="${open}" title="Click to open the contract and thread providers/consumers in the tree">
+      <span class="chev">${open ? '▾' : '▸'}</span>
       <span class="kindchip k-${esc(i.kind || 'other')}">${esc(i.kind || '?')}</span>
       <span class="pname mono">${esc(i.id)}</span>
       ${idCounts[i.id] > 1 ? '<span class="dupflag">duplicate id — rationalize</span>' : ''}
       ${i.endpoint ? `<span class="useb mono">${esc(i.endpoint)}</span>` : ''}
       <span class="pdesc">${esc(i.description)}</span>
       <span class="uses"><span class="useb prov">▲ ${providers.length}</span><span class="useb">${consumers.length} consumer${consumers.length===1?'':'s'}</span></span>
-    </div>`;
+    </div>
+    ${open ? `<div class="pdetail">
+      <div class="dlabel">Kind</div><div><span class="kindchip k-${esc(i.kind || 'other')}">${esc(i.kind || '?')}</span>
+        ${i.endpoint ? ` <span class="mono">${esc(i.endpoint)}</span>` : ''}</div>
+      <div class="dlabel">File</div><div class="mono">${esc(i.file)}</div>
+      <div class="dlabel">Providers</div><div>${providers.length ? providers.map(m => `<span class="useb prov">▲ ${esc(m.name)}</span>`).join(' ') : '<span style="color:var(--text-dim)">none declared — who serves this?</span>'}</div>
+      <div class="dlabel">Consumers</div><div>${consumers.length ? consumers.map(m => `<span class="useb">${esc(m.name)}</span>`).join(' ') : '<span style="color:var(--text-dim)">none declared</span>'}</div>
+      <div class="dlabel">Contract</div>
+      <div class="textblock mono" style="max-height:60vh">${esc(i.body || '(no contract body in the marker yet — the file is frontmatter only)')}</div>
+    </div>` : ''}`;
   }).join('');
 
   $('view-projects').innerHTML = `
@@ -1685,7 +1751,7 @@ async function renderProjects(){
     <h3 style="margin:16px 0 6px;font-size:13.5px">Interfaces <span style="color:var(--text-dim);font-weight:500;font-size:12px">— global: aggregated across all scan roots, referenced by nodes via <span class="mono">provides:</span> / <span class="mono">uses:</span>, never owned by the tree</span></h3>
     <div class="ptree">${ifaceRows || '<div class="empty">No interfaces declared yet — add a marker with <span class="mono">interface:</span> frontmatter.</div>'}</div>`;
 
-  $('projUc').addEventListener('change', e => { projUC = +e.target.value; projIface = ''; renderProjects(); });
+  $('projUc').addEventListener('change', e => { projUC = +e.target.value; projIface = ''; openIface = -1; renderProjects(); });
   $('projOrder').addEventListener('change', e => { projOrder = e.target.value; renderProjects(); });
   $('rescan').addEventListener('click', async () => {
     if (!LIVE) { toast('Scanned 2 roots: 16 nodes, 3 interfaces, 2 use-cases, 5 plain docs (mock)'); return; }
@@ -1718,17 +1784,32 @@ function projClick(e){
       title: '', mainwork: '', source: 'user' }));
     return true;
   }
-  const ifr = e.target.closest('[data-iface]');
-  if (ifr) {
-    const id = ifr.dataset.iface;
-    projIface = projIface === id ? '' : id;
-    projUC = -1;
+  const ifr = e.target.closest('[data-ifacerow]');
+  if (ifr && !e.target.closest('.pdetail')) {
+    const idx = +ifr.dataset.ifacerow;
+    if (openIface === idx) {
+      openIface = -1;
+      projIface = '';
+    } else {
+      openIface = idx;
+      projIface = INTERFACES[idx].id;
+      projUC = -1;
+    }
     renderProjects();
     return true;
   }
   const vm = e.target.closest('[data-viewmarker]');
   if (vm) {
     const m = MARKERS.find(x => x.key === vm.dataset.viewmarker);
+    if (m.body) {
+      // LIVE (or any marker whose body we hold): show the real file content.
+      const front = `---\nname: ${m.name}\nlevel: ${m.level}\ndescription: "${m.desc}"` +
+        (m.provides.length ? `\nprovides: [${m.provides.join(', ')}]` : '') +
+        (m.uses.length ? `\nuses: [${m.uses.join(', ')}]` : '') + '\n---\n\n';
+      openLb('Marker — ' + m.path,
+        `<div class="textblock mono" style="max-height:66vh">${esc(front + m.body)}</div>`);
+      return true;
+    }
     openLb('Marker — ' + m.path, `<div class="textblock mono" style="max-height:60vh">${esc(
 `---
 name: ${m.name}
