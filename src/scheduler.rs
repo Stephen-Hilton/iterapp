@@ -59,11 +59,11 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
         .canonicalize()
         .map_err(|e| format!("bad project path {}: {}", project_root.display(), e))?;
     if !project_root.join(".iter").is_dir() {
-        return Err(format!("{} has no .iter/ directory (run `iterloop init`?)", project_root.display()));
+        return Err(format!("{} has no .iter/ directory (run `iter init`?)", project_root.display()));
     }
     let cfg = config::load(&project_root);
 
-    // `iterloop run` clears any leftover stop signal.
+    // `iter run` clears any leftover stop signal.
     let _ = std::fs::remove_file(stop_signal_path(&project_root));
 
     let shared = Arc::new(Shared {

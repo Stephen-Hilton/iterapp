@@ -37,12 +37,12 @@ parallelizable implementation plan, then hand the pieces off as new work items.
 ## Creating new work items (handoff)
 Create work items by running:
 
-    iterloop add --file <item.json>
+    iter add --file <item.json>
 
 - Set `source` to `agent: plan`, `type` to the target agent, and `codepath` to the
   narrowest directory the work owns (this is the lock scope — narrower = more parallelism).
 - Set `priority` 0–10 (default 5; raise only for blocking slices) and `risk` 0–10.
-- If `iterloop add` refuses because the queue is full (`max_open_workitems`), report the
+- If `iter add` refuses because the queue is full (`max_open_workitems`), report the
   refused items in your output instead of retrying.
 
 ## Output

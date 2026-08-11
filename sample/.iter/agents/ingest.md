@@ -38,11 +38,11 @@ iterapp-ready.
 ## Creating new work items (handoff)
 Create work items by running:
 
-    iterloop add --file <item.json>
+    iter add --file <item.json>
 
 - Set `source` to `agent: ingest`, and attach the normalized requirement files you wrote
   to each new item's `context` so downstream agents inherit them.
-- If `iterloop add` refuses (queue at `max_open_workitems`), note it in your output.
+- If `iter add` refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: requirement files written/updated, ambiguities flagged, and the work items you

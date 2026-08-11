@@ -1,14 +1,14 @@
-//! End-to-end tests: real `iterloop` binary, real template files, fake claude runner.
+//! End-to-end tests: real `iter` binary, real template files, fake claude runner.
 //!
-//! The fake runner (a shell stub swapped in via ITERLOOP_CLAUDE_BIN) echoes canned
+//! The fake runner (a shell stub swapped in via ITER_CLAUDE_BIN) echoes canned
 //! `claude -p --output-format json` output, so the whole engine loop — locking,
-//! lifecycle, handoff via `iterloop add`, terminal output — runs without burning tokens.
+//! lifecycle, handoff via `iter add`, terminal output — runs without burning tokens.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_iterloop");
+const BIN: &str = env!("CARGO_BIN_EXE_iter");
 
 fn template_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/.iter")
@@ -47,7 +47,7 @@ fn setup_project(name: &str, max_attempts: u32, max_open: usize) -> (PathBuf, Pa
     .unwrap();
 
     // The fake claude: finds the project root by walking up from cwd, supports a
-    // handoff trigger (calls `iterloop add` like a real agent would) and a failure
+    // handoff trigger (calls `iter add` like a real agent would) and a failure
     // trigger (non-zero exit).
     let stub = root.join("fake-claude.sh");
     std::fs::write(
@@ -58,7 +58,7 @@ dir="$(pwd)"
 while [ "$dir" != "/" ] && [ ! -d "$dir/.iter" ]; do dir="$(dirname "$dir")"; done
 case "$args" in
   *HANDOFF_TRIGGER*)
-    "$ITERLOOP_BIN" add --project "$dir" --type code --title "handoff child" \
+    "$ITER_BIN" add --project "$dir" --type code --title "handoff child" \
       --mainwork "child work created by handoff" --codepath "./src" \
       --source "agent: plan" >/dev/null 2>&1
     ;;
@@ -110,8 +110,8 @@ fn workitem_json(id: &str, typ: &str, title: &str, codepath: &str, mainwork: &st
 fn run_engine(root: &Path, stub: &Path, timeout: Duration) -> String {
     let mut child = Command::new(BIN)
         .args(["run", "--project", root.to_str().unwrap(), "--until-idle"])
-        .env("ITERLOOP_CLAUDE_BIN", stub)
-        .env("ITERLOOP_BIN", BIN)
+        .env("ITER_CLAUDE_BIN", stub)
+        .env("ITER_BIN", BIN)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -165,7 +165,7 @@ fn full_lifecycle_concurrency_and_handoff() {
     // Three seeds across agent types. The plan item (codepath ".") and the code item
     // (codepath "./src") have overlapping lock scopes, so the codepath lock must
     // serialize them; the handoff trigger makes the plan agent create a 4th item
-    // mid-run via `iterloop add`, exactly like a real agent would.
+    // mid-run via `iter add`, exactly like a real agent would.
     seed(&root, &workitem_json("e2e-code-1", "code", "code seed", "./src", "implement the thing", r#""git-pull""#, r#""git-commit""#));
     seed(&root, &workitem_json("e2e-plan-1", "plan", "plan seed", ".", "plan the thing HANDOFF_TRIGGER", "", ""));
     seed(&root, &workitem_json("e2e-test-1", "test", "test seed", ".", "run the tests", r#""inline literal prework step""#, ""));
@@ -199,7 +199,7 @@ fn full_lifecycle_concurrency_and_handoff() {
     let test_item = closed.iter().find(|i| i["workid"] == "e2e-test-1").unwrap();
     assert!(test_item["output"].as_str().unwrap().contains("[prework:inline("));
 
-    // Handoff child: created by the stub through `iterloop add`, picked up and completed.
+    // Handoff child: created by the stub through `iter add`, picked up and completed.
     let child = closed.iter().find(|i| i["title"] == "handoff child").expect("handoff child must be picked up and closed");
     assert_eq!(child["source"], "agent: plan");
     assert_eq!(child["type"], "code");
@@ -324,8 +324,69 @@ fn init_embedded_template_and_heal() {
 }
 
 #[test]
+fn start_serves_webapp_and_runs_engine() {
+    use std::io::{Read, Write};
+    let dest = std::env::temp_dir().join(format!("iterloop-e2e-start-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(dest.join(".iter/.engine")).unwrap();
+    // Fast ticks so the stop signal is honored quickly (heal fills the other files).
+    std::fs::write(
+        dest.join(".iter/.engine/config.json"),
+        r#"{"engine":{"tick_interval_sec":1},"globalsettings":{"log_default_path":""}}"#,
+    )
+    .unwrap();
+
+    let port = 21000 + (std::process::id() % 20000) as u16;
+    let mut child = Command::new(BIN)
+        .args(["start", "--project", dest.to_str().unwrap(), "--port", &port.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The webapp must answer with the embedded page.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut sock) => {
+                sock.write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").unwrap();
+                let mut resp = String::new();
+                let _ = sock.read_to_string(&mut resp);
+                assert!(resp.starts_with("HTTP/1.1 200"), "bad response: {}", &resp[..resp.len().min(120)]);
+                assert!(resp.contains("IterLoop"), "page body must be the embedded webapp");
+                break;
+            }
+            Err(_) => {
+                assert!(Instant::now() < deadline, "webapp never came up on port {}", port);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    // Engine is running too: stop it via the signal and expect a clean exit.
+    std::thread::sleep(Duration::from_millis(1200)); // let the scheduler clear old signals first
+    let ok = Command::new(BIN).args(["stop", "--project", dest.to_str().unwrap()]).status().unwrap();
+    assert!(ok.success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "engine did not honor stop.signal");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(status.success());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("iterapp webapp:"), "must print the URL: {}", stdout);
+    assert!(stdout.contains(&format!("localhost:{}/", port)));
+
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
 fn copy_binary_and_run_scaffolds_project() {
-    // The deployment story: an empty directory, `iterloop run` — the .iter tree
+    // The deployment story: an empty directory, `iter run` — the .iter tree
     // appears from the embedded template and the engine starts clean.
     let dest = std::env::temp_dir().join(format!("iterloop-e2e-scaffold-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dest);

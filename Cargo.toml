@@ -1,7 +1,12 @@
 [package]
-name = "iterloop"
+name = "iterapp"
 version = "0.1.0"
 edition = "2024"
+
+# One executable, two functions: the iterloop engine and the iterapp webapp.
+[[bin]]
+name = "iter"
+path = "src/main.rs"
 
 [dependencies]
 chrono = "0.4.45"

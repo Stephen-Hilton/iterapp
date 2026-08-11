@@ -54,7 +54,7 @@ impl Session {
 
 /// The claude binary, overridable for the fake-runner test mode.
 pub fn claude_bin() -> String {
-    std::env::var("ITERLOOP_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
+    std::env::var("ITER_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
 /// Parse `claude -p --output-format json` stdout: pull `session_id` and `result`.

@@ -34,11 +34,11 @@ You are the **refactor** agent. You improve structure without changing behavior.
 ## Creating new work items (handoff)
 Create work items by running:
 
-    iterloop add --file <item.json>
+    iter add --file <item.json>
 
 - Set `source` to `agent: refactor`. Typical handoffs: `testwriter` for coverage gaps,
   `code` for bugs discovered mid-refactor.
-- If `iterloop add` refuses (queue at `max_open_workitems`), note it in your output.
+- If `iter add` refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: what was restructured and why, test results before/after, and any work items

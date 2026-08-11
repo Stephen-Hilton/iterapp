@@ -301,10 +301,10 @@ loopback with no OS config, so the `url_slug` gives readable URLs:
 **skipped by decision** — loopback `localhost`/`*.localhost` are already secure
 contexts in browsers, so https buys nothing here.
 
-**Server registry — discovery across engines.** Each `iterloop serve` writes
+**Server registry — discovery across engines.** Each `iter serve` writes
 `{project_name, url_slug, path, port, pid, started}` to `~/.iterapp/servers.json`
 on startup and removes itself on shutdown; readers drop rows whose pid is gone.
-Powers `iterloop servers` (CLI list) and the sidebar's **Running Servers** switcher
+Powers `iter servers` (CLI list) and the sidebar's **Running Servers** switcher
 (`GET /api/servers`), so every webapp links to every other one even if a hash moved
 a port.
 
@@ -319,14 +319,14 @@ with ten open tabs:
 
 ## API (merge phase)
 
-Served by the same binary — `iterloop serve --project <p> [--port 9779]`, or
-`iterloop run --serve` to run engine + web server together. Localhost only by default.
+Served by the same binary — `iter serve --project <p> [--port 9779]`, or
+`iter run --serve` to run engine + web server together. Localhost only by default.
 A deterministic local port also gives scripts/agents a stable insert path.
 
 ```
 GET    /api/state                      engine state + counts
 GET    /api/workitems?state=…          open + closed items, filterable
-POST   /api/workitems                  insert (same validation as `iterloop add`: warn
+POST   /api/workitems                  insert (same validation as `iter add`: warn
                                        on unknown type, 409 at max_open_workitems)
 GET    /api/workitems/{id}             one item, full detail
 PATCH  /api/workitems/{id}             edit request fields (only todo/paused items)
@@ -347,7 +347,7 @@ GET    /api/servers                    live rows from ~/.iterapp/servers.json
                                        (pid-checked) — the Running Servers switcher
 ```
 
-All mutations go through the same record-lock protocol as `iterloop add`; the web
+All mutations go through the same record-lock protocol as `iter add`; the web
 server is just another external producer, so engine and UI can't corrupt the queue.
 
 ## Build plan

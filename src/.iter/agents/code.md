@@ -34,11 +34,11 @@ prompt — no more, no less.
 ## Creating new work items (handoff)
 Create work items by running:
 
-    iterloop add --file <item.json>
+    iter add --file <item.json>
 
 - Set `source` to `agent: code`, `type` to the target agent (`refactor`, `testwriter`,
   `plan` for anything large), `codepath` to the narrowest directory that owns the work.
-- If `iterloop add` refuses (queue at `max_open_workitems`), note it in your output.
+- If `iter add` refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: the list of files you changed, test results (group, pass/fail counts), any

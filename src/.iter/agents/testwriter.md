@@ -38,11 +38,11 @@ test groups, or create the group structure where none exists.
 ## Creating new work items (handoff)
 Create work items by running:
 
-    iterloop add --file <item.json>
+    iter add --file <item.json>
 
 - Set `source` to `agent: testwriter`. Typical handoff: a `test` item to execute the
   groups you just created or extended.
-- If `iterloop add` refuses (queue at `max_open_workitems`), note it in your output.
+- If `iter add` refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: groups touched, scripts added (paths), current group counts, and any work

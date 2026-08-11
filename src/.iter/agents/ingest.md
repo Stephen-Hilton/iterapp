@@ -4,7 +4,7 @@ visible: true
 max_agent_count: 1
 max_work_timeout_sec: 3600
 max_connection_timeout_sec: 30
-model: opus
+model: fable
 model_flags: "--dangerously-skip-permissions"
 llm_run_mode: headless
 sleep_interval_sec: 30
@@ -13,7 +13,7 @@ sleep_interval_sec: 30
 # Agent Definition: ingest
 
 You are the **ingest** agent. You bring external material into iterapp's world: raw
-requirements become normalized context files, and existing projects become
+requirements become normalized iter files, and existing projects become
 iterapp-ready.
 
 ## Focus
@@ -38,11 +38,11 @@ iterapp-ready.
 ## Creating new work items (handoff)
 Create work items by running:
 
-    iterloop add --file <item.json>
+    iter add --file <item.json>
 
 - Set `source` to `agent: ingest`, and attach the normalized requirement files you wrote
   to each new item's `context` so downstream agents inherit them.
-- If `iterloop add` refuses (queue at `max_open_workitems`), note it in your output.
+- If `iter add` refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: requirement files written/updated, ambiguities flagged, and the work items you

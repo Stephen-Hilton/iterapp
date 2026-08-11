@@ -7,15 +7,25 @@ a capability. Full specification: [`src/features/iterloop.md`](src/features/iter
 
 ## Deploy = copy one file
 
-`iterloop` is a single self-contained binary — the `.iter/` template ships embedded
-inside it. Drop it into any project directory and start it; missing `.iter/`
-folders and files are created on the spot (existing files are never overwritten):
+`iter` is a single self-contained binary — the iterloop engine, the iterapp webapp,
+and the `.iter/` template all ship inside it. Drop it into any project directory and
+start it; missing `.iter/` folders and files are created on the spot (existing files
+are never overwritten):
 
 ```bash
 cargo build --release
-cp target/release/iterloop ~/dev/myproject/
-cd ~/dev/myproject && ./iterloop run     # scaffolds .iter/ if absent, starts the loop
+cp target/release/iter ~/dev/myproject/
+cd ~/dev/myproject && ./iter start
+#   initialized 21 missing .iter file(s) in .
+#     iterapp webapp:  http://localhost:9889/
+#                      http://myproject.localhost:9889/
 ```
+
+`iter start` runs the engine loop AND the webapp server, printing the URL to copy or
+open. The port is deterministic (hashed from the project path into 9700–9899, so the
+same project always gets the same port; `--port N` to pin one), and the hostname slug
+comes from `url_slug` in `.iter/projects.json`, defaulting to the directory name.
+Use `iter run` for the engine alone, headless.
 
 The binary is per-platform (build on the OS/arch you deploy to), and agent
 execution shells out to `claude` (plus `git`/`gh` for those prepostwork steps) —
@@ -27,19 +37,19 @@ those must be on PATH; everything else is in the one file.
 cargo build
 
 # initialize a target project (embedded template; --from <dir> to use your own)
-./target/debug/iterloop init ~/dev/myproject
+./target/debug/iter init ~/dev/myproject
 
 # add a work item
-./target/debug/iterloop add --project ~/dev/myproject \
+./target/debug/iter add --project ~/dev/myproject \
   --type code --title "add auth middleware" \
   --mainwork "Implement ... acceptance criteria ..." --codepath "./api" --priority 6
 
-# run the engine (Ctrl-C, or `iterloop stop` from another shell)
-./target/debug/iterloop run --project ~/dev/myproject
+# run the engine (Ctrl-C, or `iter stop` from another shell)
+./target/debug/iter run --project ~/dev/myproject
 
 # inspect
-./target/debug/iterloop status --project ~/dev/myproject
-./target/debug/iterloop stop   --project ~/dev/myproject --wait   # drain, then stop
+./target/debug/iter status --project ~/dev/myproject
+./target/debug/iter stop   --project ~/dev/myproject --wait   # drain, then stop
 ```
 
 `run --once` executes a single tick; `run --until-idle` exits when the queue drains —
@@ -52,12 +62,12 @@ work items. Copy it somewhere and point the engine at it:
 
 ```bash
 cp -R sample /tmp/demo
-./target/debug/iterloop run --project /tmp/demo --until-idle
+./target/debug/iter run --project /tmp/demo --until-idle
 ```
 
 ## Fake runner (no tokens)
 
-Set `ITERLOOP_CLAUDE_BIN` to any executable that prints
+Set `ITER_CLAUDE_BIN` to any executable that prints
 `{"session_id":"...","result":"..."}` and the engine runs the full loop — locking,
 lifecycle, handoff — without calling Claude. The integration tests in `tests/e2e.rs`
 use this; see `setup_project` there for a reference stub.
@@ -73,7 +83,7 @@ use this; see `setup_project` there for a reference stub.
 
 ## Notes
 
-- Agents create handoff work items by running `iterloop add`; put the binary on `PATH`
+- Agents create handoff work items by running `iter add`; put the binary on `PATH`
   (or reference it absolutely in your agent files) so spawned agents can find it.
 - The template agent files ship with `--dangerously-skip-permissions` for sandboxed
   demos. Remove it (and rely on your repo's own `.claude/` permission settings) before

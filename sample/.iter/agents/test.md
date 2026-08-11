@@ -39,11 +39,11 @@ whatever they reveal to the right agent.
 ## Creating new work items (handoff)
 Create work items by running:
 
-    iterloop add --file <item.json>
+    iter add --file <item.json>
 
 - Set `source` to `agent: test`, `codepath` to the directory owning the code under test,
   and include the relevant `testgroups.iter.md` path in the new item's `testfiles`.
-- If `iterloop add` refuses (queue at `max_open_workitems`), note it in your output.
+- If `iter add` refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: per-group results (label, counts, pass/fail), direct fixes you made, and any

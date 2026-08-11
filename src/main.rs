@@ -5,6 +5,7 @@ mod locks;
 mod logging;
 mod runner;
 mod scheduler;
+mod server;
 mod template;
 /// Used by unit tests today; the engine itself reads testgroups in v2 scheduling.
 #[allow(dead_code)]
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 use workitems::{Queue, WorkItem};
 
 #[derive(Parser)]
-#[command(name = "iterloop", version, about = "iterapp's looping AI-coding engine")]
+#[command(name = "iter", version, about = "iterapp: the iterloop engine and webapp in one executable")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -24,7 +25,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the engine loop
+    /// Start the engine loop AND the webapp server; prints the URL
+    Start {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Fixed port (default: deterministic auto-port hashed from the project path)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Start the engine loop only (no webapp)
     Run {
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -81,6 +90,7 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
+        Command::Start { project, port } => cmd_start(project, port),
         Command::Run { project, once, until_idle } => cmd_run(project, once, until_idle),
         Command::Add { project, file, item_type, title, mainwork, codepath, priority, risk, source } => {
             cmd_add(project, file, item_type, title, mainwork, codepath, priority, risk, source)
@@ -92,17 +102,17 @@ fn main() {
     std::process::exit(code);
 }
 
-fn cmd_run(project: PathBuf, once: bool, until_idle: bool) -> i32 {
-    // Copy-the-binary deployment: heal any missing .iter/ files before starting.
-    match template::ensure_project(&project) {
+/// Shared startup: heal .iter/, load config, initialize logging. Returns false on failure.
+fn boot(project: &Path) -> bool {
+    match template::ensure_project(project) {
         Ok(0) => {}
         Ok(n) => println!("initialized {} missing .iter file(s) in {}", n, project.display()),
         Err(e) => {
             eprintln!("error: cannot initialize .iter in {}: {}", project.display(), e);
-            return 1;
+            return false;
         }
     }
-    let cfg = config::load(&project);
+    let cfg = config::load(project);
     let log_file = if cfg.globalsettings.log_default_path.is_empty() {
         None
     } else {
@@ -111,7 +121,40 @@ fn cmd_run(project: PathBuf, once: bool, until_idle: bool) -> i32 {
         Some(project.join(rel))
     };
     logging::init(&cfg.globalsettings.log_level, log_file, cfg.globalsettings.log_max_size_mb);
+    true
+}
+
+fn cmd_run(project: PathBuf, once: bool, until_idle: bool) -> i32 {
+    if !boot(&project) {
+        return 1;
+    }
     match scheduler::run(project, scheduler::RunMode { once, until_idle }) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            1
+        }
+    }
+}
+
+fn cmd_start(project: PathBuf, port: Option<u16>) -> i32 {
+    if !boot(&project) {
+        return 1;
+    }
+    let (listener, port) = match server::bind(&project, port) {
+        Ok(bound) => bound,
+        Err(e) => {
+            eprintln!("error: cannot bind webapp port: {}", e);
+            return 1;
+        }
+    };
+    let slug = server::slug(&project);
+    println!();
+    println!("  iterapp webapp:  http://localhost:{}/", port);
+    println!("                   http://{}.localhost:{}/", slug, port);
+    println!();
+    server::spawn(listener);
+    match scheduler::run(project, scheduler::RunMode { once: false, until_idle: false }) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("error: {}", e);

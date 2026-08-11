@@ -20,7 +20,7 @@ regularly do so. More complex interactions build on this framework later.
 | Agent runner | **Headless `claude -p`** with `--resume <session-id>` for sequential prompts into one session |
 | Queue location | **`.iter/.engine/workitems.jsonl`** — engine-owned data lives in the engine-owned folder |
 | Concurrency | **Concurrent from day 1** — locking is core to the product, so exercise it immediately |
-| Agent handoff | **All agents can create new work items, and regularly do** — work items are the standard handoff between agents; v1 write path is `iterloop add` (stateless MCP is the long-term candidate) |
+| Agent handoff | **All agents can create new work items, and regularly do** — work items are the standard handoff between agents; v1 write path is `iter add` (stateless MCP is the long-term candidate) |
 | Retry semantics | **Full re-run** — a failed item retries from scratch: fresh session, prework included |
 | Logging | **One stream**, tagged `[type#n]` |
 | Type validation | **Warn at add, enforce at pick** |
@@ -35,7 +35,7 @@ regularly do so. More complex interactions build on this framework later.
 - Everything user-extensible is a markdown file: agents, prework/postwork steps, source
   instructions. Adding a file adds a capability; no engine change needed.
 - Work items as the standard handoff between agents: any agent can create new work items
-  mid-run (via `iterloop add`), and the loop picks them up on a later tick.
+  mid-run (via `iter add`), and the loop picks them up on a later tick.
 - Terminal output sufficient to watch and verify the loop end to end.
 - Runs locally on a laptop or server as a single binary.
 
@@ -355,14 +355,14 @@ can queue new work items, and they will regularly do so. Canonical examples:
   `testwriter` work items to integrate and build missing files.
 
 **v1 mechanism:** each agent's `.iter/agents/<type>.md` body includes standard handoff
-instructions — create work items by running `iterloop add --file <item.json>` with
+instructions — create work items by running `iter add --file <item.json>` with
 `source` set to `agent: {type}`. The agent is just another external producer using the
 record-lock protocol; the engine notices the queue change on a later tick via size/mtime
 detection. The long-term write path is TBD — the leading candidate is an iterapp-provided
 tool served over **stateless MCP**, so agent instructions never depend on a binary path
 (see Open questions).
 
-**Guardrail:** `engine.max_open_workitems` caps the open queue. `iterloop add` refuses
+**Guardrail:** `engine.max_open_workitems` caps the open queue. `iter add` refuses
 new items at the cap (with a clear error the agent can report in its output), which
 bounds runaway agent-creates-agent loops.
 
@@ -381,7 +381,7 @@ create-exclusive semantics (`O_CREAT|O_EXCL`); holder writes, then deletes the l
   engine also staggers agent creation by `agent_stagger_ms` (100ms) to avoid a thundering
   herd on first tick.
 - Within a single engine process, a mutex serializes queue writes; the file lock exists
-  for external producers — chiefly agents creating handoff work items via `iterloop add`
+  for external producers — chiefly agents creating handoff work items via `iter add`
   mid-run, plus the user's own CLI calls, a second engine, or a human script.
 
 ### Codepath lock (`.iter.lock`)
@@ -410,7 +410,7 @@ Locks past timeout are treated as absent and deleted when encountered.
 
 ## The engine loop
 
-On `iterloop run`, per tick (`tick_interval_sec`):
+On `iter run`, per tick (`tick_interval_sec`):
 
 1. **Load agents** — read `.iter/agents/*.md`; parse frontmatter (config) and body
    (prompt definition). Re-read each tick so edits apply live.
@@ -494,8 +494,8 @@ Work items can control the engine itself via prepostwork steps:
 - `iterloop-wait-for-stop.md` — write the same signal, but the engine drains: no new
   Find Work, waits for all in-flight work items to finish, then stops.
 
-`iterloop stop` from the CLI writes the same signal file. Deleting the file (or
-`iterloop run`) clears the state.
+`iter stop` from the CLI writes the same signal file. Deleting the file (or
+`iter run`) clears the state.
 
 ## Terminal output (v1 observability)
 
@@ -517,12 +517,18 @@ Logs also go to `log_default_path` with rotation per `log_max_size_mb` / `log_ma
 
 ## CLI (v1)
 
+The executable is named **`iter`** — iterloop (the engine) and iterapp (the webapp)
+are two functions of the one binary. The `.iter/` template is embedded in it;
+`start`, `run`, and `init` all scaffold/heal missing `.iter/` files (never
+overwriting existing ones), so deployment is copy-one-file.
+
 ```
-iterloop run    [--project <path>] [--once]     # start the loop (--once = single tick, for testing)
-iterloop add    --file <item.json> | --type code --title "…" --mainwork "…" [--priority N] …
-iterloop status [--project <path>]              # queue summary + active agents + locks
-iterloop stop   [--wait]                        # write stop.signal (--wait = drain first)
-iterloop init   <path>                          # copy the src/.iter template into a target project
+iter start  [--project <path>] [--port N]   # engine loop + webapp server; prints the URL
+iter run    [--project <path>] [--once]     # engine loop only (--once = single tick, for testing)
+iter add    --file <item.json> | --type code --title "…" --mainwork "…" [--priority N] …
+iter status [--project <path>]              # queue summary + active agents + locks
+iter stop   [--wait]                        # write stop.signal (--wait = drain first)
+iter init   <path> [--from <dir>]           # scaffold .iter/ from the embedded template (idempotent)
 ```
 
 `add` appends to `workitems.jsonl` under the record-lock protocol — it is the reference
@@ -547,7 +553,7 @@ Deliberately excluded from v1, but the file formats above leave room:
 - Scheduling intelligence: dependency-aware ordering, splitting oversized items, smarter
   prioritization. (Agents *creating* work items is already core v1 behavior.)
 - An iterapp-provided work-item tool for agents — likely stateless MCP — replacing the
-  `iterloop add` convention; the same interface would back the web UI.
+  `iter add` convention; the same interface would back the web UI.
 - Web UI (engine + local web server) for queue maintenance and investigation.
 - `.sh` prepostwork steps and the `.md`+`.sh` paired pattern (AI decides → script executes).
 - `llm_run_mode: terminal | tmux` for watch-live agent sessions.
@@ -559,7 +565,7 @@ Deliberately excluded from v1, but the file formats above leave room:
 
 ## Open questions
 
-1. **Agent write path, long-term:** v1 agents create work items via the `iterloop add`
+1. **Agent write path, long-term:** v1 agents create work items via the `iter add`
    convention. Is an engine-served **stateless MCP** tool the right long-term interface
    (cf. Google's stateless-MCP infrastructure writeup:
    <https://developers.googleblog.com/scaling-ai-agent-infrastructure-with-the-mcp-stateless-updates/>)?
@@ -591,7 +597,7 @@ complete, usable prompts.
 
 **`src/.iter/agents/`**
 - [x] Shared handoff block, included in every agent body: when and how to create new work
-      items (`iterloop add --file <item.json>`, `source: agent: {type}`, priority/risk
+      items (`iter add --file <item.json>`, `source: agent: {type}`, priority/risk
       guidance, respect the `max_open_workitems` error).
 - [x] `plan.md` — frontmatter (`max_agent_count: 1`, model opus); body: read bizreq/techreq
       + context, produce a **parallelizable** plan with tests and acceptance criteria, then
@@ -685,19 +691,19 @@ complete, usable prompts.
 - [x] Structured terminal logging + rotating file log per config.
 
 ## Phase 6 — CLI + end-to-end demo
-- [x] `iterloop run|add|status|stop|init` per §CLI (`add`: warn on unknown type, error at
+- [x] `iter run|add|status|stop|init` per §CLI (`add`: warn on unknown type, error at
       `max_open_workitems`).
 - [x] E2E (fake runner): seed 4 items across types into `sample/`, run engine, verify
       concurrency caps, lock contention on shared codepath, closed-file archival, output
       concatenation, timestamps.
-- [x] E2E handoff (fake runner): a fake agent turn invokes `iterloop add` mid-run; verify
+- [x] E2E handoff (fake runner): a fake agent turn invokes `iter add` mid-run; verify
       the new `agent: {type}`-sourced item lands in the queue and is picked up on a later
       tick; verify the `max_open_workitems` refusal path.
 - [x] E2E (one real item): a real `code` workitem against `sample/` with real
       `claude -p`, watched in the terminal.
 - [x] README: quickstart (init → add → run), file-format reference pointing at this spec.
 
-**Definition of done (v1):** `iterloop run` against `sample/` executes seeded work items
+**Definition of done (v1):** `iter run` against `sample/` executes seeded work items
 concurrently within capacity limits, no two agents ever hold overlapping codepath locks,
 every lifecycle transition is visible in the terminal, and closed items land in
 `workitems_closed.jsonl` with full `output` and `times`.
