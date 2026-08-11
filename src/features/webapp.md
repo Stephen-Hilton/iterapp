@@ -167,8 +167,21 @@ decisive data-model difference: **content lives in distributed in-code marker fi
 not a central definition file**, and the page is **loosely coupled to the work-item
 queue** — its one write-path into execution is submitting work items.
 
-**Marker files.** A node exists because a marker file exists near the code it
-describes, e.g. `./src/some/path/some_file_name.iter.context.md`:
+**Marker files.** One naming convention: **any `*.iter.md` file is
+iterapp-meaningful**; its **role comes from its frontmatter**, not its filename:
+
+| Frontmatter | Role |
+|---|---|
+| has `level:` | **structure node** — a row on the Projects map |
+| has `participants:` | **use-case thread** — drives the red line + step numbers |
+| neither | **plain context document** (testgroups.iter.md, bizreq.iter.md, notes) — discoverable and attachable as context, never a map node |
+
+*(Naming note, locked 2026-08-11: an earlier draft used `*.iter.context.md`, where
+"context" meant generic agent-context — too easily read as the C4 CONTEXT level. The
+level lives in the file's frontmatter, so the filename doesn't need it.)*
+
+A node exists because a marker file exists near the code it describes, e.g.
+`./src/some/path/some_file_name.iter.md`:
 
 ```markdown
 ---
@@ -195,11 +208,12 @@ requirements, interfaces, constraints. The marker IS the context file.
 - **Read-only by design** (locked 2026-08-11): the page never edits marker files.
   Changing the model = a work item that edits the marker — the loop maintains its own
   map. The one write path into execution is Create WorkItem.
-- **Use-cases are their own marker type** (`*.iter.usecase.md`): a name, description,
-  and an ordered participant list (`- 2.1 core-intake/orchestrator`). The red thread
-  and step numbers render from it; structure files never mention use-cases.
-- **Discovery by search**: the engine scans configured roots for the marker globs
-  (Project Settings) and caches to `.iter/.engine/markers.json`; a **Rescan** button
+- **Use-cases are `*.iter.md` files with `participants:`**: a name, description, and
+  an ordered participant list (`- 2.1 core/intake/orchestrator`). The red thread and
+  step numbers render from it; structure files never mention use-cases.
+- **Discovery by search**: the engine scans configured roots for the single marker
+  glob (default `**/*.iter.md`), sorts each hit into node / use-case / plain-context
+  by frontmatter, and caches to `.iter/.engine/markers.json`; a **Rescan** button
   (and later a file-watcher) refreshes. Ultimate flexibility: adding a node to the
   model = dropping a file in the tree, same extensibility rule as `.iter/` itself.
 - **Queue coupling (loose, one-way)**: every node row offers **Create WorkItem** —
@@ -221,12 +235,35 @@ it describes (a component team owns its marker like its code).
 ### Project Settings (ITERAPP → Settings)
 
 Kept — it earns its place as the home of marker discovery config: project name,
-**scan roots** (multiple; can point outside the repo), **marker glob** (default
-`**/*.iter.context.md`), **use-case glob** (default `**/*.iter.usecase.md`),
-default context attachments for Create-WorkItem-from-node, the testgroups glob, and
-(advanced) **custom level definitions** — ordered `{name, color}` list overriding the
-C4 default vocabulary. Stored in `.iter/projects.json` (extensible area —
-user-editable, engine-read).
+**scan roots** (multiple; can point outside the repo), the single **marker glob**
+(default `**/*.iter.md`; role sorted by frontmatter, see Projects), the
+**testgroups glob**, **default_context**, and (advanced) **custom level
+definitions** — ordered `{name, color}` list overriding the C4 default vocabulary.
+Stored in `.iter/projects.json` (extensible area — user-editable, engine-read).
+
+**`default_context`** is the template for the `context` list prefilled when you
+Create WorkItem from a Projects node — one entry per line; placeholders expand at
+form-open time, and every line supports the same globs as any work-item context:
+
+| Entry | Expands to |
+|---|---|
+| `{marker}` | the clicked node's own `.iter.md` file |
+| `{ancestor_markers}` | the marker files of that node's parent chain, walking up to the project root (directory-derived, `parent:` overrides respected) — e.g. from `core/intake/evidence-vault`: the `core/intake`, `core`, and project-root markers |
+| `{codepath}` | the node's directory, absolute — use to scope a glob to the work item's own tree |
+| any glob/path | passed through as a normal context entry |
+
+Worked example — *"attach this node's marker, everything above it, and every
+bizreq/techreq doc anywhere under the node"*:
+
+```
+{marker}
+{ancestor_markers}
+{codepath}/**/*bizreq.iter.md
+{codepath}/**/*techreq.iter.md
+```
+
+(The leading `*` also matches prefixed names like `payout.bizreq.iter.md`; without
+the `{codepath}/` anchor a glob searches from the project root instead.)
 
 ## Data mapping
 

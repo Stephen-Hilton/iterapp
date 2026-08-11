@@ -1267,7 +1267,8 @@ function renderIlSettings(){
 
 /* ---------------------------------------------------------------- projects */
 /* Fake scan results — in the wired version: GET /api/markers, built by scanning
-   the configured roots for *.iter.context.md / *.iter.usecase.md marker files. */
+   the configured roots for *.iter.md files, sorted into node / use-case / plain
+   context by frontmatter (level: / participants: / neither). */
 const LEVELS = ['project','context','container','component'];
 const MARKERS = [
   { key:'',                              level:'project',   name:'Paydaay Core Product',            desc:'Wage-access platform: intake, novation, and payout orchestration', uses:[] },
@@ -1290,18 +1291,18 @@ const MARKERS = [
 MARKERS.forEach(m => {
   m.depth = m.key ? m.key.split('/').length : 0;
   m.dir = m.key ? `./${m.key}` : '.';
-  m.path = `${m.dir}/${(m.name.split(' ')[0] || 'node').toLowerCase().replace(/[^a-z0-9]/g,'')}.iter.context.md`;
+  m.path = `${m.dir}/${(m.name.split(' ')[0] || 'node').toLowerCase().replace(/[^a-z0-9]/g,'')}.iter.md`;
 });
 
 const USECASES = [
   { name:'Capital provider logs in to modify a Sentinel',
     desc:'Edge auth through policy check, then an orchestrated intake change',
-    file:'./usecases/modify-sentinel.iter.usecase.md',
+    file:'./usecases/modify-sentinel.iter.md',
     steps:{ 'infra/seccomm/gateway':'1.1', 'infra/seccomm/authn':'1.2', 'infra/seccomm/authz':'1.3',
             'core/intake':'2', 'core/intake/orchestrator':'2.1', 'core/intake/emancipator':'2.2' } },
   { name:'Worker requests early wage payout',
     desc:'Verified shift becomes an obligation, novates, and pays out',
-    file:'./usecases/early-payout.iter.usecase.md',
+    file:'./usecases/early-payout.iter.md',
     steps:{ 'infra/seccomm/gateway':'1', 'core/intake':'2', 'core/intake/ewo-origination':'2.1',
             'core/intake/onvl-novation':'2.2', 'core/payout':'3', 'core/payout/rail-selector':'3.1',
             'core/payout/ledger':'3.2' } },
@@ -1369,14 +1370,14 @@ function renderProjects(){
     <div class="legendbar">
       ${LEVELS.map((l,i) => `<button class="lvlchip ${projDepth===i?'active':''}" data-depth="${i}"
         style="background:var(--lvl-${l}-bg);color:var(--lvl-${l}-fg)">${l} · ${counts[i]}</button>`).join('')}
-      <span class="lhint">click a level to collapse below it · markers: <span class="mono">**/*.iter.context.md</span></span>
+      <span class="lhint">click a level to collapse below it · markers: <span class="mono">**/*.iter.md</span> with <span class="mono">level:</span> frontmatter</span>
     </div>
     <div class="ptree">${rows || '<div class="empty">No markers found — check scan roots in Project Settings.</div>'}</div>`;
 
   $('projUc').addEventListener('change', e => { projUC = +e.target.value; renderProjects(); });
   $('projOrder').addEventListener('change', e => { projOrder = e.target.value; renderProjects(); });
   $('rescan').addEventListener('click', () =>
-    toast('Scanned 2 roots: 16 context markers, 2 use-case markers (mock)'));
+    toast('Scanned 2 roots: 16 nodes, 2 use-cases, 5 plain context docs (mock)'));
 }
 
 function markerAncestors(key){
@@ -1440,17 +1441,28 @@ document.addEventListener('click', (e) => {
 /* --------------------------------------------------------- project settings */
 const PROJSET = {
   project_name: ['Paydaay Core Product', 'display name for the Projects page'],
-  scan_roots: ['~/dev/paydaay-core\n~/dev/paydaay-shared', 'directories searched for markers (one per line; may be outside this repo)'],
-  marker_glob: ['**/*.iter.context.md', 'structure/context marker files'],
-  usecase_glob: ['**/*.iter.usecase.md', 'use-case thread definitions'],
+  scan_roots: ['~/dev/paydaay-core\n~/dev/paydaay-shared', 'directories searched for markers — one per line; may be outside this repo'],
+  marker_glob: ['**/*.iter.md', 'ONE glob finds every iterapp file; frontmatter declares each file’s role (see legend above)'],
   testgroups_glob: ['**/testgroups.iter.md', 'test-group files aligned to nodes'],
-  default_context: ['{marker}\n{ancestor_markers}\n./bizreq.md', 'context prefilled on Create-WorkItem-from-node'],
+  default_context: ['{marker}\n{ancestor_markers}\n{codepath}/**/*bizreq.iter.md\n{codepath}/**/*techreq.iter.md', 'context prefilled on Create-WorkItem-from-node — one entry per line; placeholders in the legend above'],
 };
 
 function renderIaSettings(){
   $('view-iasettings').innerHTML = `<div class="setform"><div class="setgroup">
     <h3>Project Settings</h3>
     <div class="sub">Marker discovery and Create-WorkItem defaults — stored in <span class="mono">.iter/projects.json</span></div>
+    <div class="sub" style="border:1px solid var(--border);border-radius:7px;padding:10px 12px;line-height:1.7">
+      <b>How markers work:</b> any file matching <span class="mono">marker_glob</span> is iterapp-meaningful;
+      its <b>frontmatter declares its role</b> —
+      <span class="mono">level:</span> → a node on the Projects map ·
+      <span class="mono">participants:</span> → a use-case thread ·
+      neither → a plain context doc (bizreq, techreq, testgroups, notes), attachable but never a map node.<br>
+      <b>Placeholders in default_context:</b>
+      <span class="mono">{marker}</span> = the clicked node’s own .iter.md file ·
+      <span class="mono">{ancestor_markers}</span> = markers of that node’s parent chain up to the project root ·
+      <span class="mono">{codepath}</span> = the node’s directory (anchors a glob to the work item’s own tree —
+      without it, globs search from the project root).
+    </div>
     ${Object.entries(PROJSET).map(([k,[v,why]]) => v.includes('\n')
       ? `<div class="setrow wide"><label>${k}</label><textarea rows="${v.split('\n').length + 1}" data-ps="${k}">${esc(v)}</textarea></div>
          <div class="setrow wide"><span></span><span class="why">${why}</span></div>`
