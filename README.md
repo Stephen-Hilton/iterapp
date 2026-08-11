@@ -83,8 +83,9 @@ use this; see `setup_project` there for a reference stub.
 
 ## Notes
 
-- Agents create handoff work items by running `iter add`; put the binary on `PATH`
-  (or reference it absolutely in your agent files) so spawned agents can find it.
+- Agents create handoff work items with `"$ITER_BIN" add --project "$ITER_PROJECT" …`;
+  the engine injects both env vars into every agent session (the executable's absolute
+  path and the project root), so nothing needs to be on PATH.
 - The template agent files ship with `--dangerously-skip-permissions` for sandboxed
   demos. Remove it (and rely on your repo's own `.claude/` permission settings) before
   pointing iterloop at production code.

@@ -273,7 +273,7 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
     };
 
     let turns = build_turns(&shared, &agent, &item, &codepath, &tag);
-    let mut session = Session::new(agent.clone(), codepath.clone());
+    let mut session = Session::new(agent.clone(), codepath.clone(), shared.project_root.clone());
     let mut outputs: Vec<String> = Vec::new();
 
     for (i, step) in turns.iter().enumerate() {

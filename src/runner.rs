@@ -15,16 +15,29 @@ pub struct Turn {
 /// A live headless Claude Code session. The first turn creates it (`claude -p`);
 /// every later turn resumes it (`claude -p --resume <sid>`), so the agent keeps full
 /// context across prework → mainwork → postwork.
+///
+/// Every session gets ITER_BIN (this executable's absolute path) and ITER_PROJECT
+/// (the project root owning the queue) in its environment, so agent handoffs —
+/// `"$ITER_BIN" add --project "$ITER_PROJECT" …` — work from any codepath without
+/// PATH luck or cwd guessing.
 pub struct Session {
     pub agent: AgentDef,
     pub cwd: PathBuf,
     pub session_id: String,
     pub bin: String,
+    pub envs: Vec<(String, String)>,
 }
 
 impl Session {
-    pub fn new(agent: AgentDef, cwd: PathBuf) -> Session {
-        Session { agent, cwd, session_id: String::new(), bin: claude_bin() }
+    pub fn new(agent: AgentDef, cwd: PathBuf, project_root: PathBuf) -> Session {
+        let iter_bin = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "iter".to_string());
+        let envs = vec![
+            ("ITER_BIN".to_string(), iter_bin),
+            ("ITER_PROJECT".to_string(), project_root.to_string_lossy().into_owned()),
+        ];
+        Session { agent, cwd, session_id: String::new(), bin: claude_bin(), envs }
     }
 
     /// Submit one turn, wait for it to finish (subject to the agent's work timeout),
@@ -43,7 +56,7 @@ impl Session {
         for flag in self.agent.model_flags.split_whitespace() {
             args.push(flag.to_string());
         }
-        let stdout = run_with_timeout(&self.bin, &args, &self.cwd, self.agent.max_work_timeout_sec)?;
+        let stdout = run_with_timeout(&self.bin, &args, &self.cwd, self.agent.max_work_timeout_sec, &self.envs)?;
         let (sid, result) = parse_output(&stdout);
         if !sid.is_empty() {
             self.session_id = sid;
@@ -74,10 +87,17 @@ fn parse_output(stdout: &str) -> (String, String) {
     }
 }
 
-fn run_with_timeout(bin: &str, args: &[String], cwd: &Path, timeout_sec: u64) -> Result<String, String> {
+fn run_with_timeout(
+    bin: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout_sec: u64,
+    envs: &[(String, String)],
+) -> Result<String, String> {
     let child = Command::new(bin)
         .args(args)
         .current_dir(cwd)
+        .envs(envs.iter().map(|(k, v)| (k.clone(), v.clone())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -131,7 +151,7 @@ mod tests {
     #[test]
     fn timeout_kills_hung_process() {
         let start = std::time::Instant::now();
-        let err = run_with_timeout("sleep", &["30".to_string()], Path::new("/tmp"), 1).unwrap_err();
+        let err = run_with_timeout("sleep", &["30".to_string()], Path::new("/tmp"), 1, &[]).unwrap_err();
         assert!(err.contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(5));
     }
@@ -141,9 +161,11 @@ mod tests {
         // Uses /bin/echo as a degenerate fake: output is not JSON, so the raw text
         // becomes the result and no session id is captured.
         let agent = AgentDef { model: "opus".into(), max_work_timeout_sec: 10, ..Default::default() };
-        let mut session = Session::new(agent, PathBuf::from("/tmp"));
+        let mut session = Session::new(agent, PathBuf::from("/tmp"), PathBuf::from("/tmp/proj"));
         session.bin = "/bin/echo".into();
         let out = session.run(&Turn { label: "t".into(), prompt: "hello".into() }).unwrap();
         assert!(out.contains("hello"));
+        assert!(session.envs.iter().any(|(k, v)| k == "ITER_PROJECT" && v == "/tmp/proj"));
+        assert!(session.envs.iter().any(|(k, v)| k == "ITER_BIN" && !v.is_empty()));
     }
 }

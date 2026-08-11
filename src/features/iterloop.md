@@ -355,12 +355,15 @@ can queue new work items, and they will regularly do so. Canonical examples:
   `testwriter` work items to integrate and build missing files.
 
 **v1 mechanism:** each agent's `.iter/agents/<type>.md` body includes standard handoff
-instructions — create work items by running `iter add --file <item.json>` with
-`source` set to `agent: {type}`. The agent is just another external producer using the
-record-lock protocol; the engine notices the queue change on a later tick via size/mtime
-detection. The long-term write path is TBD — the leading candidate is an iterapp-provided
-tool served over **stateless MCP**, so agent instructions never depend on a binary path
-(see Open questions).
+instructions — create work items by running
+`"$ITER_BIN" add --project "$ITER_PROJECT" --file <item.json>` with `source` set to
+`agent: {type}`. The engine injects both env vars into every agent session:
+**`ITER_BIN`** = the running executable's absolute path, **`ITER_PROJECT`** = the
+project root that owns the queue — so handoffs are deterministic from any codepath,
+with nothing on PATH and no cwd guessing. The agent is just another external producer
+using the record-lock protocol; the engine notices the queue change on a later tick.
+The long-term write path is TBD — the leading candidate is an iterapp-provided tool
+served over **stateless MCP** (see Open questions).
 
 **Guardrail:** `engine.max_open_workitems` caps the open queue. `iter add` refuses
 new items at the cap (with a clear error the agent can report in its output), which

@@ -37,12 +37,16 @@ parallelizable implementation plan, then hand the pieces off as new work items.
 ## Creating new work items (handoff)
 Create work items by running:
 
-    iter add --file <item.json>
+    "$ITER_BIN" add --project "$ITER_PROJECT" --file <item.json>
+
+($ITER_BIN is the absolute path of the running iter executable and $ITER_PROJECT is
+the project root that owns the work queue — the engine sets both in your environment,
+so this command works from any codepath.)
 
 - Set `source` to `agent: plan`, `type` to the target agent, and `codepath` to the
   narrowest directory the work owns (this is the lock scope — narrower = more parallelism).
 - Set `priority` 0–10 (default 5; raise only for blocking slices) and `risk` 0–10.
-- If `iter add` refuses because the queue is full (`max_open_workitems`), report the
+- If the add refuses because the queue is full (`max_open_workitems`), report the
   refused items in your output instead of retrying.
 
 ## Output

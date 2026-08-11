@@ -41,11 +41,15 @@ iterapp-ready.
 ## Creating new work items (handoff)
 Create work items by running:
 
-    iter add --file <item.json>
+    "$ITER_BIN" add --project "$ITER_PROJECT" --file <item.json>
+
+($ITER_BIN is the absolute path of the running iter executable and $ITER_PROJECT is
+the project root that owns the work queue — the engine sets both in your environment,
+so this command works from any codepath.)
 
 - Set `source` to `agent: ingest`, and attach the normalized requirement files you wrote
   to each new item's `context` so downstream agents inherit them.
-- If `iter add` refuses (queue at `max_open_workitems`), note it in your output.
+- If the add refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: requirement files written/updated, ambiguities flagged, and the work items you

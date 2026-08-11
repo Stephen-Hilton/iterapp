@@ -46,19 +46,17 @@ fn setup_project(name: &str, max_attempts: u32, max_open: usize) -> (PathBuf, Pa
     )
     .unwrap();
 
-    // The fake claude: finds the project root by walking up from cwd, supports a
-    // handoff trigger (calls `iter add` like a real agent would) and a failure
-    // trigger (non-zero exit).
+    // The fake claude: relies on the ITER_BIN/ITER_PROJECT env vars the ENGINE
+    // injects into every agent session — exactly like the real agent templates —
+    // so this test proves the injection end-to-end. Also supports a failure trigger.
     let stub = root.join("fake-claude.sh");
     std::fs::write(
         &stub,
         r#"#!/bin/sh
 args="$*"
-dir="$(pwd)"
-while [ "$dir" != "/" ] && [ ! -d "$dir/.iter" ]; do dir="$(dirname "$dir")"; done
 case "$args" in
   *HANDOFF_TRIGGER*)
-    "$ITER_BIN" add --project "$dir" --type code --title "handoff child" \
+    "$ITER_BIN" add --project "$ITER_PROJECT" --type code --title "handoff child" \
       --mainwork "child work created by handoff" --codepath "./src" \
       --source "agent: plan" >/dev/null 2>&1
     ;;
@@ -111,7 +109,6 @@ fn run_engine(root: &Path, stub: &Path, timeout: Duration) -> String {
     let mut child = Command::new(BIN)
         .args(["run", "--project", root.to_str().unwrap(), "--until-idle"])
         .env("ITER_CLAUDE_BIN", stub)
-        .env("ITER_BIN", BIN)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
