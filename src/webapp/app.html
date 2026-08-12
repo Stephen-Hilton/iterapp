@@ -512,7 +512,7 @@ async function api(path, opts = {}) {
 const PREPOST = ['deploy','git-commit','git-pr','git-pull','git-push','iterloop-stop','iterloop-wait-for-stop'];
 const AGENTS = ['plan','code','test','testwriter','refactor','ingest'];
 let PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // replaced by /api/meta in LIVE mode
-const HOME = '/Users/stephen.hilton';
+let HOME = '/Users/stephen.hilton';                              // replaced by /api/meta in LIVE mode
 
 /* codepath is entered relative but always resolved and shown absolute */
 function normPath(p){
@@ -525,6 +525,38 @@ function normPath(p){
     out.push(part);
   }
   return out.join('/') || '/';
+}
+
+/* Resolve one context/testfiles line for display, mirroring the engine:
+   placeholders labeled, {codepath} substituted, ~ expanded, relative from the
+   project root, globs kept as globs. */
+function resolveLine(line, codepathAbs){
+  line = line.trim();
+  if (!line) return null;
+  const placeholders = {
+    '{marker}': '(this node’s own marker file)',
+    '{ancestor_markers}': '(markers of the ancestor chain)',
+    '{interfaces}': '(contract files for uses/provides)',
+  };
+  if (placeholders[line]) return placeholders[line];
+  let p = line.split('{codepath}').join(codepathAbs || '(codepath)');
+  if (p === '~') p = HOME;
+  else if (p.startsWith('~/')) p = HOME + '/' + p.slice(2);
+  if (!p.startsWith('/') && !p.startsWith('(')) p = PROJECT_ROOT + '/' + p;
+  return normPath(p);
+}
+
+/* live "→ resolves to" hints under a multi-line path box */
+function wirePathHints(textareaId, hintId, codepathInputId){
+  const update = () => {
+    const cp = codepathInputId ? absCodepath($(codepathInputId).value) : '';
+    const lines = $(textareaId).value.split('\n')
+      .map(l => resolveLine(l, cp)).filter(Boolean);
+    $(hintId).innerHTML = lines.map(l => '→ ' + esc(l)).join('<br>');
+  };
+  $(textareaId).addEventListener('input', update);
+  if (codepathInputId) $(codepathInputId).addEventListener('input', update);
+  update();
 }
 
 function absCodepath(cp){
@@ -684,6 +716,7 @@ async function loadAll(){
     PREPOST.length = 0;
     meta.prepostwork.forEach(p => PREPOST.push(p));
     PROJECT_ROOT = meta.project_root;
+    if (meta.home) HOME = meta.home;
     if (Array.isArray(meta.default_context) && meta.default_context.length) {
       DEFAULT_CONTEXT = meta.default_context;
     }
@@ -1066,10 +1099,14 @@ function openForm(mode, source, priorState){
       <span class="flabel top-align">Context</span>
       <div>
         <textarea id="f_context" rows="2" style="width:100%" placeholder="one path or glob per line">${esc(d.context.join('\n'))}</textarea>
-        <div class="pathhint">one rule: globs ok anywhere · relative paths start at the project root · ~ = home · {codepath} = this work item’s code</div>
+        <div class="pathhint" id="f_ctxhint"></div>
+        <div class="pathhint" style="opacity:.75">one rule: globs ok anywhere · relative = from project root · ~ = home · {codepath} = this work item’s code</div>
       </div>
       <span class="flabel top-align">Test files</span>
-      <textarea id="f_testfiles" rows="1">${esc(d.testfiles.join('\n'))}</textarea>
+      <div>
+        <textarea id="f_testfiles" rows="1" style="width:100%">${esc(d.testfiles.join('\n'))}</textarea>
+        <div class="pathhint" id="f_tfhint"></div>
+      </div>
       <span class="flabel top-align">Prework</span>
       <div>${pillRow(d.prework, true, 'prework')}
         <input type="text" id="f_prelit" class="mono" style="margin-top:7px;width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:6px 10px;color:var(--text)"
@@ -1100,6 +1137,8 @@ function openForm(mode, source, priorState){
   $('f_prelit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('prework', e.target); }});
   $('f_postlit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('postwork', e.target); }});
   $('f_codepath').addEventListener('input', e => { $('f_pathhint').textContent = '→ ' + absCodepath(e.target.value); });
+  wirePathHints('f_context', 'f_ctxhint', 'f_codepath');
+  wirePathHints('f_testfiles', 'f_tfhint', 'f_codepath');
   $('saveGo').addEventListener('click', () => saveDraft($('f_savestate').value));
 }
 
@@ -1924,7 +1963,9 @@ async function renderIaSettings(){
     ${Object.entries(PROJSET).map(([k,[v,why]]) => {
       const value = val(k, v);
       return PS_MULTILINE.includes(k)
-        ? `<div class="setrow wide"><label>${k}</label><textarea rows="${value.split('\n').length + 1}" data-ps="${k}">${esc(value)}</textarea></div>
+        ? `<div class="setrow wide"><label>${k}</label>
+             <div><textarea rows="${value.split('\n').length + 1}" style="width:100%" data-ps="${k}" id="ps_${k}">${esc(value)}</textarea>
+             <div class="pathhint" id="ps_hint_${k}"></div></div></div>
            <div class="setrow wide"><span></span><span class="why">${why}</span></div>`
         : `<div class="setrow"><label>${k}</label><input type="text" data-ps="${k}" value="${esc(value)}"><span class="why">${why}</span></div>`;
     }).join('')}
@@ -1932,6 +1973,8 @@ async function renderIaSettings(){
       <button class="btn" id="psReset">Reset</button>
       <button class="btn primary" id="psSave">Save projects.json</button>
     </div></div></div>`;
+  wirePathHints('ps_scan_roots', 'ps_hint_scan_roots', null);
+  wirePathHints('ps_default_context', 'ps_hint_default_context', null);
   $('psSave').addEventListener('click', () => {
     if (!LIVE) { toast('projects.json saved (mock) — rescan to apply new globs'); return; }
     const out = {};

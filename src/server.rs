@@ -377,6 +377,7 @@ fn api_meta(project: &Path) -> Resp {
             "project_name": settings["project_name"],
             "url_slug": settings["url_slug"],
             "default_context": settings["default_context"],
+            "home": std::env::var("HOME").unwrap_or_default(),
         }),
     )
 }
