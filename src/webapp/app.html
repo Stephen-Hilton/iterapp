@@ -1535,10 +1535,47 @@ const CONFIG = {
   },
 };
 
+/* Per-agent frontmatter fields — .iter/agents/<name>.md. Same keys the engine's
+   parser reads; the selector is built from whatever files exist, so agents added
+   by dropping in a new file show up automatically. */
+const AGENT_FIELDS = {
+  description: ['', 'text', 'one-line summary of what this agent does'],
+  visible: ['true', 'bool', 'show this type in the New WorkItem selector'],
+  max_agent_count: [1, 'num', 'concurrent agents of this type'],
+  max_work_timeout_sec: [3600, 'num', 'kill a turn that runs longer than this'],
+  max_connection_timeout_sec: [30, 'num', 'reserved — parsed but not used by the engine yet'],
+  model: ['opus', 'text', 'passed to claude --model'],
+  model_flags: ['', 'text', 'extra claude CLI flags, e.g. --dangerously-skip-permissions'],
+  llm_run_mode: ['headless', 'text', 'reserved — headless is the only mode today'],
+  sleep_interval_sec: [30, 'num', 'reserved — parsed but not used by the engine yet'],
+};
+const MOCK_AGENT_DEFS = AGENTS.map(t => ({
+  type: t, description: `the ${t} agent`, visible: true,
+  max_agent_count: t === 'code' ? 3 : 1, max_work_timeout_sec: 3600, max_connection_timeout_sec: 30,
+  model: 'opus', model_flags: '--dangerously-skip-permissions', llm_run_mode: 'headless',
+  sleep_interval_sec: 30, body: `# Agent Definition: ${t}\n\n(open via iter start to edit the real prompt)`,
+}));
+
+function agentFieldsHtml(a){
+  const rows = Object.entries(AGENT_FIELDS).map(([k,[d,kind,why]]) => {
+    const v = a[k] !== undefined ? String(a[k]) : String(d);
+    const input = kind === 'bool'
+      ? `<select data-ag="${k}"><option${v === 'true' ? ' selected' : ''}>true</option><option${v === 'false' ? ' selected' : ''}>false</option></select>`
+      : `<input type="text" data-ag="${k}" data-num="${kind === 'num'}" value="${esc(v)}">`;
+    return `<div class="setrow"><label>${k}</label>${input}<span class="why">${why}</span></div>`;
+  }).join('');
+  return rows + `
+    <div class="setrow wide"><label>prompt body</label>
+      <textarea rows="14" style="width:100%" data-ag="body">${esc(a.body || '')}</textarea></div>
+    <div class="setrow wide"><span></span><span class="why">the markdown below the frontmatter — this agent's instructions</span></div>`;
+}
+
 async function renderIlSettings(){
   let live = null;
+  let agents = MOCK_AGENT_DEFS;
   if (LIVE) {
     try { live = await api('/api/config'); } catch (e) { toast('Config: ' + e.message); }
+    try { agents = (await api('/api/agents')).agents || []; } catch (e) { toast('Agents: ' + e.message); }
   }
   const val = (section, key, fallback) =>
     live && live[section] && live[section][key] !== undefined ? live[section][key] : fallback;
@@ -1547,12 +1584,28 @@ async function renderIlSettings(){
       `<div class="setrow"><label>${k}</label>
        <input type="text" data-cfg="${name}.${k}" data-num="${typeof v === 'number'}" value="${esc(String(val(name, k, v)))}">
        <span class="why">${why}</span></div>`).join('')}</div>`;
+  const agentOptions = agents.map((a, i) =>
+    `<option value="${esc(a.type)}"${i === 0 ? ' selected' : ''}>${esc(a.type)}</option>`).join('');
   $('view-ilsettings').innerHTML = `<div class="setform">
     ${group('engine', CONFIG.engine, 'Scheduler, locking, and retry behavior — .iter/.engine/config.json')}
     ${group('globalsettings', CONFIG.globalsettings, 'Testing and logging defaults')}
     <div class="setfoot">
       <button class="btn" id="cfgReset">Reset to Defaults</button>
       <button class="btn primary" id="cfgSave">Save config.json</button>
+    </div>
+    <div class="setgroup">
+      <h3>Agents Settings</h3>
+      <div class="sub">Per-agent settings and prompt — <span class="mono">.iter/agents/&lt;name&gt;.md</span>.
+        Add an agent by adding a new .md file there; the engine and this list pick it up automatically.</div>
+      ${agents.length ? `
+      <div class="setrow"><label>agent</label>
+        <select id="agSel">${agentOptions}</select>
+        <span class="why">which agent file to edit</span></div>
+      <div id="agFields">${agentFieldsHtml(agents[0])}</div>
+      <div class="setfoot">
+        <button class="btn" id="agReset">Reload</button>
+        <button class="btn primary" id="agSave">Save agent file</button>
+      </div>` : '<div class="sub">No agent files found in .iter/agents/.</div>'}
     </div></div>`;
   $('cfgSave').addEventListener('click', () => {
     if (!LIVE) { toast('config.json saved (mock) — engine applies it on its next tick'); return; }
@@ -1580,6 +1633,31 @@ async function renderIlSettings(){
     renderIlSettings();
     toast('Reset to defaults (unsaved)');
   });
+  if (agents.length) {
+    $('agSel').addEventListener('change', () => {
+      const picked = agents.find(a => a.type === $('agSel').value) || agents[0];
+      $('agFields').innerHTML = agentFieldsHtml(picked);
+    });
+    $('agSave').addEventListener('click', () => {
+      const name = $('agSel').value;
+      if (!LIVE) { toast(`agents/${name}.md saved (mock) — engine reloads it on its next tick`); return; }
+      const out = {};
+      document.querySelectorAll('[data-ag]').forEach(el => {
+        const k = el.dataset.ag;
+        if (k === 'body') out[k] = el.value;
+        else if (k === 'visible') out[k] = el.value === 'true';
+        else if (el.dataset.num === 'true') out[k] = Number(el.value.trim()) || 0;
+        else out[k] = el.value.trim();
+      });
+      api('/api/agents/' + encodeURIComponent(name), { method: 'PUT', body: JSON.stringify(out) })
+        .then(saved => {
+          Object.assign(agents.find(a => a.type === name) || {}, saved);
+          toast(`agents/${name}.md saved — engine reloads it on its next tick`);
+        })
+        .catch(e => toast('Save failed: ' + e.message));
+    });
+    $('agReset').addEventListener('click', () => { renderIlSettings(); toast('Reloaded from disk'); });
+  }
 }
 
 /* ---------------------------------------------------------------- projects */

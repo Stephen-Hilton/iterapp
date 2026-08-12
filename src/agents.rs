@@ -94,6 +94,64 @@ pub fn parse(type_name: &str, content: &str) -> AgentDef {
     def
 }
 
+/// Frontmatter keys the settings editor may update — the same set `parse` reads.
+pub const EDITABLE_KEYS: &[&str] = &[
+    "description",
+    "visible",
+    "max_agent_count",
+    "max_work_timeout_sec",
+    "max_connection_timeout_sec",
+    "model",
+    "model_flags",
+    "llm_run_mode",
+    "sleep_interval_sec",
+];
+
+/// Rewrite an agent file's text with `updates` applied to its frontmatter and the
+/// body replaced when `new_body` is given. Frontmatter lines the editor doesn't
+/// know about (unknown keys, comments) are kept in place; updated keys keep their
+/// position; keys not present yet are appended before the closing fence. A file
+/// with no frontmatter gains one.
+pub fn apply_updates(content: &str, updates: &[(String, String)], new_body: Option<&str>) -> String {
+    let (front, body) = split_frontmatter(content);
+    let mut remaining: Vec<&(String, String)> = updates.iter().collect();
+    let mut lines: Vec<String> = Vec::new();
+    for line in front.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = trimmed.split_once(':').map(|(k, _)| k.trim()).unwrap_or("");
+        if let Some(pos) = remaining.iter().position(|(k, _)| k == key) {
+            let (k, v) = remaining.remove(pos);
+            lines.push(format!("{}: {}", k, quote_if_needed(v)));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    for (k, v) in remaining {
+        lines.push(format!("{}: {}", k, quote_if_needed(v)));
+    }
+    let body = new_body.unwrap_or(&body);
+    format!("---\n{}\n---\n\n{}\n", lines.join("\n"), body.trim())
+}
+
+/// Bare values round-trip through `parse` except when they'd be misread: empty,
+/// whitespace-padded, comment-like, or already quote-wrapped. `unquote` only strips
+/// a matching outer pair, so inner quotes survive.
+fn quote_if_needed(v: &str) -> String {
+    let needs = v.is_empty()
+        || v != v.trim()
+        || v.starts_with('#')
+        || (v.starts_with('"') && v.ends_with('"'))
+        || (v.starts_with('\'') && v.ends_with('\''));
+    if needs {
+        format!("\"{}\"", v)
+    } else {
+        v.to_string()
+    }
+}
+
 fn split_frontmatter(content: &str) -> (String, String) {
     let trimmed = content.trim_start();
     if let Some(rest) = trimmed.strip_prefix("---") {
@@ -146,5 +204,43 @@ mod tests {
         let def = parse("x", "just a body");
         assert_eq!(def.body, "just a body");
         assert_eq!(def.max_agent_count, 1);
+    }
+
+    #[test]
+    fn apply_updates_edits_in_place_and_appends_new_keys() {
+        let original = "---\n# tuning\ndescription: \"old\"\nmax_agent_count: 3\ncustom_key: kept\n---\n\nBody stays\n";
+        let updates = vec![
+            ("description".to_string(), "new words".to_string()),
+            ("model".to_string(), "sonnet".to_string()),
+        ];
+        let out = apply_updates(original, &updates, None);
+        let def = parse("x", &out);
+        assert_eq!(def.description, "new words");
+        assert_eq!(def.model, "sonnet");
+        assert_eq!(def.max_agent_count, 3, "untouched keys keep their values");
+        assert!(out.contains("# tuning"), "comments survive");
+        assert!(out.contains("custom_key: kept"), "unknown keys survive");
+        assert_eq!(def.body, "Body stays");
+        let front = out.split("---").nth(1).unwrap();
+        assert!(
+            front.find("description").unwrap() < front.find("max_agent_count").unwrap(),
+            "updated keys keep their original position"
+        );
+    }
+
+    #[test]
+    fn apply_updates_replaces_body_and_creates_frontmatter() {
+        let out = apply_updates("no frontmatter here", &[("model".to_string(), "opus".to_string())], Some("new body"));
+        let def = parse("x", &out);
+        assert_eq!(def.model, "opus");
+        assert_eq!(def.body, "new body");
+    }
+
+    #[test]
+    fn apply_updates_round_trips_awkward_values() {
+        for val in ["", "  padded  ", "# looks like a comment", "\"already quoted\"", "colons: are: fine", "--flag-with-dashes"] {
+            let out = apply_updates("---\n---\nb", &[("description".to_string(), val.to_string())], None);
+            assert_eq!(parse("x", &out).description, val, "value {:?} must round-trip", val);
+        }
     }
 }

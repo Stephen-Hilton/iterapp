@@ -504,6 +504,26 @@ fn api_crud_history_markers_and_settings() {
     let ps2 = http(port, "GET", "/api/projectsettings", None);
     assert!(ps2.contains("api-test") && ps2.contains("marker_glob"), "defaults overlay: {}", ps2);
 
+    // agents: list, edit roundtrip (body + comments untouched), bad names rejected
+    let ag = http(port, "GET", "/api/agents", None);
+    assert!(ag.contains("\"type\":\"code\""), "{}", ag);
+    let ag_put = http(
+        port,
+        "PUT",
+        "/api/agents/code",
+        Some(r#"{"model":"sonnet","max_agent_count":5,"visible":false,"description":"edited via api"}"#),
+    );
+    assert!(ag_put.contains("200") && ag_put.contains("sonnet"), "{}", ag_put);
+    let agent_md = std::fs::read_to_string(dest.join(".iter/agents/code.md")).unwrap();
+    assert!(agent_md.contains("model: sonnet") && agent_md.contains("max_agent_count: 5"), "{}", agent_md);
+    assert!(agent_md.contains("You are the **code** agent"), "body must be untouched: {}", agent_md);
+    let ag_missing = http(port, "PUT", "/api/agents/nope", Some(r#"{"model":"opus"}"#));
+    assert!(ag_missing.contains("404"), "{}", ag_missing);
+    let ag_bad = http(port, "PUT", "/api/agents/..%2Fescape", Some(r#"{"model":"opus"}"#));
+    assert!(ag_bad.contains("400"), "{}", ag_bad);
+    let ag_field = http(port, "PUT", "/api/agents/code", Some(r#"{"nonsense_key":"x"}"#));
+    assert!(ag_field.contains("400"), "unknown fields must be rejected: {}", ag_field);
+
     // servers registry includes us
     let servers = http(port, "GET", "/api/servers", None);
     assert!(servers.contains(&format!("\"port\":{}", port)) || servers.contains(&format!("\"port\": {}", port)), "{}", servers);

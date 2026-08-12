@@ -271,6 +271,8 @@ fn route(req: &Req, engine: &Engine, port: u16) -> Resp {
         ("GET", ["api", "history"]) => api_history(req, project),
         ("GET", ["api", "config"]) => api_config_get(project),
         ("PUT", ["api", "config"]) => api_config_put(req, project),
+        ("GET", ["api", "agents"]) => api_agents_get(project),
+        ("PUT", ["api", "agents", name]) => api_agent_put(req, project, name),
         ("GET", ["api", "projectsettings"]) => json_resp(200, project_settings(project)),
         ("PUT", ["api", "projectsettings"]) => api_projectsettings_put(req, project),
         ("GET", ["api", "markers"]) | ("POST", ["api", "markers", "rescan"]) => api_markers(project),
@@ -694,6 +696,75 @@ fn api_config_put(req: &Req, project: &Path) -> Resp {
         return err_resp(500, "cannot write config.json");
     }
     json_resp(200, v)
+}
+
+fn agent_json(a: &crate::agents::AgentDef) -> Value {
+    json!({
+        "type": a.type_name, "description": a.description, "visible": a.visible,
+        "max_agent_count": a.max_agent_count, "max_work_timeout_sec": a.max_work_timeout_sec,
+        "max_connection_timeout_sec": a.max_connection_timeout_sec, "model": a.model,
+        "model_flags": a.model_flags, "llm_run_mode": a.llm_run_mode,
+        "sleep_interval_sec": a.sleep_interval_sec, "body": a.body,
+    })
+}
+
+fn api_agents_get(project: &Path) -> Resp {
+    let agents: Vec<Value> = crate::agents::discover(project).iter().map(agent_json).collect();
+    json_resp(200, json!({ "agents": agents }))
+}
+
+/// Update one agent's frontmatter/body in `.iter/agents/<name>.md`. Editing only:
+/// a new agent is added by adding a new file, so an unknown name is a 404.
+fn api_agent_put(req: &Req, project: &Path, name: &str) -> Resp {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return err_resp(400, "agent name must be alphanumeric with - or _");
+    }
+    let path = crate::agents::agents_dir(project).join(format!("{}.md", name));
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        return err_resp(404, "no such agent — add one by creating .iter/agents/<name>.md");
+    };
+    let Ok(Value::Object(patch)) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_resp(400, "body must be a JSON object of agent fields");
+    };
+    let mut updates: Vec<(String, String)> = Vec::new();
+    let mut new_body: Option<String> = None;
+    for (key, val) in &patch {
+        if key == "body" {
+            match val.as_str() {
+                Some(b) => new_body = Some(b.to_string()),
+                None => return err_resp(400, "body must be a string"),
+            }
+            continue;
+        }
+        if !crate::agents::EDITABLE_KEYS.contains(&key.as_str()) {
+            return err_resp(400, &format!("unknown agent field \"{}\"", key));
+        }
+        let text = match key.as_str() {
+            "visible" => match val {
+                Value::Bool(b) => b.to_string(),
+                Value::String(s) if s == "true" || s == "false" => s.clone(),
+                _ => return err_resp(400, "visible must be true or false"),
+            },
+            "max_agent_count" | "max_work_timeout_sec" | "max_connection_timeout_sec" | "sleep_interval_sec" => {
+                match val.as_u64().or_else(|| val.as_str().and_then(|s| s.trim().parse().ok())) {
+                    Some(n) => n.to_string(),
+                    None => return err_resp(400, &format!("{} must be a non-negative integer", key)),
+                }
+            }
+            _ => match val.as_str() {
+                // Frontmatter is one line per key.
+                Some(s) => s.replace(['\n', '\r'], " ").trim().to_string(),
+                None => return err_resp(400, &format!("{} must be a string", key)),
+            },
+        };
+        updates.push((key.clone(), text));
+    }
+    let rewritten = crate::agents::apply_updates(&existing, &updates, new_body.as_deref());
+    let tmp = path.with_extension("md.tmp");
+    if std::fs::write(&tmp, &rewritten).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        return err_resp(500, "cannot write agent file");
+    }
+    json_resp(200, agent_json(&crate::agents::parse(name, &rewritten)))
 }
 
 fn api_projectsettings_put(req: &Req, project: &Path) -> Resp {
