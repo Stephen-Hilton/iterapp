@@ -14,6 +14,9 @@ pub struct EngineConfig {
     pub max_open_workitems: usize,
     pub retry_backoff_sec: u64,
     pub max_attempts: u32,
+    /// Daily spend cap in USD, summed from each turn's total_cost_usd. 0 = off.
+    /// At the cap the engine auto-drains (finishes in-flight, picks nothing new).
+    pub max_cost_usd_per_day: f64,
 }
 
 impl Default for EngineConfig {
@@ -29,6 +32,7 @@ impl Default for EngineConfig {
             max_open_workitems: 200,
             retry_backoff_sec: 300,
             max_attempts: 3,
+            max_cost_usd_per_day: 0.0,
         }
     }
 }

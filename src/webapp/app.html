@@ -1423,7 +1423,7 @@ function mockHistory(){
   return {
     days: HIST.comp.map((c, i) => ({ date: '2026-08-' + labels[i].split('/')[1], complete: c, failed: HIST.fail[i] })),
     by_agent: Object.fromEntries(HIST.byAgent),
-    tiles: { success_pct: 97, per_hour: 1.4, median_cycle_sec: 1440, running: items.filter(i => i.state === 'in-progress').length, open: items.length, handoff_pct: 38 },
+    tiles: { spend_today_usd: 12.34, budget_usd_per_day: 50, success_pct: 97, per_hour: 1.4, median_cycle_sec: 1440, running: items.filter(i => i.state === 'in-progress').length, open: items.length, handoff_pct: 38 },
   };
 }
 
@@ -1455,6 +1455,10 @@ async function renderDashboard(){
   const cAll = comp.reduce((a,b)=>a+b,0), fAll = fail.reduce((a,b)=>a+b,0);
   const windowLabel = `${data.days.length} days`;
   const tiles = [
+    [`$${(t.spend_today_usd ?? 0).toFixed(2)}`,
+      t.budget_usd_per_day > 0
+        ? `Spend today · auto-drains at $${t.budget_usd_per_day.toFixed(0)}`
+        : 'Spend today · no budget set (Settings → max_cost_usd_per_day)'],
     [`${t.success_pct}<small>%</small>`, `Success rate · window`],
     [`${t.per_hour < 0.1 && t.per_hour > 0 ? t.per_hour.toFixed(2) : t.per_hour.toFixed(1)}<small>/hr</small>`, 'Completions per hour · window avg'],
     [fmtCycle(t.median_cycle_sec), 'Median cycle time · added → closed'],
@@ -1518,6 +1522,7 @@ const CONFIG = {
     max_open_workitems: [200, 'queue cap; iter add refuses beyond this'],
     retry_backoff_sec: [300, 'wait before a failed item retries'],
     max_attempts: [3, 'attempts before terminal failure'],
+    max_cost_usd_per_day: [0, 'daily spend cap in USD (from each turn’s total_cost_usd); 0 = off — engine auto-drains at the cap, raise it to resume'],
   },
   globalsettings: {
     test_min: [20, 'minimum tests per group (testwriter floor)'],

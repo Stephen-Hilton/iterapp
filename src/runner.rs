@@ -12,6 +12,14 @@ pub struct Turn {
     pub prompt: String,
 }
 
+/// What a completed turn produced, including the CLI's own cost accounting.
+pub struct TurnOutcome {
+    pub text: String,
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// A live headless Claude Code session. The first turn creates it (`claude -p`);
 /// every later turn resumes it (`claude -p --resume <sid>`), so the agent keeps full
 /// context across prework → mainwork → postwork.
@@ -41,8 +49,8 @@ impl Session {
     }
 
     /// Submit one turn, wait for it to finish (subject to the agent's work timeout),
-    /// and return the result text.
-    pub fn run(&mut self, turn: &Turn) -> Result<String, String> {
+    /// and return the result text plus the turn's cost accounting.
+    pub fn run(&mut self, turn: &Turn) -> Result<TurnOutcome, String> {
         let mut args: Vec<String> = vec!["-p".into()];
         if !self.session_id.is_empty() {
             args.push("--resume".into());
@@ -57,11 +65,11 @@ impl Session {
             args.push(flag.to_string());
         }
         let stdout = run_with_timeout(&self.bin, &args, &self.cwd, self.agent.max_work_timeout_sec, &self.envs)?;
-        let (sid, result) = parse_output(&stdout);
+        let (sid, outcome) = parse_output(&stdout);
         if !sid.is_empty() {
             self.session_id = sid;
         }
-        Ok(result)
+        Ok(outcome)
     }
 }
 
@@ -70,20 +78,36 @@ pub fn claude_bin() -> String {
     std::env::var("ITER_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
-/// Parse `claude -p --output-format json` stdout: pull `session_id` and `result`.
-/// Anything unparseable falls back to the raw stdout as the result.
-fn parse_output(stdout: &str) -> (String, String) {
+/// Parse `claude -p --output-format json` stdout: pull `session_id`, `result`, and
+/// the turn's cost accounting (`total_cost_usd`, `usage`). Anything unparseable
+/// falls back to the raw stdout as the result with zero cost.
+fn parse_output(stdout: &str) -> (String, TurnOutcome) {
     match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
         Ok(v) => {
             let sid = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            let result = v
+            let text = v
                 .get("result")
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| stdout.trim().to_string());
-            (sid, result)
+            let usage = v.get("usage");
+            let tok = |key: &str| {
+                usage.and_then(|u| u.get(key)).and_then(|t| t.as_u64()).unwrap_or(0)
+            };
+            (
+                sid,
+                TurnOutcome {
+                    text,
+                    cost_usd: v.get("total_cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0),
+                    input_tokens: tok("input_tokens"),
+                    output_tokens: tok("output_tokens"),
+                },
+            )
         }
-        Err(_) => (String::new(), stdout.trim().to_string()),
+        Err(_) => (
+            String::new(),
+            TurnOutcome { text: stdout.trim().to_string(), cost_usd: 0.0, input_tokens: 0, output_tokens: 0 },
+        ),
     }
 }
 
@@ -135,17 +159,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_json_output() {
-        let (sid, result) = parse_output(r#"{"type":"result","session_id":"abc-123","result":"did the thing"}"#);
+    fn parses_json_output_with_cost() {
+        let (sid, out) = parse_output(
+            r#"{"type":"result","session_id":"abc-123","result":"did the thing","total_cost_usd":0.42,"usage":{"input_tokens":100,"output_tokens":50}}"#,
+        );
         assert_eq!(sid, "abc-123");
-        assert_eq!(result, "did the thing");
+        assert_eq!(out.text, "did the thing");
+        assert!((out.cost_usd - 0.42).abs() < 1e-9);
+        assert_eq!(out.input_tokens, 100);
+        assert_eq!(out.output_tokens, 50);
     }
 
     #[test]
     fn falls_back_to_raw_stdout() {
-        let (sid, result) = parse_output("not json at all");
+        let (sid, out) = parse_output("not json at all");
         assert_eq!(sid, "");
-        assert_eq!(result, "not json at all");
+        assert_eq!(out.text, "not json at all");
+        assert_eq!(out.cost_usd, 0.0);
     }
 
     #[test]
@@ -164,7 +194,7 @@ mod tests {
         let mut session = Session::new(agent, PathBuf::from("/tmp"), PathBuf::from("/tmp/proj"));
         session.bin = "/bin/echo".into();
         let out = session.run(&Turn { label: "t".into(), prompt: "hello".into() }).unwrap();
-        assert!(out.contains("hello"));
+        assert!(out.text.contains("hello"));
         assert!(session.envs.iter().any(|(k, v)| k == "ITER_PROJECT" && v == "/tmp/proj"));
         assert!(session.envs.iter().any(|(k, v)| k == "ITER_BIN" && !v.is_empty()));
     }

@@ -8,6 +8,7 @@ mod registry;
 mod runner;
 mod scheduler;
 mod server;
+mod spend;
 mod template;
 /// Used by unit tests today; the engine itself reads testgroups in v2 scheduling.
 #[allow(dead_code)]

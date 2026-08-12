@@ -104,6 +104,25 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
         let cfg = config::load(&project_root);
         *shared.cfg.lock().unwrap() = cfg.clone();
 
+        // Daily budget: at the cap, write a drain signal so in-flight work finishes
+        // and nothing new starts. Raising the cap (or the next UTC day) lifts it.
+        if !stop_picking && cfg.engine.max_cost_usd_per_day > 0.0 {
+            let spent = crate::spend::today_usd(&project_root);
+            if spent >= cfg.engine.max_cost_usd_per_day {
+                logging::error(
+                    "engine",
+                    &format!(
+                        "daily budget reached (${:.2} of ${:.2}) — draining; raise max_cost_usd_per_day in Settings to resume",
+                        spent, cfg.engine.max_cost_usd_per_day
+                    ),
+                );
+                let _ = std::fs::write(
+                    stop_signal_path(&project_root),
+                    format!("{} drain auto: daily budget reached (${:.2})\n", workitems::now_iso(), spent),
+                );
+            }
+        }
+
         // Stop signal: `drain` token = finish in-flight items; otherwise immediate.
         if !stop_picking {
             if let Ok(text) = std::fs::read_to_string(stop_signal_path(&project_root)) {
@@ -296,12 +315,33 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
             return;
         }
         match session.run(&step.turn) {
-            Ok(result) => {
-                logging::info(&tag, &format!("{} done", step.turn.label));
-                outputs.push(format!("[{}] {}", step.turn.label, result));
+            Ok(outcome) => {
+                crate::spend::record(&shared.project_root, &crate::spend::SpendEntry {
+                    ts: workitems::now_iso(),
+                    workid: item.workid.clone(),
+                    agent: agent.type_name.clone(),
+                    turn: step.turn.label.clone(),
+                    usd: outcome.cost_usd,
+                    input_tokens: outcome.input_tokens,
+                    output_tokens: outcome.output_tokens,
+                });
+                logging::info(&tag, &format!("{} done (${:.2})", step.turn.label, outcome.cost_usd));
+                outputs.push(format!("[{}] {}", step.turn.label, outcome.text));
                 stamp_boundaries(&shared, &item.workid, &turns, i);
             }
             Err(e) => {
+                // Account limits are terminal for every turn that would follow —
+                // drain the engine instead of burning attempts across the queue.
+                if crate::spend::is_usage_limit_error(&e) {
+                    logging::error(&tag, &format!("usage/credit limit hit ({}); auto-draining engine and requeueing {}", e, short(&item.workid)));
+                    let _ = std::fs::write(
+                        stop_signal_path(&shared.project_root),
+                        format!("{} drain auto: usage limit reached\n", workitems::now_iso()),
+                    );
+                    requeue(&shared, &item.workid, "usage limit reached; engine auto-drained", true);
+                    drop(lock);
+                    return;
+                }
                 let msg = format!("{} failed: {}", step.turn.label, e);
                 logging::error(&tag, &msg);
                 fail_item(&shared, &item, &msg, outputs.join("\n"), &tag);

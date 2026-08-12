@@ -294,6 +294,7 @@ fn api_state(project: &Path, engine: &Engine, port: u16) -> Resp {
     let open = queue.load();
     let closed = queue.load_closed();
     let count = |s: &str| open.iter().filter(|i| i.state == s).count();
+    let cfg = config::load(project);
     json_resp(
         200,
         json!({
@@ -301,6 +302,8 @@ fn api_state(project: &Path, engine: &Engine, port: u16) -> Resp {
             "port": port,
             "project": project.to_string_lossy(),
             "slug": slug(project),
+            "spend_today_usd": crate::spend::today_usd(project),
+            "budget_usd_per_day": cfg.engine.max_cost_usd_per_day,
             "counts": {
                 "queued": count(workitems::STATE_QUEUED),
                 "in-progress": count(workitems::STATE_IN_PROGRESS),
@@ -656,6 +659,8 @@ fn api_history(req: &Req, project: &Path) -> Resp {
             "days": day_buckets,
             "by_agent": by_agent,
             "tiles": {
+                "spend_today_usd": crate::spend::today_usd(project),
+                "budget_usd_per_day": config::load(project).engine.max_cost_usd_per_day,
                 "success_pct": if window.is_empty() { 100 } else { (100 * complete_n) / window.len() },
                 "per_hour": if hours > 0 { complete_n as f64 / hours as f64 } else { 0.0 },
                 "median_cycle_sec": median_cycle_sec,

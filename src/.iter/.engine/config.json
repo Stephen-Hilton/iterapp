@@ -9,7 +9,8 @@
         "max_total_agents": 8,
         "max_open_workitems": 200,
         "retry_backoff_sec": 300,
-        "max_attempts": 3
+        "max_attempts": 3,
+        "max_cost_usd_per_day": 0
     },
     "globalsettings": {
         "test_min": 20,
