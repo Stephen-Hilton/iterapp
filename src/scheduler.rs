@@ -33,7 +33,9 @@ pub struct RunMode {
 
 struct Shared {
     project_root: PathBuf,
-    cfg: Config,
+    /// Re-loaded from config.json every tick, so Iterloop Settings changes
+    /// (max_total_agents, backoffs, caps) apply live — no engine restart.
+    cfg: Mutex<Config>,
     /// Serializes every load-modify-save sequence on the queue within this process.
     /// (The on-disk record lock protects against OTHER processes.)
     queue_mutex: Mutex<()>,
@@ -45,8 +47,12 @@ struct Shared {
 }
 
 impl Shared {
+    fn cfg(&self) -> Config {
+        self.cfg.lock().unwrap().clone()
+    }
+
     fn queue(&self) -> Queue {
-        Queue::new(&self.project_root, &self.cfg)
+        Queue::new(&self.project_root, &self.cfg())
     }
 }
 
@@ -68,7 +74,7 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
 
     let shared = Arc::new(Shared {
         project_root: project_root.clone(),
-        cfg: cfg.clone(),
+        cfg: Mutex::new(cfg),
         queue_mutex: Mutex::new(()),
         stop_now: AtomicBool::new(false),
         deferred: Mutex::new(HashMap::new()),
@@ -93,6 +99,10 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
 
     loop {
         tick += 1;
+
+        // Live settings: re-read config.json each tick so webapp edits apply now.
+        let cfg = config::load(&project_root);
+        *shared.cfg.lock().unwrap() = cfg.clone();
 
         // Stop signal: `drain` token = finish in-flight items; otherwise immediate.
         if !stop_picking {
@@ -194,6 +204,7 @@ fn summarize(items: &[WorkItem], running: usize) -> String {
 /// Select and claim the best eligible item of this type: mark it in-progress and
 /// stamp times.start before releasing the queue mutex, so no other pick can race it.
 fn pick_next(shared: &Shared, type_name: &str) -> Option<WorkItem> {
+    let cfg = shared.cfg();
     let _q = shared.queue_mutex.lock().unwrap();
     let deferred = {
         let mut map = shared.deferred.lock().unwrap();
@@ -206,7 +217,7 @@ fn pick_next(shared: &Shared, type_name: &str) -> Option<WorkItem> {
     let now = chrono::Utc::now();
     let mut best: Option<usize> = None;
     for (i, item) in items.iter().enumerate() {
-        if item.item_type != type_name || !item.eligible(&shared.cfg, now) || deferred.contains(&item.workid) {
+        if item.item_type != type_name || !item.eligible(&cfg, now) || deferred.contains(&item.workid) {
             continue;
         }
         best = match best {
@@ -242,8 +253,9 @@ fn pick_next(shared: &Shared, type_name: &str) -> Option<WorkItem> {
 }
 
 fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: String) {
+    let cfg = shared.cfg();
     let codepath = resolve_codepath(&shared.project_root, &item.codepath);
-    let lock_timeout = shared.cfg.engine.codepath_lock_timeout_sec.max(agent.max_work_timeout_sec);
+    let lock_timeout = cfg.engine.codepath_lock_timeout_sec.max(agent.max_work_timeout_sec);
 
     // Codepath lock (see .iter/.engine/codepath_lock.md).
     let lock = match locks::acquire_codepath_lock(&codepath, &item.workid, &agent.type_name, lock_timeout) {
@@ -252,7 +264,7 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
             lock
         }
         Err(conflict) => {
-            let backoff = shared.cfg.engine.codepath_conflict_backoff_sec;
+            let backoff = cfg.engine.codepath_conflict_backoff_sec;
             logging::info(
                 &tag,
                 &format!(
@@ -364,6 +376,7 @@ fn requeue(shared: &Shared, workid: &str, reason: &str, refund_attempt: bool) {
 }
 
 fn fail_item(shared: &Shared, item: &WorkItem, error: &str, partial_output: String, tag: &str) {
+    let cfg = shared.cfg();
     let _q = shared.queue_mutex.lock().unwrap();
     let queue = shared.queue();
     let mut failed = item.clone();
@@ -374,7 +387,7 @@ fn fail_item(shared: &Shared, item: &WorkItem, error: &str, partial_output: Stri
     failed.state = workitems::STATE_FAILED.into();
     failed.lasterror = error.into();
     failed.output = partial_output;
-    if failed.failed_terminally(&shared.cfg) {
+    if failed.failed_terminally(&cfg) {
         failed.times.closed = workitems::now_iso();
         fill_empty_stamps(&mut failed.times);
         if let Err(e) = queue.close(&failed) {
@@ -391,7 +404,7 @@ fn fail_item(shared: &Shared, item: &WorkItem, error: &str, partial_output: Stri
         });
         logging::warn(
             tag,
-            &format!("failed (attempt {}/{}); retry after backoff", attempts, shared.cfg.engine.max_attempts),
+            &format!("failed (attempt {}/{}); retry after backoff", attempts, cfg.engine.max_attempts),
         );
     }
 }
@@ -524,7 +537,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".iter/.engine")).unwrap();
         let shared = Shared {
             project_root: root.clone(),
-            cfg: Config::default(),
+            cfg: Mutex::new(Config::default()),
             queue_mutex: Mutex::new(()),
             stop_now: AtomicBool::new(false),
             deferred: Mutex::new(HashMap::new()),
