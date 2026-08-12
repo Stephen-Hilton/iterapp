@@ -515,13 +515,26 @@ let PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // replaced by 
 const HOME = '/Users/stephen.hilton';
 
 /* codepath is entered relative but always resolved and shown absolute */
+function normPath(p){
+  // collapse ., .., and duplicate slashes so "devops/.." reads as what it means
+  const out = [];
+  for (const part of p.split('/')) {
+    if (part === '' && out.length) continue;
+    if (part === '.') continue;
+    if (part === '..') { if (out.length > 1) out.pop(); continue; }
+    out.push(part);
+  }
+  return out.join('/') || '/';
+}
+
 function absCodepath(cp){
   cp = (cp || '.').trim();
-  if (cp.startsWith('/')) return cp.replace(/\/+$/,'') || '/';
-  if (cp === '~') return HOME;
-  if (cp.startsWith('~/')) return HOME + '/' + cp.slice(2).replace(/\/+$/,'');
-  cp = cp.replace(/^\.\//,'').replace(/\/+$/,'');
-  return cp === '' || cp === '.' ? PROJECT_ROOT : PROJECT_ROOT + '/' + cp;
+  let abs;
+  if (cp.startsWith('/')) abs = cp;
+  else if (cp === '~') abs = HOME;
+  else if (cp.startsWith('~/')) abs = HOME + '/' + cp.slice(2);
+  else abs = PROJECT_ROOT + '/' + cp;
+  return normPath(abs.replace(/\/+$/,''));
 }
 
 const STATES = {
