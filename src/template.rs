@@ -5,6 +5,8 @@ use std::path::Path;
 /// it, and any missing `.iter/` folders/files are created on the spot. Existing
 /// files are NEVER overwritten — healing adds, it doesn't reset.
 pub const TEMPLATE: &[(&str, &str)] = &[
+    (".iter/agents/_shared.md", include_str!(".iter/agents/_shared.md")),
+    (".iter/agents/_critic.md", include_str!(".iter/agents/_critic.md")),
     (".iter/agents/code.md", include_str!(".iter/agents/code.md")),
     (".iter/agents/ingest.md", include_str!(".iter/agents/ingest.md")),
     (".iter/agents/plan.md", include_str!(".iter/agents/plan.md")),
@@ -17,11 +19,13 @@ pub const TEMPLATE: &[(&str, &str)] = &[
     (".iter/prepostwork/git-pull.md", include_str!(".iter/prepostwork/git-pull.md")),
     (".iter/prepostwork/git-push.md", include_str!(".iter/prepostwork/git-push.md")),
     (".iter/prepostwork/iterloop-stop.md", include_str!(".iter/prepostwork/iterloop-stop.md")),
+    (".iter/prepostwork/premise-check.md", include_str!(".iter/prepostwork/premise-check.md")),
     (".iter/prepostwork/iterloop-wait-for-stop.md", include_str!(".iter/prepostwork/iterloop-wait-for-stop.md")),
     (".iter/source/agent.md", include_str!(".iter/source/agent.md")),
     (".iter/source/error.md", include_str!(".iter/source/error.md")),
     (".iter/source/user.md", include_str!(".iter/source/user.md")),
     (".iter/.engine/config.json", include_str!(".iter/.engine/config.json")),
+    (".iter/.engine/statusline-collector.py", include_str!(".iter/.engine/statusline-collector.py")),
     (".iter/.engine/codepath_lock.md", include_str!(".iter/.engine/codepath_lock.md")),
     (".iter/.engine/codepath_unlock.md", include_str!(".iter/.engine/codepath_unlock.md")),
     (".iter/.engine/workitems.jsonl", include_str!(".iter/.engine/workitems.jsonl")),

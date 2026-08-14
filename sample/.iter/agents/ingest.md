@@ -28,6 +28,13 @@ iterapp-ready.
 2. **Requirements ingest:** write/update normalized context markdown (location per the
    mainwork prompt) — business rules, technical constraints, common interfaces — keeping
    requirement IDs stable across runs.
+
+   **Marker frontmatter (REQUIRED):** every `*.iter.md` you write that should appear in
+   the Projects view must begin with a `---`-fenced frontmatter block — a structure node
+   needs `name:`, `level:` (project | context | container | component), `description:`,
+   and optional `uses:`/`provides:` interface lists; an interface marker needs
+   `interface:` (its id), `kind:`, `endpoint:`, `description:`. A marker without
+   frontmatter is treated as plain context and is invisible to the project structure.
 3. **Project migration** (bringing an existing repo onto iterapp): survey the project,
    then create the work items needed to integrate it — typically multiple `code` items
    (one per component needing integration or missing files) and `testwriter` items (one
@@ -51,3 +58,8 @@ so this command works from any codepath.)
 ## Output
 End with: requirement files written/updated, ambiguities flagged, and the work items you
 created (title + type + codepath).
+
+## CI note
+GitHub Actions may be intentionally disabled repo-wide. Do NOT create work items about
+CI not running, workflows never going green, or Actions jobs being refused — Actions
+will be re-enabled by a later process, or triggered manually when appropriate.

@@ -40,6 +40,14 @@ impl Default for EngineConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GlobalSettings {
+    /// IANA timezone (e.g. "America/Los_Angeles") used by the webapp to display
+    /// timestamps. Data stays UTC on disk; this is display-only.
+    pub user_timezone: String,
+    /// Base directory for resolving relative codepaths, context patterns, and
+    /// testfiles. Relative values (including the default ".") resolve against the
+    /// engine home — the directory holding .iter/. Supports ~. Set this (e.g. "..")
+    /// when iter lives in a subdirectory of the codebase it works on.
+    pub code_root: String,
     pub test_min: u32,
     pub test_max: u32,
     pub test_default_path: String,
@@ -52,6 +60,8 @@ pub struct GlobalSettings {
 impl Default for GlobalSettings {
     fn default() -> Self {
         GlobalSettings {
+            user_timezone: "UTC".into(),
+            code_root: ".".into(),
             test_min: 20,
             test_max: 100,
             test_default_path: "./test*/".into(),
@@ -63,15 +73,76 @@ impl Default for GlobalSettings {
     }
 }
 
+/// Account-usage throttling (see limits.rs): tiered agent caps driven by Claude
+/// Code's server-authoritative rate_limits percentages, kept fresh by a background
+/// interactive probe session.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Run the background probe session (tmux/screen + claude) that keeps the
+    /// usage snapshot fresh. Off by default — it spawns a real claude session.
+    pub probe_enabled: bool,
+    /// Agent caps by account utilization percent (max of the 5h and 7d windows).
+    /// Below 80% the engine uses max_total_agents unchanged; 0 = stop picking.
+    pub max_agents_at_80: usize,
+    pub max_agents_at_90: usize,
+    pub max_agents_at_95: usize,
+    /// Seconds between probe pokes while the engine is working; also the retry
+    /// interval after a hard usage-limit hit when no reset time was parseable.
+    pub probe_interval_sec: u64,
+    /// Warn when the engine is working but the snapshot is older than this.
+    pub snapshot_stale_warn_sec: u64,
+    /// Machine-wide snapshot written by the statusline collector. Account state is
+    /// global, so one snapshot serves every iter project on the box.
+    pub snapshot_path: String,
+    /// Model for the probe session — cheapest available.
+    pub probe_model: String,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            probe_enabled: false,
+            max_agents_at_80: 4,
+            max_agents_at_90: 2,
+            max_agents_at_95: 0,
+            probe_interval_sec: 300,
+            snapshot_stale_warn_sec: 900,
+            snapshot_path: "~/.claude/iter-usage-snapshot.json".into(),
+            probe_model: "haiku".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub engine: EngineConfig,
     pub globalsettings: GlobalSettings,
+    pub limits: LimitsConfig,
 }
 
 pub fn engine_dir(project_root: &Path) -> std::path::PathBuf {
     project_root.join(".iter").join(".engine")
+}
+
+/// Resolve globalsettings.code_root to the absolute directory that relative
+/// codepaths/context/testfiles resolve against. `project_root` is the engine home
+/// (where .iter/ lives); the default "." keeps historical behavior.
+pub fn code_root(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
+    let raw = cfg.globalsettings.code_root.trim();
+    let raw = if raw.is_empty() { "." } else { raw };
+    let mut p = raw.to_string();
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Some(rest) = p.strip_prefix("~/") {
+            p = format!("{}/{}", home.to_string_lossy(), rest);
+        } else if p == "~" {
+            p = home.to_string_lossy().into_owned();
+        }
+    }
+    let path = std::path::PathBuf::from(&p);
+    let abs = if path.is_absolute() { path } else { project_root.join(path) };
+    abs.canonicalize().unwrap_or(abs)
 }
 
 pub fn load(project_root: &Path) -> Config {

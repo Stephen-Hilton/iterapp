@@ -119,7 +119,17 @@ impl Drop for CodepathLock {
 /// descendants, and all ancestors up to the filesystem root. Expired locks are deleted
 /// on sight. Returns the path of the first active lock found.
 pub fn find_active_lock(codepath: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
-    // Ancestors (including codepath itself).
+    if let Some(p) = find_ancestor_lock(codepath, now) {
+        return Some(p);
+    }
+    // Descendants.
+    scan_descendants(codepath, now)
+}
+
+/// Ancestor-chain-only lock probe (codepath itself and every parent): cheap enough
+/// to run per queue candidate per tick, unlike the full descendant walk. Used by the
+/// scheduler to skip un-runnable items without wasting an agent slot on them.
+pub fn find_ancestor_lock(codepath: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
     let mut dir = Some(codepath.to_path_buf());
     while let Some(d) = dir {
         if let Some(p) = check_lock_file(&d.join(CODEPATH_LOCK_NAME), now) {
@@ -127,8 +137,7 @@ pub fn find_active_lock(codepath: &Path, now: DateTime<Utc>) -> Option<PathBuf> 
         }
         dir = d.parent().map(|p| p.to_path_buf());
     }
-    // Descendants.
-    scan_descendants(codepath, now)
+    None
 }
 
 fn scan_descendants(dir: &Path, now: DateTime<Utc>) -> Option<PathBuf> {

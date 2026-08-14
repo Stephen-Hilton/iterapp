@@ -52,3 +52,8 @@ so this command works from any codepath.)
 ## Output
 End with: the plan summary, the list of work items you created (title + type), and
 anything you could not delegate and why.
+
+## CI note
+GitHub Actions may be intentionally disabled repo-wide. Do NOT create work items about
+CI not running, workflows never going green, or Actions jobs being refused — Actions
+will be re-enabled by a later process, or triggered manually when appropriate.

@@ -306,6 +306,15 @@ fn api_state(project: &Path, engine: &Engine, port: u16) -> Resp {
             "slug": slug(project),
             "spend_today_usd": crate::spend::today_usd(project),
             "budget_usd_per_day": cfg.engine.max_cost_usd_per_day,
+            "usage": crate::limits::read_snapshot(&cfg).map(|u| {
+                let now = Utc::now();
+                json!({
+                    "five_hour_pct": u.five_hour_pct,
+                    "seven_day_pct": u.seven_day_pct,
+                    "effective_pct": u.effective_pct(now),
+                    "age_sec": u.age_sec(now),
+                })
+            }).unwrap_or(Value::Null),
             "counts": {
                 "queued": count(workitems::STATE_QUEUED),
                 "in-progress": count(workitems::STATE_IN_PROGRESS),
@@ -379,6 +388,7 @@ fn api_meta(project: &Path) -> Resp {
             "agents": agents,
             "prepostwork": prepost,
             "project_root": project.canonicalize().unwrap_or_else(|_| project.to_path_buf()).to_string_lossy(),
+            "code_root": config::code_root(project, &config::load(project)).to_string_lossy(),
             "project_name": settings["project_name"],
             "url_slug": settings["url_slug"],
             "default_context": settings["default_context"],
@@ -579,12 +589,13 @@ fn api_logs(project: &Path, id: &str) -> Resp {
 
 fn api_tests(project: &Path, id: &str) -> Resp {
     let Some((item, _)) = find_item(project, id) else { return err_resp(404, "no such work item") };
+    let code_root = config::code_root(project, &config::load(project));
     let codepath = if Path::new(&item.codepath).is_absolute() {
         PathBuf::from(&item.codepath)
     } else {
-        project.join(&item.codepath)
+        code_root.join(&item.codepath)
     };
-    let (files, _warnings) = context::resolve(&item.testfiles, &codepath, project);
+    let (files, _warnings) = context::resolve(&item.testfiles, &codepath, &code_root);
     let groups: Vec<Value> = files
         .iter()
         .filter_map(|f| {

@@ -52,3 +52,8 @@ so this command works from any codepath.)
 ## Output
 End with: per-group results (label, counts, pass/fail), direct fixes you made, and any
 work items you created.
+
+## CI note
+GitHub Actions may be intentionally disabled repo-wide. Do NOT create work items about
+CI not running, workflows never going green, or Actions jobs being refused — Actions
+will be re-enabled by a later process, or triggered manually when appropriate.

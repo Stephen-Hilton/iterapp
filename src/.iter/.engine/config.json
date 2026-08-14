@@ -13,6 +13,8 @@
         "max_cost_usd_per_day": 0
     },
     "globalsettings": {
+        "user_timezone": "UTC",
+        "code_root": ".",
         "test_min": 20,
         "test_max": 100,
         "test_default_path": "./test*/",
@@ -20,5 +22,15 @@
         "log_level": "info",
         "log_max_size_mb": 10,
         "log_max_files": 50
+    },
+    "limits": {
+        "probe_enabled": false,
+        "max_agents_at_80": 4,
+        "max_agents_at_90": 2,
+        "max_agents_at_95": 0,
+        "probe_interval_sec": 300,
+        "snapshot_stale_warn_sec": 900,
+        "snapshot_path": "~/.claude/iter-usage-snapshot.json",
+        "probe_model": "haiku"
     }
 }

@@ -79,9 +79,13 @@ pub fn parse_iso(s: &str) -> Option<DateTime<Utc>> {
 }
 
 impl WorkItem {
-    /// Effective priority for ordering: error-sourced work gets a +2 boost.
+    /// Effective priority for ordering: error-sourced work gets a +2 boost,
+    /// and failed items awaiting retry get +2 so they go before queued work
+    /// of the same priority instead of languishing behind a deep backlog.
     pub fn effective_priority(&self) -> i64 {
-        self.priority + if self.source == "error" { 2 } else { 0 }
+        self.priority
+            + if self.source == "error" { 2 } else { 0 }
+            + if self.state == STATE_FAILED { 2 } else { 0 }
     }
 
     /// Is this item eligible to be picked up right now?
@@ -319,6 +323,15 @@ mod tests {
         a.source = "error".into();
         let b = WorkItem { priority: 6, ..Default::default() };
         assert!(a.effective_priority() > b.effective_priority());
+    }
+
+    #[test]
+    fn failed_state_priority_boost() {
+        let failed = WorkItem { priority: 5, state: STATE_FAILED.into(), ..Default::default() };
+        let queued_same = WorkItem { priority: 5, state: STATE_QUEUED.into(), ..Default::default() };
+        let queued_higher = WorkItem { priority: 8, state: STATE_QUEUED.into(), ..Default::default() };
+        assert!(failed.effective_priority() > queued_same.effective_priority());
+        assert!(queued_higher.effective_priority() > failed.effective_priority());
     }
 
     #[test]

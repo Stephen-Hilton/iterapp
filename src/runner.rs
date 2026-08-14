@@ -34,6 +34,11 @@ pub struct Session {
     pub session_id: String,
     pub bin: String,
     pub envs: Vec<(String, String)>,
+    /// True (engine-spawned agents): the claude process leads its own process
+    /// group, and a timeout kill takes the whole group — including any
+    /// `iter critreview` critic subprocess the agent spawned. False (the critic
+    /// itself): stay in the calling agent's group so the engine's kill reaches it.
+    pub own_group: bool,
 }
 
 impl Session {
@@ -44,8 +49,14 @@ impl Session {
         let envs = vec![
             ("ITER_BIN".to_string(), iter_bin),
             ("ITER_PROJECT".to_string(), project_root.to_string_lossy().into_owned()),
+            // Let the agent's Bash tool wait on long synchronous calls (critreview)
+            // up to the agent's own work timeout — the natural upper bound.
+            (
+                "BASH_MAX_TIMEOUT_MS".to_string(),
+                agent.max_work_timeout_sec.saturating_mul(1000).to_string(),
+            ),
         ];
-        Session { agent, cwd, session_id: String::new(), bin: claude_bin(), envs }
+        Session { agent, cwd, session_id: String::new(), bin: claude_bin(), envs, own_group: true }
     }
 
     /// Submit one turn, wait for it to finish (subject to the agent's work timeout),
@@ -64,7 +75,7 @@ impl Session {
         for flag in self.agent.model_flags.split_whitespace() {
             args.push(flag.to_string());
         }
-        let stdout = run_with_timeout(&self.bin, &args, &self.cwd, self.agent.max_work_timeout_sec, &self.envs)?;
+        let stdout = run_with_timeout(&self.bin, &args, &self.cwd, self.agent.max_work_timeout_sec, &self.envs, self.own_group)?;
         let (sid, outcome) = parse_output(&stdout);
         if !sid.is_empty() {
             self.session_id = sid;
@@ -117,16 +128,21 @@ fn run_with_timeout(
     cwd: &Path,
     timeout_sec: u64,
     envs: &[(String, String)],
+    own_group: bool,
 ) -> Result<String, String> {
-    let child = Command::new(bin)
-        .args(args)
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
         .current_dir(cwd)
         .envs(envs.iter().map(|(k, v)| (k.clone(), v.clone())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot spawn {}: {}", bin, e))?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if own_group {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn().map_err(|e| format!("cannot spawn {}: {}", bin, e))?;
     let pid = child.id();
 
     let (tx, rx) = mpsc::channel();
@@ -139,16 +155,26 @@ fn run_with_timeout(
             if output.status.success() {
                 Ok(String::from_utf8_lossy(&output.stdout).into_owned())
             } else {
-                Err(format!(
-                    "exit {}: {}",
-                    output.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ))
+                // claude -p reports usage-limit errors on stdout and exits 1 with an
+                // empty stderr; fall back so spend::is_usage_limit_error can see them.
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let detail = if stderr.is_empty() {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                } else {
+                    stderr
+                };
+                Err(format!("exit {}: {}", output.status.code().unwrap_or(-1), detail))
             }
         }
         Ok(Err(e)) => Err(format!("wait failed: {}", e)),
         Err(_) => {
-            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            // Group leaders get a group kill (negative pid) so the whole tree dies —
+            // the agent, its shells, and any critic subprocess they spawned.
+            if own_group && cfg!(unix) {
+                let _ = Command::new("sh").arg("-c").arg(format!("kill -9 -{}", pid)).status();
+            } else {
+                let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            }
             Err(format!("timed out after {}s (killed)", timeout_sec))
         }
     }
@@ -179,9 +205,38 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_exit_falls_back_to_stdout_when_stderr_empty() {
+        let err = run_with_timeout(
+            "sh",
+            &["-c".to_string(), "echo 'Claude AI usage limit reached|1765500000'; exit 1".to_string()],
+            Path::new("/tmp"),
+            10,
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("usage limit reached"), "got: {}", err);
+        assert!(crate::spend::is_usage_limit_error(&err));
+    }
+
+    #[test]
+    fn nonzero_exit_prefers_stderr() {
+        let err = run_with_timeout(
+            "sh",
+            &["-c".to_string(), "echo out; echo 'real error' >&2; exit 1".to_string()],
+            Path::new("/tmp"),
+            10,
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err, "exit 1: real error");
+    }
+
+    #[test]
     fn timeout_kills_hung_process() {
         let start = std::time::Instant::now();
-        let err = run_with_timeout("sleep", &["30".to_string()], Path::new("/tmp"), 1, &[]).unwrap_err();
+        let err = run_with_timeout("sleep", &["30".to_string()], Path::new("/tmp"), 1, &[], true).unwrap_err();
         assert!(err.contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(5));
     }
@@ -197,5 +252,6 @@ mod tests {
         assert!(out.text.contains("hello"));
         assert!(session.envs.iter().any(|(k, v)| k == "ITER_PROJECT" && v == "/tmp/proj"));
         assert!(session.envs.iter().any(|(k, v)| k == "ITER_BIN" && !v.is_empty()));
+        assert!(session.envs.iter().any(|(k, v)| k == "BASH_MAX_TIMEOUT_MS" && v == "10000"));
     }
 }

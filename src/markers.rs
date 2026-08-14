@@ -118,6 +118,15 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(&path) else { continue };
+            // Test-group manifests are found by filename and read for their JSON
+            // block only — never structure nodes, even if an over-eager agent gave
+            // one `level:` frontmatter (that would put a phantom second node on the
+            // directory the component's own marker already claims).
+            let fname = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            if fname.ends_with("testgroups.iter.md") {
+                result.plain.push(path.to_string_lossy().into_owned());
+                continue;
+            }
             let (front, participants, body) = frontmatter(&content);
             let rel_dir = path
                 .parent()
@@ -185,6 +194,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("core/intake")).unwrap();
         dir
+    }
+
+    #[test]
+    fn testgroups_manifest_never_becomes_a_node() {
+        let dir = std::env::temp_dir().join(format!("iter-markers-tg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("core")).unwrap();
+        std::fs::write(
+            dir.join("core/core.iter.md"),
+            "---\nname: Core\nlevel: component\n---\nthe real node",
+        )
+        .unwrap();
+        // An over-eager agent gave the manifest `level:` frontmatter — it must
+        // stay a plain context doc, not a phantom second node on core/.
+        std::fs::write(
+            dir.join("core/testgroups.iter.md"),
+            "---\nname: Core Tests\nlevel: component\n---\n<!-- iterapp:testgroups\n-->",
+        )
+        .unwrap();
+        let scan = scan(&dir, &[dir.clone()], "**/*.iter.md");
+        assert_eq!(scan.nodes.len(), 1, "only the component marker is a node");
+        assert_eq!(scan.nodes[0].name, "Core");
+        assert!(
+            scan.plain.iter().any(|p| p.ends_with("testgroups.iter.md")),
+            "manifest is filed as plain context: {:?}",
+            scan.plain
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

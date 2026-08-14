@@ -1,6 +1,7 @@
 mod agents;
 mod config;
 mod context;
+mod limits;
 mod locks;
 mod logging;
 mod markers;
@@ -69,6 +70,22 @@ enum Command {
         #[arg(long)]
         source: Option<String>,
     },
+    /// Synchronous critical review: runs the `_critic.md` persona as a subprocess
+    /// and prints its feedback to stdout — no work items involved
+    Critreview {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// File containing the material to review (plan text, change summary, …)
+        #[arg(long)]
+        file: PathBuf,
+        /// Context file the critic should also read (repeatable)
+        #[arg(long)]
+        context: Vec<PathBuf>,
+        /// Retries after a failed critic run (a 1-token probe rules out token
+        /// exhaustion first; exhaustion aborts with exit 3 instead of retrying)
+        #[arg(long, default_value_t = 1)]
+        max_retry: u32,
+    },
     /// Queue summary, active agents, and locks
     Status {
         #[arg(long, default_value = ".")]
@@ -97,6 +114,9 @@ fn main() {
         Command::Run { project, once, until_idle } => cmd_run(project, once, until_idle),
         Command::Add { project, file, item_type, title, mainwork, codepath, priority, risk, source } => {
             cmd_add(project, file, item_type, title, mainwork, codepath, priority, risk, source)
+        }
+        Command::Critreview { project, file, context, max_retry } => {
+            cmd_critreview(project, file, context, max_retry)
         }
         Command::Status { project } => cmd_status(project),
         Command::Stop { project, wait } => cmd_stop(project, wait),
@@ -268,6 +288,142 @@ fn cmd_add(
             1
         }
     }
+}
+
+/// Exit codes: 0 = review on stdout; 1 = critic failed after retries; 2 = bad
+/// invocation; 3 = usage/credit limit hit. On 1 and 3 a fail-flag file keyed by
+/// $ITER_WORKID is written, which the engine consumes at the next turn boundary
+/// to fail the calling work item DETERMINISTICALLY — a requested review that
+/// never happened must never degrade into "proceeded without review". The
+/// caller is told to stop, but the item fails even if it doesn't.
+///
+/// Deliberately NO usage-limit gate before spawning: the caller is already
+/// running and this review is how it finishes its work — the engine throttles
+/// at agent start (max_agents_at_80/90/95), never mid-flight. The critic's spend
+/// is still recorded to the ledger as receipts; recording never throttles.
+fn cmd_critreview(project: PathBuf, file: PathBuf, context: Vec<PathBuf>, max_retry: u32) -> i32 {
+    // Heal so projects created before _critic.md existed still get the persona.
+    let _ = template::ensure_project(&project);
+    let critic_path = agents::agents_dir(&project).join("_critic.md");
+    let text = match std::fs::read_to_string(&critic_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", critic_path.display(), e);
+            return 2;
+        }
+    };
+    if !file.exists() {
+        eprintln!("error: material file {} not found", file.display());
+        return 2;
+    }
+    let agent = agents::parse("_critic", &text);
+
+    let mut prompt = format!(
+        "{}\n\n## Material to review\nRead and review this file: {}\n",
+        agent.body,
+        file.display()
+    );
+    if !context.is_empty() {
+        prompt.push_str("\n## Context files (requirements to judge against)\n");
+        for c in &context {
+            prompt.push_str(&format!("- {}\n", c.display()));
+        }
+    }
+    prompt.push_str("\nRead the material and context files now, then return ONLY the review in the output shape specified above.");
+
+    let attempts = max_retry.saturating_add(1);
+    let mut last_err = String::new();
+    for attempt in 1..=attempts {
+        // Fresh session per attempt; a crashed session id is not worth resuming.
+        let mut session = runner::Session::new(agent.clone(), project.clone(), project.clone());
+        session.own_group = false; // stay in the caller's process group: an engine kill of the caller takes us too
+        match session.run(&runner::Turn { label: "critreview".into(), prompt: prompt.clone() }) {
+            Ok(out) if !out.text.trim().is_empty() => {
+                spend::record(
+                    &project,
+                    &spend::SpendEntry {
+                        ts: workitems::now_iso(),
+                        workid: "critreview".into(),
+                        agent: "_critic".into(),
+                        turn: format!("attempt-{}", attempt),
+                        usd: out.cost_usd,
+                        input_tokens: out.input_tokens,
+                        output_tokens: out.output_tokens,
+                    },
+                );
+                println!("{}", out.text.trim());
+                return 0;
+            }
+            Ok(_) => last_err = "critic returned empty output".into(),
+            Err(e) => last_err = e,
+        }
+        if spend::is_usage_limit_error(&last_err) {
+            // Raw error text goes into the flag so the engine's classifier routes
+            // it (window limit → hold until reset; billing → drain).
+            write_critfail(&project, &format!("critical review aborted: {}", last_err));
+            println!(
+                "CRITREVIEW ABORT (usage/credit limit): {}. STOP NOW: this work item is flagged to fail; end your work immediately.",
+                last_err
+            );
+            return 3;
+        }
+        // The critic crashed for an unclear reason — probe with a ~1-token request
+        // to separate "out of tokens" from "transient crash worth retrying".
+        if let Err(probe_err) = probe_tokens(&project) {
+            write_critfail(
+                &project,
+                &format!("critical review aborted: critic error \"{}\"; token probe error \"{}\"", last_err, probe_err),
+            );
+            println!(
+                "CRITREVIEW ABORT (token probe failed): critic error was \"{}\"; probe error was \"{}\". STOP NOW: this work item is flagged to fail; end your work immediately.",
+                last_err, probe_err
+            );
+            return 3;
+        }
+        eprintln!(
+            "critreview: attempt {}/{} failed ({}); token probe OK{}",
+            attempt,
+            attempts,
+            last_err,
+            if attempt < attempts { ", retrying" } else { "" }
+        );
+    }
+    write_critfail(&project, &format!("critical review failed after {} attempt(s): {}", attempts, last_err));
+    println!(
+        "CRITREVIEW FAILED after {} attempt(s): {}. STOP NOW: do NOT proceed without the review — this work item is flagged to fail and will retry.",
+        attempts, last_err
+    );
+    1
+}
+
+/// Flag the calling work item ($ITER_WORKID, injected by the engine) as failed.
+/// The scheduler consumes the flag at the next turn boundary. Manual CLI use
+/// (no ITER_WORKID) skips the flag — there is no item to fail.
+fn write_critfail(project: &Path, reason: &str) {
+    let Ok(workid) = std::env::var("ITER_WORKID") else { return };
+    if workid.is_empty() {
+        return;
+    }
+    let path = scheduler::critfail_path(project, &workid);
+    if let Err(e) = std::fs::write(&path, reason) {
+        eprintln!("critreview: cannot write fail-flag {}: {}", path.display(), e);
+    }
+}
+
+/// A minimal one-word haiku turn: succeeds iff the account can still complete
+/// requests. Cheap enough to be negligible, decisive enough to tell "critic
+/// crashed" apart from "tokens exhausted".
+fn probe_tokens(project: &Path) -> Result<(), String> {
+    let agent = agents::AgentDef {
+        model: "haiku".into(),
+        max_work_timeout_sec: 120,
+        ..Default::default()
+    };
+    let mut session = runner::Session::new(agent, project.to_path_buf(), project.to_path_buf());
+    session.own_group = false;
+    session
+        .run(&runner::Turn { label: "probe".into(), prompt: "Reply with the single word: ok".into() })
+        .map(|_| ())
 }
 
 fn cmd_status(project: PathBuf) -> i32 {

@@ -557,3 +557,118 @@ fn copy_binary_and_run_scaffolds_project() {
 
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+#[test]
+fn critreview_success_abort_and_retry_paths() {
+    let (root, _stub) = setup_project("critrev", 1, 10);
+    let material = root.join("plan-to-review.md");
+    std::fs::write(&material, "1. build the thing\n2. test the thing\n").unwrap();
+
+    let write_stub = |name: &str, body: &str| -> PathBuf {
+        let path = root.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    };
+    let run = |stub: &Path| {
+        Command::new(BIN)
+            .args(["critreview", "--project", root.to_str().unwrap(), "--file", material.to_str().unwrap()])
+            .env("ITER_CLAUDE_BIN", stub)
+            .env("ITER_WORKID", "wi-critrev-1")
+            .output()
+            .unwrap()
+    };
+    let flag_path = root.join(".iter/.engine/critfail-wi-critrev-1.txt");
+    let take_flag = || {
+        let text = std::fs::read_to_string(&flag_path).ok();
+        let _ = std::fs::remove_file(&flag_path);
+        text
+    };
+
+    // Exit 0: critic returns a review; it lands on stdout and spend is recorded.
+    let ok = write_stub(
+        "critic-ok.sh",
+        "#!/bin/sh\necho '{\"type\":\"result\",\"session_id\":\"c1\",\"result\":\"VERDICT: sound with fixes\\n1. [minor] nit\",\"total_cost_usd\":0.05,\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}'\n",
+    );
+    let out = run(&ok);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("VERDICT: sound with fixes"), "{}", stdout);
+    let ledger = std::fs::read_to_string(root.join(".iter/.engine/spend.jsonl")).unwrap();
+    assert!(ledger.contains("\"workid\":\"critreview\""), "critic spend is receipted: {}", ledger);
+    assert!(take_flag().is_none(), "a delivered review must not flag failure");
+
+    // Exit 3: usage limit — abort immediately, no probe, caller told to STOP.
+    let limit = write_stub(
+        "critic-limit.sh",
+        "#!/bin/sh\necho 'Claude AI usage limit reached|1765500000'\nexit 1\n",
+    );
+    let out = run(&limit);
+    assert_eq!(out.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("CRITREVIEW ABORT") && stdout.contains("STOP NOW"), "{}", stdout);
+    let flag = take_flag().expect("limit abort writes the fail-flag");
+    assert!(flag.contains("usage limit reached"), "raw limit text routes the engine's hold: {}", flag);
+
+    // Exit 1: critic crashes, the haiku probe succeeds (tokens fine), retries burn
+    // out — the item is flagged to fail; the caller must NOT proceed unreviewed.
+    let crash = write_stub(
+        "critic-crash.sh",
+        "#!/bin/sh\ncase \"$*\" in\n  *haiku*) echo '{\"type\":\"result\",\"session_id\":\"p1\",\"result\":\"ok\"}';;\n  *) echo 'stub crash' >&2; exit 1;;\nesac\n",
+    );
+    let out = run(&crash);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("CRITREVIEW FAILED after 2 attempt(s)") && stdout.contains("STOP NOW"), "{}", stdout);
+    assert!(stderr.contains("token probe OK"), "probe ran and passed: {}", stderr);
+    let flag = take_flag().expect("exhausted retries write the fail-flag");
+    assert!(flag.contains("critical review failed after 2 attempt(s)"), "{}", flag);
+
+    // Exit 3: crash where the probe ALSO fails — treated as token exhaustion.
+    let dead = write_stub("critic-dead.sh", "#!/bin/sh\necho 'stub crash' >&2\nexit 1\n");
+    let out = run(&dead);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("token probe failed"));
+    assert!(take_flag().expect("probe-fail abort writes the fail-flag").contains("token probe error"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn critfail_flag_fails_item_even_when_agent_reports_success() {
+    // The stub plays an agent whose critreview subprocess wrote the fail-flag
+    // mid-turn, but which then LIES by returning a normal successful result.
+    // The engine must fail the item from the flag alone.
+    let (root, _stub) = setup_project("critflag", 1, 10);
+    let stub = root.join("flagging-claude.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'critical review failed after 2 attempt(s): stub crash' > \"$ITER_PROJECT/.iter/.engine/critfail-$ITER_WORKID.txt\"\necho '{\"type\":\"result\",\"session_id\":\"s1\",\"result\":\"all done, everything is fine\"}'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    seed(&root, &workitem_json("e2e-critflag-1", "code", "flagged", "./src", "do work with review", "", ""));
+
+    run_engine(&root, &stub, Duration::from_secs(60));
+
+    let closed = closed_items(&root);
+    assert_eq!(closed.len(), 1, "{:?}", closed);
+    assert_eq!(closed[0]["state"], "failed", "flag must override the agent's claimed success: {:?}", closed[0]);
+    assert!(
+        closed[0]["lasterror"].as_str().unwrap().contains("critical review failed"),
+        "flag reason lands in lasterror: {:?}",
+        closed[0]["lasterror"]
+    );
+    assert!(!root.join(".iter/.engine/critfail-e2e-critflag-1.txt").exists(), "flag is consumed");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

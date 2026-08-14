@@ -37,8 +37,9 @@ pub fn agents_dir(project_root: &Path) -> std::path::PathBuf {
     project_root.join(".iter").join("agents")
 }
 
-/// Discover all agent definitions in `.iter/agents/*.md`. Files that are empty or
-/// unreadable are skipped with a warning on stderr.
+/// Discover all agent definitions in `.iter/agents/*.md`. Files whose name starts
+/// with `_` are helpers, not agent types (e.g. `_shared.md`); files that are empty
+/// or unreadable are skipped with a warning on stderr.
 pub fn discover(project_root: &Path) -> Vec<AgentDef> {
     let dir = agents_dir(project_root);
     let mut out = Vec::new();
@@ -55,6 +56,9 @@ pub fn discover(project_root: &Path) -> Vec<AgentDef> {
             Some(n) => n.to_string(),
             None => continue,
         };
+        if name.starts_with('_') {
+            continue;
+        }
         match std::fs::read_to_string(&path) {
             Ok(text) if !text.trim().is_empty() => out.push(parse(&name, &text)),
             Ok(_) => eprintln!("warning: agent file {} is empty; skipped", path.display()),
@@ -63,6 +67,19 @@ pub fn discover(project_root: &Path) -> Vec<AgentDef> {
     }
     out.sort_by(|a, b| a.type_name.cmp(&b.type_name));
     out
+}
+
+/// Instructions shared by EVERY agent: `.iter/agents/_shared.md`. Appended to each
+/// agent's composed context at run time — the store-once place for all-agent rules.
+/// Returns None when the file is missing or effectively empty.
+pub fn shared_instructions(project_root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(agents_dir(project_root).join("_shared.md")).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Parse an agent markdown file: flat `key: value` YAML frontmatter between `---`
@@ -188,6 +205,18 @@ mod tests {
         assert_eq!(code.llm_run_mode, "headless");
         assert!(code.body.contains("code"));
         assert!(agents.len() >= 6, "expected 6 template agents, got {}", agents.len());
+        assert!(
+            !agents.iter().any(|a| a.type_name.starts_with('_')),
+            "underscore-prefixed helper files must not become agent types"
+        );
+    }
+
+    #[test]
+    fn shared_instructions_loaded_from_underscore_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let text = shared_instructions(&root).expect("template ships _shared.md");
+        assert!(text.contains("frontmatter"), "the template's first shared rule");
+        assert!(shared_instructions(Path::new("/nonexistent/nowhere")).is_none());
     }
 
     #[test]

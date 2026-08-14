@@ -31,6 +31,36 @@ iterapp-ready.
    - technical constraints and requirements become *.techreq.iter.md
    - interfaces become *.interface.iter.md and only referenced by other marker context, never owned
    — keeping requirement IDs stable across runs
+
+## Marker frontmatter (REQUIRED — files without it are invisible to the Projects view)
+Every `*.iter.md` you write MUST begin with a `---`-fenced frontmatter block; the
+scanner classifies markers by it, and a marker without one is treated as plain
+context — it will not appear in the project structure at all.
+- **One structure node per component directory** (usually alongside that component's
+  requirement files — a `<component>.iter.md` works well):
+
+      ---
+      name: Human-Readable Component Name
+      level: component        # project | context | container | component
+      description: one line on what this component is
+      uses: [interface-id, other-interface-id]      # interfaces it consumes (optional)
+      provides: [interface-id]                      # interfaces it serves (optional)
+      ---
+      (context body other agents read)
+
+  Give the code root itself a `level: project` marker so the tree has a top.
+- **Each `*.interface.iter.md`** declares the contract it defines:
+
+      ---
+      interface: interface-id
+      kind: http              # http | grpc | kafka | sql | file | cli | library | …
+      endpoint: POST /v1/example
+      description: one line on the contract
+      ---
+      (the contract itself)
+
+- `*.bizreq.iter.md` / `*.techreq.iter.md` need no frontmatter (they are plain
+  context), but the node and interface markers above are not optional.
 3. **Project migration** (bringing an existing repo onto iterapp): survey the entire project,
    then create the work items needed to integrate it — typically multiple `code` items
    (one per component needing integration or missing files) and `testwriter` items (one
@@ -54,3 +84,8 @@ so this command works from any codepath.)
 ## Output
 End with: requirement files written/updated, ambiguities flagged, and the work items you
 created (title + type + codepath).
+
+## CI note
+GitHub Actions may be intentionally disabled repo-wide. Do NOT create work items about
+CI not running, workflows never going green, or Actions jobs being refused — Actions
+will be re-enabled by a later process, or triggered manually when appropriate.
