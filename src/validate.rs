@@ -61,6 +61,20 @@ impl Report {
 /// unquoted, strict-YAML readers see a nested key and refuse the whole block.
 const PROSE_KEYS: &[&str] = &["name", "description", "endpoint"];
 
+/// The four logical interaction kinds and each one's required H2 sections
+/// (matched case-insensitively, trailing colons ignored). Every kind also
+/// requires the tail sections, in order, closing the file.
+fn interface_kind_sections(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        "request-reply" => Some(&["Request", "Reply, success shape", "Reply, failure shape"]),
+        "event" => Some(&["Event"]),
+        "stream" => Some(&["Stream item", "Stream end"]),
+        "dataset" => Some(&["Record"]),
+        _ => None,
+    }
+}
+const INTERFACE_TAIL_SECTIONS: &[&str] = &["Worked examples", "Invariants"];
+
 /// Identity-bearing keys that belong to specific roles; anywhere else they are
 /// harmless (the filename wins) but confuse readers.
 fn stray_identity_keys(role: Option<Role>) -> &'static [&'static str] {
@@ -243,34 +257,41 @@ pub fn validate_file(path: &Path, fix: bool) -> std::io::Result<Vec<Finding>> {
             if front.get("interface").map(|v| v.trim().is_empty()).unwrap_or(true) {
                 push(Severity::Error, "missing-key", "interface file has no `interface:` id — nothing can reference it from uses:/provides:".into(), false);
             }
-            if front.get("kind").map(|v| v.trim().is_empty()).unwrap_or(true) {
-                push(Severity::Warn, "missing-key", "interface file has no `kind:` (json | xml | http | grpc | kafka | sql | cli | library | …)".into(), false);
+            let kind = front.get("kind").map(|v| v.trim().to_string()).unwrap_or_default();
+            let kind_sections = interface_kind_sections(&kind);
+            if kind.is_empty() {
+                push(Severity::Warn, "missing-key", "interface file has no `kind:` (request-reply | event | stream | dataset)".into(), false);
+            } else if kind_sections.is_none() {
+                push(Severity::Warn, "bad-kind", format!("`kind: {}` is not a logical interaction kind (request-reply | event | stream | dataset) — transports and formats are not kinds", kind), false);
             }
-            // The body IS the contract: an example of the data exchanged. The
-            // format is free (json, xml, kwargs, argv/stdout …), so the checks
-            // are shape-level: an example block exists, tagged examples parse,
-            // and no usage (who/how) prose rides along.
+            // The body IS the contract, in the fixed format: an H1 title, a
+            // summary under 300 chars, the kind's required H2 sections, then
+            // `## Worked examples` (strict JSON) and `## Invariants` last.
             let contract = body.trim();
             if contract.is_empty() {
                 push(
                     Severity::Warn,
                     "empty-contract-body",
-                    "interface body is empty — the body IS the contract: a fenced example of the data exchanged (model: sample/greet-msg.interface.iter.md)".into(),
+                    "interface body is empty — the body IS the contract (get the skeleton: `iter validate --file <this file> --template`)".into(),
                     false,
                 );
             } else {
-                // Walk ``` fences: collect (language-tag, content) per block and
-                // the lines outside all blocks.
+                // Walk ``` fences: collect (language-tag, content, owning H2
+                // section) per block, headings and summary from outside lines.
                 let mut in_fence = false;
                 let mut fence_lang = String::new();
                 let mut block = String::new();
-                let mut blocks: Vec<(String, String)> = Vec::new();
+                let mut blocks: Vec<(String, String, String)> = Vec::new();
                 let mut outside: Vec<&str> = Vec::new();
+                let mut sections: Vec<String> = Vec::new();
+                let mut cur_section = String::new();
+                let mut h1_count = 0usize;
+                let mut summary_len = 0usize;
                 for line in contract.lines() {
                     let t = line.trim_start();
                     if t.starts_with("```") {
                         if in_fence {
-                            blocks.push((fence_lang.clone(), std::mem::take(&mut block)));
+                            blocks.push((fence_lang.clone(), std::mem::take(&mut block), cur_section.clone()));
                         } else {
                             fence_lang = t.trim_start_matches('`').trim().to_lowercase();
                         }
@@ -280,8 +301,17 @@ pub fn validate_file(path: &Path, fix: bool) -> std::io::Result<Vec<Finding>> {
                     if in_fence {
                         block.push_str(line);
                         block.push('\n');
-                    } else {
-                        outside.push(line);
+                        continue;
+                    }
+                    outside.push(line);
+                    if let Some(h) = t.strip_prefix("## ") {
+                        let name = h.trim().trim_end_matches(':').trim().to_string();
+                        sections.push(name.clone());
+                        cur_section = name;
+                    } else if t.starts_with("# ") {
+                        h1_count += 1;
+                    } else if h1_count > 0 && sections.is_empty() && !t.is_empty() {
+                        summary_len += t.len() + 1; // prose between the H1 and the first H2
                     }
                 }
                 if in_fence {
@@ -295,11 +325,48 @@ pub fn validate_file(path: &Path, fix: bool) -> std::io::Result<Vec<Finding>> {
                     push(
                         Severity::Warn,
                         "no-example-block",
-                        "interface body has no fenced example block — show the data shape as a fenced example (pseudo-JSON/XML/kwargs are fine), not prose about it".into(),
+                        "interface body has no fenced example block — show the message shapes as fenced examples, not prose about them".into(),
                         false,
                     );
                 }
-                for (lang, content) in &blocks {
+                // H1 + summary.
+                if h1_count == 0 {
+                    push(Severity::Warn, "missing-summary", "no `# <id> — contract` H1 title; the fixed format is H1 + a summary under 300 characters, then the H2 sections".into(), false);
+                } else if h1_count > 1 {
+                    push(Severity::Warn, "multiple-h1", format!("{} H1 headings — the fixed format has exactly one, followed by the summary", h1_count), false);
+                } else if summary_len == 0 {
+                    push(Severity::Warn, "missing-summary", "no summary prose between the H1 title and the first H2 section".into(), false);
+                } else if summary_len > 300 {
+                    push(Severity::Warn, "summary-too-long", format!("the summary between the H1 and the first H2 is {} characters — the cap is 300; move detail into the sections", summary_len), false);
+                }
+                // Required and allowed H2 sections, per kind.
+                if let Some(required) = kind_sections {
+                    let has = |name: &str| sections.iter().any(|s| s.eq_ignore_ascii_case(name));
+                    for name in required.iter().chain(INTERFACE_TAIL_SECTIONS) {
+                        if !has(name) {
+                            push(Severity::Warn, "missing-section", format!("`kind: {}` requires a `## {}` section and the body has none", kind, name), false);
+                        }
+                    }
+                    for s in &sections {
+                        let allowed = required.iter().chain(INTERFACE_TAIL_SECTIONS).any(|n| s.eq_ignore_ascii_case(n));
+                        if !allowed {
+                            push(Severity::Warn, "unexpected-section", format!("`## {}` is not a section of the fixed format for `kind: {}` — the contract holds ONLY the format's sections; other prose belongs on a marker or techreq", s, kind), false);
+                        }
+                    }
+                    // Tail order: Worked examples, then Invariants, closing the file.
+                    let tail_ok = sections.len() >= 2
+                        && sections[sections.len() - 2].eq_ignore_ascii_case("Worked examples")
+                        && sections[sections.len() - 1].eq_ignore_ascii_case("Invariants");
+                    if !tail_ok && INTERFACE_TAIL_SECTIONS.iter().all(|n| has(n)) {
+                        push(Severity::Warn, "section-order", "`## Worked examples` then `## Invariants` must be the last two sections".into(), false);
+                    }
+                    // Worked examples must be machine-checkable: a strict-JSON fence.
+                    let we_json = blocks.iter().any(|(lang, _, sec)| lang == "json" && sec.eq_ignore_ascii_case("Worked examples"));
+                    if has("Worked examples") && !we_json {
+                        push(Severity::Warn, "worked-examples-not-json", "the `## Worked examples` section has no ```json fence — worked examples are normative and must strictly parse".into(), false);
+                    }
+                }
+                for (lang, content, _) in &blocks {
                     if lang == "json" && serde_json::from_str::<serde_json::Value>(content).is_err() {
                         push(
                             Severity::Warn,
@@ -388,6 +455,112 @@ pub fn validate_file(path: &Path, fix: bool) -> std::io::Result<Vec<Finding>> {
     }
     Ok(findings)
 }
+
+/// `iter validate --file <path> --template` — the one authoritative skeleton
+/// per role, stubs in <angle brackets>. Agents fetch this instead of carrying
+/// every file template in context; changing a template here changes it for
+/// every agent at once. The role comes from the FILENAME; interface skeletons
+/// follow the file's existing `kind:` when it already declares a valid one,
+/// and stub `request-reply` otherwise.
+pub fn template_for(path: &Path) -> Result<String, String> {
+    let fname = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let Some(role) = markers::role_of(&fname) else {
+        return Err(format!(
+            "`{}` matches no role (marker/bizreq/techreq/interface/testgroup/usecase before .iter.md) — a plain context doc has no template",
+            fname
+        ));
+    };
+    Ok(match role {
+        Role::Interface => {
+            let declared = std::fs::read_to_string(path)
+                .ok()
+                .map(|t| markers::frontmatter(&t).0.get("kind").cloned().unwrap_or_default())
+                .unwrap_or_default();
+            let kind = if interface_kind_sections(&declared).is_some() { declared } else { "request-reply".to_string() };
+            interface_template(&kind)
+        }
+        Role::Marker => MARKER_TEMPLATE.trim_start().to_string(),
+        Role::Bizreq => req_template("BIZ", "business requirements", "WHAT the business needs — never how it is built"),
+        Role::Techreq => req_template("TECH", "technical requirements", "a technical constraint the build must honor"),
+        Role::Testgroup => TESTGROUP_TEMPLATE.trim_start().to_string(),
+        Role::Usecase => USECASE_TEMPLATE.trim_start().to_string(),
+    })
+}
+
+fn interface_template(kind: &str) -> String {
+    let middle = match kind {
+        "event" => {
+            "## Event\n\n```\n{\n  \"<field>\": \"<example>\"        // <type>, <required|optional — default>\n}\n```\n\n## Worked examples\n\nNormative — each event must be producible and acceptable on every implementation (strict JSON):\n\n```json\n[\n  { \"event\": { } }\n]\n```\n"
+        }
+        "stream" => {
+            "## Stream item\n\n```\n{\n  \"<field>\": \"<example>\"        // <type>; state the ordering rule items arrive in\n}\n```\n\n## Stream end\n\n```\n{\n  \"end\": {\n    \"reason\": \"<COMPLETE | closed vocabulary of failure codes>\"\n  }\n}\n```\n\n## Worked examples\n\nNormative — each sequence must hold on every implementation (strict JSON):\n\n```json\n[\n  { \"items\": [ { } ], \"end\": { \"reason\": \"COMPLETE\" } }\n]\n```\n"
+        }
+        "dataset" => {
+            "## Record\n\n```\n{\n  \"<field>\": \"<example>\"        // <type>; mark the identity/key fields\n}\n```\n\n## Worked examples\n\nNormative — each record must be producible and acceptable on every implementation (strict JSON):\n\n```json\n[\n  { \"record\": { } }\n]\n```\n"
+        }
+        _ => {
+            "## Request\n\n```\n{\n  \"<field>\": \"<example>\"        // <type>, <required|optional — default>\n}\n```\n\n## Reply, success shape\n\n```\n{\n  \"<field>\": \"<example>\"        // <type, rules the value must satisfy>\n}\n```\n\n## Reply, failure shape\n\n```\n{\n  \"refusal\": {\n    \"code\":   \"<REFUSAL_CODE>\",  // closed vocabulary — list every code\n    \"detail\": \"<one line naming what was refused>\"\n  }\n}\n```\n\n## Worked examples\n\nNormative — each pair must hold on every implementation (strict JSON):\n\n```json\n[\n  { \"request\": { }, \"reply\": { } }\n]\n```\n"
+        }
+    };
+    format!(
+        "---\ninterface: <kebab-case-id>\nkind: {}                    # request-reply | event | stream | dataset\ndescription: \"<one line: what data crosses this boundary>\"\n---\n\n# <kebab-case-id> — contract\n\n<Named summary, under 300 characters: what goes in, what comes out, and why.\nNo carrier, no consumers, no deployment.>\n\n{}\n## Invariants\n\n- <property the examples cannot show: totality, determinism, ordering, limits,\n  closed vocabularies>\n- Transport-neutral: these messages ride any carrier unchanged; carrier\n  bindings (routes, ports, topics, flags, exit codes) live on the serving\n  object's marker, never here.\n",
+        kind, middle
+    )
+}
+
+fn req_template(prefix: &str, title: &str, statement: &str) -> String {
+    format!(
+        "# <component> — {}\n\n- **<PREFIX>-{}-001** — <one requirement per bullet, stable id never renumbered,\n  a testable statement of {}.>\n",
+        title, prefix, statement
+    )
+}
+
+const MARKER_TEMPLATE: &str = r#"
+---
+name: "<Human-Readable Name>"
+level: component                # project | context | container | component
+description: "<one line on what this C4 object is>"
+uses: [<interface-id>]          # interfaces it consumes (optional)
+provides: [<interface-id>]      # interfaces it serves (optional)
+testgroup: tests/testgroup.iter.md   # THIS object's testgroup file, relative to this marker
+test_dir: tests                 # subtree holding its test scripts
+---
+
+# Long Description
+
+<Plain-language description for a non-technical reader — describe, don't
+state; no jargon; define every acronym on first use; link related project
+parts by their marker path. Never leave TBD.>
+
+## <interface-id> binding
+
+<Only if this object serves or consumes an interface over a specific carrier:
+how the transport-neutral messages map to that carrier — routes, topics,
+flags, exit codes. One short block per bound interface.>
+"#;
+
+const TESTGROUP_TEMPLATE: &str = r#"
+# <component> — test groups
+
+<!-- iterapp:testgroups
+{"label":"<Group label>","testlist":[{"id":"t1","name":"<short name>","desc":"<what it proves>","shell":"tests/iter/t1.sh"}]}
+-->
+"#;
+
+const USECASE_TEMPLATE: &str = r#"
+---
+name: "<Use-case name>"
+description: "<one line on the thread>"
+participants:
+  - 1 <marker key of the first participant>
+  - 2 <marker key of the next participant>
+---
+
+# <Use-case name>
+
+<The narrative: who initiates, what flows through which participants, what
+comes out. Reference interfaces by id and C4 objects by marker path.>
+"#;
 
 fn role_name(role: Option<Role>) -> &'static str {
     match role {
@@ -552,40 +725,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fully format-compliant request-reply contract.
+    const CLEAN_IFACE: &str = "---\ninterface: pay-msg\nkind: request-reply\ndescription: \"a payment in, a receipt or refusal out\"\n---\n\n# pay-msg — contract\n\nA payment request in; exactly one reply out — a receipt XOR a refusal.\n\n## Request\n\n```\n{ \"amount_cents\": 1200 }\n```\n\n## Reply, success shape\n\n```\n{ \"receipt_id\": \"r-1\" }\n```\n\n## Reply, failure shape\n\n```\n{ \"refusal\": { \"code\": \"NO_FUNDS\" } }\n```\n\n## Worked examples\n\n```json\n[ { \"request\": { \"amount_cents\": 1200 }, \"reply\": { \"receipt_id\": \"r-1\" } } ]\n```\n\n## Invariants\n\n- Deterministic and total.\n";
+
     #[test]
     fn interface_body_is_the_contract() {
         let dir = tmp("ifacebody");
         let p = dir.join("api.interface.iter.md");
 
-        // Clean: id + kind + a strict-JSON example, no usage prose → no findings.
-        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\ndescription: \"d\"\n---\n# pay-msg — contract\n```json\n{ \"amount_cents\": 1200, \"currency\": \"USD\" }\n```\n").unwrap();
-        assert!(validate_file(&p, false).unwrap().is_empty());
+        // Clean: the fixed format end to end → no findings at all.
+        std::fs::write(&p, CLEAN_IFACE).unwrap();
+        let fs = validate_file(&p, false).unwrap();
+        assert!(fs.is_empty(), "{:?}", fs);
 
         // Empty body.
-        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n").unwrap();
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: request-reply\n---\n").unwrap();
         assert!(codes(&validate_file(&p, false).unwrap()).contains(&"empty-contract-body"));
 
         // Prose but no fenced example.
-        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\ntwo pages of prose about the payload\n").unwrap();
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: request-reply\n---\ntwo pages of prose about the payload\n").unwrap();
         assert!(codes(&validate_file(&p, false).unwrap()).contains(&"no-example-block"));
 
         // Tagged json that does not parse; pseudo-JSON untagged is fine.
-        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n```json\n{ \"amount\": … }\n```\n").unwrap();
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: request-reply\n---\n```json\n{ \"amount\": … }\n```\n").unwrap();
         assert!(codes(&validate_file(&p, false).unwrap()).contains(&"bad-json-example"));
-        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n```\n{ \"amount\": … }\n```\n").unwrap();
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: request-reply\n---\n```\n{ \"amount\": … }\n```\n").unwrap();
         assert!(!codes(&validate_file(&p, false).unwrap()).contains(&"bad-json-example"));
 
         // Unclosed fence.
-        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n```json\n{ \"a\": 1 }\n").unwrap();
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: request-reply\n---\n```json\n{ \"a\": 1 }\n").unwrap();
         assert!(codes(&validate_file(&p, false).unwrap()).contains(&"unclosed-fence"));
 
         // Usage prose outside the fence is flagged; the same words INSIDE an
         // example (e.g. a kafka `consumer:` config key) are not.
-        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\nThis is consumed by the settlement service.\n```json\n{ \"a\": 1 }\n```\n").unwrap();
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: request-reply\n---\nThis is consumed by the settlement service.\n```json\n{ \"a\": 1 }\n```\n").unwrap();
         let fs = validate_file(&p, false).unwrap();
         assert!(codes(&fs).contains(&"usage-in-contract"), "{:?}", fs);
-        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n```\nconsumer: settlement-group\n```\n").unwrap();
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: request-reply\n---\n```\nconsumer: settlement-group\n```\n").unwrap();
         assert!(!codes(&validate_file(&p, false).unwrap()).contains(&"usage-in-contract"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interface_fixed_format_checks() {
+        let dir = tmp("ifaceformat");
+        let p = dir.join("api.interface.iter.md");
+
+        // Transport/format kinds are no longer kinds.
+        std::fs::write(&p, CLEAN_IFACE.replace("kind: request-reply", "kind: grpc")).unwrap();
+        assert!(codes(&validate_file(&p, false).unwrap()).contains(&"bad-kind"));
+
+        // Missing a required section for the kind.
+        std::fs::write(&p, CLEAN_IFACE.replace("## Reply, failure shape", "## Whatever")).unwrap();
+        let c = codes(&validate_file(&p, false).unwrap());
+        assert!(c.contains(&"missing-section") && c.contains(&"unexpected-section"), "{:?}", c);
+
+        // Tail order: Invariants must close the file, after Worked examples.
+        let swapped = CLEAN_IFACE
+            .replace("## Worked examples", "## Invariants")
+            .replacen("## Invariants\n\n- Deterministic and total.\n", "## Worked examples\n\n```json\n[]\n```\n", 1);
+        std::fs::write(&p, swapped).unwrap();
+        assert!(codes(&validate_file(&p, false).unwrap()).contains(&"section-order"));
+
+        // Worked examples without a strict-JSON fence.
+        std::fs::write(&p, CLEAN_IFACE.replace("```json", "```")).unwrap();
+        assert!(codes(&validate_file(&p, false).unwrap()).contains(&"worked-examples-not-json"));
+
+        // No H1, and a summary over 300 characters.
+        std::fs::write(&p, CLEAN_IFACE.replace("# pay-msg — contract\n\n", "")).unwrap();
+        assert!(codes(&validate_file(&p, false).unwrap()).contains(&"missing-summary"));
+        let long = CLEAN_IFACE.replace(
+            "A payment request in; exactly one reply out — a receipt XOR a refusal.",
+            &"words ".repeat(60),
+        );
+        std::fs::write(&p, long).unwrap();
+        assert!(codes(&validate_file(&p, false).unwrap()).contains(&"summary-too-long"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn templates_match_the_validator() {
+        let dir = tmp("templates");
+
+        // The request-reply skeleton names every section the validator requires.
+        let p = dir.join("new.interface.iter.md");
+        let t = template_for(&p).unwrap();
+        for section in ["## Request", "## Reply, success shape", "## Reply, failure shape", "## Worked examples", "## Invariants"] {
+            assert!(t.contains(section), "missing {} in:\n{}", section, t);
+        }
+
+        // An existing file's kind: steers the skeleton.
+        std::fs::write(&p, "---\ninterface: x\nkind: event\n---\n").unwrap();
+        let t = template_for(&p).unwrap();
+        assert!(t.contains("## Event") && !t.contains("## Request"), "{}", t);
+
+        // Every role has a template; a no-role filename is an error.
+        for f in ["a.marker.iter.md", "a.bizreq.iter.md", "a.techreq.iter.md", "a.testgroup.iter.md", "a.usecase.iter.md"] {
+            assert!(template_for(&dir.join(f)).is_ok(), "{}", f);
+        }
+        assert!(template_for(&dir.join("notes.iter.md")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

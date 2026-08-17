@@ -146,7 +146,17 @@ pub(crate) fn frontmatter(content: &str) -> (HashMap<String, String>, Vec<String
         in_participants = false;
         if let Some((key, val)) = t.split_once(':') {
             let key = key.trim().to_string();
-            let val = val.trim().trim_matches('"').trim_matches('\'').to_string();
+            // YAML comment rule: an unquoted value ends at the first ` #`;
+            // quoted values keep their `#` characters.
+            let raw = val.trim();
+            let val = if raw.starts_with('"') || raw.starts_with('\'') {
+                raw.trim_matches('"').trim_matches('\'').to_string()
+            } else {
+                match raw.find(" #") {
+                    Some(i) => raw[..i].trim_end().to_string(),
+                    None => raw.to_string(),
+                }
+            };
             if key == "participants" && val.is_empty() {
                 in_participants = true;
             }

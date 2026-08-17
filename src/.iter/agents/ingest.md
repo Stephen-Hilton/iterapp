@@ -51,22 +51,17 @@ context — it will not appear in the project structure at all.
       (context body other agents read)
 
   Give the code root itself a `level: project` marker so the tree has a top.
-- **Each `*.interface.iter.md`** declares ONE logical data contract:
-
-      ---
-      interface: interface-id
-      kind: json              # format family of the messages: json | xml | text | binary | library | …
-      description: "one line on what data crosses this boundary"
-      ---
-      (the body is the logical messages exchanged, shown as EXAMPLES — fenced
-      request/reply shapes with constraints as inline comments, plus a
-      strict-JSON worked-examples block. Transport-neutral: the same messages
-      must survive any carrier, so routes/ports/topics/flags/exit codes are
-      binding facts that live on the serving object's marker, never here.
-      NEVER who provides/consumes it — marker provides:/uses: keys carry that.
-      Test: a stranger could implement either side from this file alone, and
-      nothing changes if a component is rebuilt or redeployed differently.
-      Model: sample/greet-msg.interface.iter.md)
+- **Each `*.interface.iter.md`** declares ONE logical data contract in the
+  FIXED FORMAT — start from `"$ITER_BIN" validate --file <path> --template`,
+  never from memory. `kind:` is the interaction shape (request-reply | event |
+  stream | dataset), never a transport or a syntax; the body is the kind's H2
+  sections plus `## Worked examples` and `## Invariants`, message shapes in
+  pseudo-JSON (JSON is the notation, not a wire format). Transport-neutral:
+  routes/ports/topics/flags/exit codes are binding facts that live on the
+  serving object's marker, never here. NEVER who provides/consumes it —
+  marker provides:/uses: keys carry that. Test: a stranger could implement
+  either side from this file alone, and nothing changes if a component is
+  rebuilt or redeployed differently. Model: sample/greet-msg.interface.iter.md.
 
 - `*.bizreq.iter.md` / `*.techreq.iter.md` need no frontmatter (they are plain
   context), but the node and interface markers above are not optional.

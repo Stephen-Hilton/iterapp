@@ -1,6 +1,6 @@
 ---
 interface: greet-msg
-kind: json
+kind: request-reply # or   event | stream | dataset
 description: "A greeting exchange: an optional name and an optional shout flag in; exactly one greeting or one refusal out"
 ---
 
@@ -10,7 +10,7 @@ One request message in, exactly one reply message out (a greeting XOR a refusal)
 The field names, types, defaults, and rules below are the whole contract; any
 carrier that preserves them honors this interface.
 
-Request:
+## Request
 
 ```
 {
@@ -19,7 +19,7 @@ Request:
 }
 ```
 
-Reply, success shape:
+## Reply, success shape
 
 ```
 {
@@ -29,7 +29,7 @@ Reply, success shape:
 }
 ```
 
-Reply, failure shape:
+## Reply, failure shape
 
 ```
 {
@@ -40,7 +40,9 @@ Reply, failure shape:
 }
 ```
 
-Worked examples (normative — each pair must hold on every implementation):
+## Worked examples
+
+Normative — each pair must hold on every implementation:
 
 ```json
 [
@@ -50,6 +52,8 @@ Worked examples (normative — each pair must hold on every implementation):
   { "request": { "volume": 11 },                 "reply": { "refusal": { "code": "UNKNOWN_FIELD", "detail": "volume" } } }
 ]
 ```
+
+## Invariants
 
 - Total and exclusive: every possible request gets exactly one reply, and a reply
   carries `greeting` or `refusal`, never both, never neither. A request field

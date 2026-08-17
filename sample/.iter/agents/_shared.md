@@ -102,6 +102,13 @@ Frontmatter supplies ATTRIBUTES, never identity: a stray `level:` key inside a
 usecase file changes nothing — renaming the file is the only way to change its
 role. A file matching no role is a plain context doc.
 
+**Never write any `*.iter.md` skeleton from memory.**
+`"$ITER_BIN" validate --file <path> --template` prints the current
+authoritative template for the role named by the filename (the file need not
+exist yet; an existing interface file's `kind:` steers which skeleton you
+get). Fetch it when you create or restructure a file — the template is the
+single deterministic source, so format changes reach every agent at once.
+
 Any `*marker.iter.md` file you CREATE or TOUCH must begin with `---`-fenced
 frontmatter; without it the node has no name/level on the Projects map.
 
@@ -125,32 +132,39 @@ frontmatter; without it the node has no name/level on the Projects map.
   tests never run automatically). If tests should exist, declare the key.
 
 - Interface marker (`*.interface.iter.md`) — the LOGICAL data contract between
-  C4 objects:
+  C4 objects. FIXED FORMAT — these sections and ONLY these, enforced by
+  `iter validate` (get the current skeleton with
+  `"$ITER_BIN" validate --file <path> --template`; never write one from memory):
 
-      ---
-      interface: interface-id
-      kind: json              # format family of the messages: json | xml | text | binary | library | …
-      description: "one line on what data crosses this boundary"
-      ---
+  - frontmatter: `interface:` id; `kind:` — the interaction shape,
+    `request-reply | event | stream | dataset`, never a transport or a syntax;
+    `description:` (quoted prose)
+  - one `# <id> — contract` H1, then a named summary under 300 characters
+  - the kind's H2 sections: request-reply → `## Request`, `## Reply, success
+    shape`, `## Reply, failure shape`; event → `## Event`; stream →
+    `## Stream item`, `## Stream end`; dataset → `## Record`
+  - closing every file, in order: `## Worked examples` (normative pairs in one
+    strict-JSON fence) and `## Invariants` (few bullets — only what examples
+    cannot show)
 
-  **The body IS the contract: the logical messages exchanged, shown as
-  examples, never prose about them.** An interface is TRANSPORT-NEUTRAL — the
-  same request/reply shapes may ride an HTTP body, a gRPC message, a queue
-  record, argv/stdout, or an in-process struct, chained in any order, without
-  renaming a field or changing a rule. Show each message as a fenced block
-  holding a concrete or pseudo example with constraints as inline comments;
-  add a strict-JSON worked-examples block (normative request → reply pairs)
-  and at most a few invariant bullets for what examples cannot express. Model:
-  `sample/greet-msg.interface.iter.md`. Tag a fence (```json) only when the
-  block strictly parses as that language; pseudo-examples with ellipses stay
-  untagged.
+  Message shapes are pseudo-JSON with constraints as inline comments. JSON is
+  the NOTATION, not a wire format — conventions for what JSON cannot say:
+  binary as hex/base64 strings, 64-bit ints and money as strings or integer
+  cents, timestamps as ISO-8601 strings, enums as closed vocabularies named in
+  comments. A function call is logically request → reply, so a library surface
+  is written as kwargs-object → return-object messages. Tag a fence (```json)
+  only when the block strictly parses; pseudo-examples stay untagged. Model:
+  `sample/greet-msg.interface.iter.md`.
 
   **The two-clause test — the file is right when:** (1) a stranger could
   implement EITHER side from this file alone, and (2) nothing in it would
   change if a component were rebuilt in another language or deployed
-  differently. Carrier bindings — routes, ports, topics, flags, exit codes,
-  build and deploy facts — fail clause 2: record them on the marker of the C4
-  object that serves that binding, never here.
+  differently. An interface is TRANSPORT-NEUTRAL: the same messages may ride
+  an HTTP body, a gRPC message, a queue record, argv/stdout, or an in-process
+  struct, chained in any order, without renaming a field or changing a rule.
+  Carrier bindings — routes, ports, topics, flags, exit codes, build and
+  deploy facts — fail clause 2: record them on the marker of the C4 object
+  that serves that binding, never here.
 
   **WHAT, never WHO or HOW.** An interface is used by many C4 objects; the file
   must not name providers, consumers, or callers, nor describe how or where

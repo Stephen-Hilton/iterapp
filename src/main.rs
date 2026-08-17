@@ -137,6 +137,12 @@ enum Command {
         /// Apply the safe corrections in place
         #[arg(long)]
         fix: bool,
+        /// With --file: print the authoritative empty template for that
+        /// file's role (from the filename) instead of validating. The file
+        /// need not exist; an existing interface file's `kind:` steers which
+        /// skeleton is emitted.
+        #[arg(long)]
+        template: bool,
     },
     /// Queue summary, active agents, and locks
     Status {
@@ -175,7 +181,7 @@ fn main() {
         }
         Command::Testsweep { project } => cmd_testsweep(project),
         Command::Stubdesc { project } => cmd_stubdesc(project),
-        Command::Validate { project, file, fix } => cmd_validate(project, file, fix),
+        Command::Validate { project, file, fix, template } => cmd_validate(project, file, fix, template),
         Command::Status { project } => cmd_status(project),
         Command::Stop { project, wait } => cmd_stop(project, wait),
         Command::Init { dest, from } => cmd_init(dest, from),
@@ -598,7 +604,23 @@ fn cmd_stubdesc(project: PathBuf) -> i32 {
 
 /// Validate iter files. Same scan roots as the Projects view; findings print one
 /// per line as `SEVERITY code file — message`, fixed ones marked.
-fn cmd_validate(project: PathBuf, file: Option<PathBuf>, fix: bool) -> i32 {
+fn cmd_validate(project: PathBuf, file: Option<PathBuf>, fix: bool, template: bool) -> i32 {
+    if template {
+        let Some(f) = file else {
+            eprintln!("error: --template needs --file <path> to pick the role from the filename");
+            return 2;
+        };
+        return match validate::template_for(&f) {
+            Ok(t) => {
+                println!("{}", t);
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                2
+            }
+        };
+    }
     let roots = server::scan_roots(&project);
     let report = match validate::run(&roots, file.as_deref(), fix) {
         Ok(r) => r,
