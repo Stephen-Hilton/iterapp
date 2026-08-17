@@ -78,6 +78,9 @@ pub struct CodepathLockInfo {
     pub pid: u32,
     pub created: String,
     pub timeout: String,
+    /// Gitignore-like patterns (relative to the lock's directory) NOT covered by this
+    /// lock — the holder promised not to touch them, so work there doesn't conflict.
+    pub ignore: Vec<String>,
 }
 
 impl CodepathLockInfo {
@@ -115,32 +118,72 @@ impl Drop for CodepathLock {
     }
 }
 
+/// Is `rel` (a path relative to a lock scope's root) excluded by the scope's
+/// gitignore-like `patterns`? Semantics (deliberate subset of .gitignore):
+/// - patterns are matched against directory paths relative to the scope root;
+///   trailing `/` and leading `./` or `/` are stripped;
+/// - a pattern containing `/` is anchored to the scope root (`test/fixtures`);
+/// - a pattern without `/` matches at any depth (`test` matches `test` and `a/test`);
+/// - a matched directory excludes everything beneath it;
+/// - glob wildcards (`*`, `?`, `[...]`, `**`) work via the same engine as context
+///   patterns.
+pub fn ignored(rel: &Path, patterns: &[String]) -> bool {
+    let rel_s = rel.to_string_lossy().replace('\\', "/");
+    if rel_s.is_empty() || rel_s == "." {
+        return false; // the scope root itself is never ignorable
+    }
+    for raw in patterns {
+        let p = raw.trim().trim_start_matches("./").trim_start_matches('/').trim_end_matches('/');
+        if p.is_empty() {
+            continue;
+        }
+        let anchored = p.contains('/');
+        let mut candidates = vec![p.to_string(), format!("{}/**", p)];
+        if !anchored {
+            candidates.push(format!("**/{}", p));
+            candidates.push(format!("**/{}/**", p));
+        }
+        for c in candidates {
+            if glob::Pattern::new(&c).map(|g| g.matches(&rel_s)).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Scan for an active `.iter.lock` covering `codepath`: the directory itself, all
-/// descendants, and all ancestors up to the filesystem root. Expired locks are deleted
-/// on sight. Returns the path of the first active lock found.
-pub fn find_active_lock(codepath: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
+/// descendants (minus the acquirer's `ignore` subtrees), and all ancestors up to the
+/// filesystem root (minus ancestors whose own ignore patterns carve `codepath` out).
+/// Expired locks are deleted on sight. Returns the path of the first active lock found.
+pub fn find_active_lock(codepath: &Path, ignore: &[String], now: DateTime<Utc>) -> Option<PathBuf> {
     if let Some(p) = find_ancestor_lock(codepath, now) {
         return Some(p);
     }
-    // Descendants.
-    scan_descendants(codepath, now)
+    // Descendants — subtrees the acquirer ignores are someone else's to lock.
+    scan_descendants(codepath, codepath, ignore, now)
 }
 
 /// Ancestor-chain-only lock probe (codepath itself and every parent): cheap enough
 /// to run per queue candidate per tick, unlike the full descendant walk. Used by the
 /// scheduler to skip un-runnable items without wasting an agent slot on them.
+/// An ancestor lock whose `ignore` patterns exclude `codepath` does not cover it —
+/// the walk continues upward past it.
 pub fn find_ancestor_lock(codepath: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
     let mut dir = Some(codepath.to_path_buf());
     while let Some(d) = dir {
-        if let Some(p) = check_lock_file(&d.join(CODEPATH_LOCK_NAME), now) {
-            return Some(p);
+        if let Some((p, info)) = check_lock_file(&d.join(CODEPATH_LOCK_NAME), now) {
+            let rel = codepath.strip_prefix(&d).unwrap_or(Path::new(""));
+            if !ignored(rel, &info.ignore) {
+                return Some(p);
+            }
         }
         dir = d.parent().map(|p| p.to_path_buf());
     }
     None
 }
 
-fn scan_descendants(dir: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
+fn scan_descendants(dir: &Path, base: &Path, ignore: &[String], now: DateTime<Utc>) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -150,11 +193,15 @@ fn scan_descendants(dir: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
             if name == ".git" || name == "target" || name == "node_modules" {
                 continue;
             }
-            if let Some(p) = scan_descendants(&path, now) {
+            let rel = path.strip_prefix(base).unwrap_or(&path);
+            if ignored(rel, ignore) {
+                continue; // outside the acquirer's scope — locks in there don't conflict
+            }
+            if let Some(p) = scan_descendants(&path, base, ignore, now) {
                 return Some(p);
             }
         } else if name == CODEPATH_LOCK_NAME {
-            if let Some(p) = check_lock_file(&path, now) {
+            if let Some((p, _)) = check_lock_file(&path, now) {
                 return Some(p);
             }
         }
@@ -162,11 +209,11 @@ fn scan_descendants(dir: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
     None
 }
 
-/// Returns Some(path) if the lock file exists and is active; deletes it if expired.
-fn check_lock_file(path: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
+/// Returns the lock (path, info) if the file exists and is active; deletes it if expired.
+fn check_lock_file(path: &Path, now: DateTime<Utc>) -> Option<(PathBuf, CodepathLockInfo)> {
     let text = std::fs::read_to_string(path).ok()?;
     match serde_json::from_str::<CodepathLockInfo>(&text) {
-        Ok(info) if info.active(now) => Some(path.to_path_buf()),
+        Ok(info) if info.active(now) => Some((path.to_path_buf(), info)),
         _ => {
             // Expired or corrupt: clear it per codepath_lock.md step 2.
             let _ = std::fs::remove_file(path);
@@ -176,14 +223,17 @@ fn check_lock_file(path: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
 }
 
 /// Acquire the codepath lock for a work item, or return the conflicting lock path.
+/// `ignore` is stored in the lock file so other acquirers can see which subtrees this
+/// lock deliberately does not cover.
 pub fn acquire_codepath_lock(
     codepath: &Path,
     workid: &str,
     agent: &str,
     timeout_sec: u64,
+    ignore: &[String],
 ) -> Result<CodepathLock, PathBuf> {
     let now = Utc::now();
-    if let Some(conflict) = find_active_lock(codepath, now) {
+    if let Some(conflict) = find_active_lock(codepath, ignore, now) {
         return Err(conflict);
     }
     let info = CodepathLockInfo {
@@ -193,6 +243,7 @@ pub fn acquire_codepath_lock(
         created: crate::workitems::now_iso(),
         timeout: (now + Duration::seconds(timeout_sec as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ignore: ignore.to_vec(),
     };
     let path = codepath.join(CODEPATH_LOCK_NAME);
     let text = serde_json::to_string_pretty(&info).expect("lock info serializes");
@@ -257,18 +308,67 @@ mod tests {
         let child = dir.join("sub");
         std::fs::create_dir_all(&child).unwrap();
 
-        let lock = acquire_codepath_lock(&dir, "w1", "code", 600).unwrap();
+        let lock = acquire_codepath_lock(&dir, "w1", "code", 600, &[]).unwrap();
         // Child blocked by ancestor lock:
-        assert!(acquire_codepath_lock(&child, "w2", "code", 600).is_err());
+        assert!(acquire_codepath_lock(&child, "w2", "code", 600, &[]).is_err());
         drop(lock);
 
         // Now lock the child; parent must be blocked by descendant lock:
-        let lock = acquire_codepath_lock(&child, "w2", "code", 600).unwrap();
-        assert!(acquire_codepath_lock(&dir, "w3", "code", 600).is_err());
+        let lock = acquire_codepath_lock(&child, "w2", "code", 600, &[]).unwrap();
+        assert!(acquire_codepath_lock(&dir, "w3", "code", 600, &[]).is_err());
         drop(lock);
 
         // Both released: parent lockable again.
-        assert!(acquire_codepath_lock(&dir, "w4", "code", 600).is_ok());
+        assert!(acquire_codepath_lock(&dir, "w4", "code", 600, &[]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignored_pattern_semantics() {
+        let pats = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // "test/" normalizes to "test" — no slash left, so it matches at any depth.
+        assert!(ignored(Path::new("test"), &pats(&["test/"])));
+        assert!(ignored(Path::new("test/deep"), &pats(&["test/"])));
+        assert!(ignored(Path::new("a/test"), &pats(&["test"])), "no-slash pattern matches at any depth");
+        assert!(ignored(Path::new("a/test/deep"), &pats(&["test"])));
+        // Anchored pattern only matches from the scope root.
+        assert!(ignored(Path::new("test/fixtures"), &pats(&["test/fixtures"])));
+        assert!(!ignored(Path::new("a/test/fixtures"), &pats(&["test/fixtures"])));
+        // Globs.
+        assert!(ignored(Path::new("tests"), &pats(&["test*"])));
+        // Non-matches and the root itself.
+        assert!(!ignored(Path::new("src"), &pats(&["test/"])));
+        assert!(!ignored(Path::new("testing-notes"), &pats(&["test/fixtures"])));
+        assert!(!ignored(Path::new(""), &pats(&["**"])), "scope root is never ignorable");
+    }
+
+    #[test]
+    fn ignore_carves_subtree_out_of_lock_scope() {
+        // The motivating scenario: code owns `obj/` ignoring `test/`; a testwriter
+        // owns `obj/test/`. Both directions must coexist, and non-ignored subtrees
+        // must still conflict.
+        let dir = tmpdir("carve");
+        let obj = dir.join("obj");
+        std::fs::create_dir_all(obj.join("test")).unwrap();
+        std::fs::create_dir_all(obj.join("src")).unwrap();
+
+        // Parent first: code locks obj/ (ignoring test/), then testwriter locks obj/test/.
+        let code = acquire_codepath_lock(&obj, "w-code", "code", 600, &["test/".into()]).unwrap();
+        let tw = acquire_codepath_lock(&obj.join("test"), "w-tw", "testwriter", 600, &[]).unwrap();
+        // Non-ignored child still conflicts with the parent lock:
+        assert!(acquire_codepath_lock(&obj.join("src"), "w3", "code", 600, &[]).is_err());
+        drop(tw);
+        drop(code);
+
+        // Child first: testwriter holds obj/test/, code can still take obj/ if it ignores test/.
+        let tw = acquire_codepath_lock(&obj.join("test"), "w-tw2", "testwriter", 600, &[]).unwrap();
+        assert!(
+            acquire_codepath_lock(&obj, "w-code2", "code", 600, &[]).is_err(),
+            "without ignore the child lock must block the parent"
+        );
+        let code = acquire_codepath_lock(&obj, "w-code2", "code", 600, &["test/".into()]).unwrap();
+        drop(code);
+        drop(tw);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -281,10 +381,11 @@ mod tests {
             pid: 0,
             created: "2020-01-01T00:00:00Z".into(),
             timeout: "2020-01-01T01:00:00Z".into(),
+            ignore: Vec::new(),
         };
         let lock_file = dir.join(CODEPATH_LOCK_NAME);
         std::fs::write(&lock_file, serde_json::to_string(&info).unwrap()).unwrap();
-        assert!(find_active_lock(&dir, Utc::now()).is_none());
+        assert!(find_active_lock(&dir, &[], Utc::now()).is_none());
         assert!(!lock_file.exists(), "expired lock must be deleted on sight");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -292,9 +393,9 @@ mod tests {
     #[test]
     fn drop_only_deletes_own_lock() {
         let dir = tmpdir("own");
-        let lock = acquire_codepath_lock(&dir, "w1", "code", 600).unwrap();
+        let lock = acquire_codepath_lock(&dir, "w1", "code", 600, &[]).unwrap();
         // Simulate another owner overwriting the lock file:
-        let other = CodepathLockInfo { workid: "other".into(), agent: "test".into(), pid: 1, created: crate::workitems::now_iso(), timeout: crate::workitems::now_iso() };
+        let other = CodepathLockInfo { workid: "other".into(), agent: "test".into(), pid: 1, created: crate::workitems::now_iso(), timeout: crate::workitems::now_iso(), ignore: Vec::new() };
         std::fs::write(dir.join(CODEPATH_LOCK_NAME), serde_json::to_string(&other).unwrap()).unwrap();
         drop(lock);
         assert!(dir.join(CODEPATH_LOCK_NAME).exists(), "someone else's lock must survive our drop");

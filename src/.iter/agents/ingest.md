@@ -26,7 +26,9 @@ iterapp-ready.
 1. Read the source material named in the mainwork (e.g. `bizreq.md`, `techreq.md`, an
    existing codebase, an external doc).
 2. **Requirements ingest:** write/update normalized context markdown (location per the
-   mainwork prompt) 
+   mainwork prompt; when the mainwork names none, component-scoped requirements go
+   beside their component and PROJECT-WIDE requirements go in `$ITER_REQS` —
+   `bizreq.iter.md` / `techreq.iter.md` in the project reqs directory)
    — business rules and requirements become *.bizreq.iter.md
    - technical constraints and requirements become *.techreq.iter.md
    - interfaces become *.interface.iter.md and only referenced by other marker context, never owned
@@ -37,7 +39,7 @@ Every `*.iter.md` you write MUST begin with a `---`-fenced frontmatter block; th
 scanner classifies markers by it, and a marker without one is treated as plain
 context — it will not appear in the project structure at all.
 - **One structure node per component directory** (usually alongside that component's
-  requirement files — a `<component>.iter.md` works well):
+  requirement files — a `<component>.marker.iter.md` works well):
 
       ---
       name: Human-Readable Component Name
@@ -64,7 +66,7 @@ context — it will not appear in the project structure at all.
 3. **Project migration** (bringing an existing repo onto iterapp): survey the entire project,
    then create the work items needed to integrate it — typically multiple `code` items
    (one per component needing integration or missing files) and `testwriter` items (one
-   per component lacking a `testgroups.iter.md`). Scope each item's `codepath` to its
+   per component lacking a `testgroup.iter.md`). Scope each item's `codepath` to its
    component so they can run in parallel.
 4. Do not modify project source code yourself; delegate through work items.
 

@@ -46,9 +46,18 @@ impl Session {
         let iter_bin = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "iter".to_string());
+        let cfg = crate::config::load(&project_root);
+        let code_root = crate::config::code_root(&project_root, &cfg);
+        let reqs_dir = crate::context::reqs_dir(&project_root, &code_root);
         let envs = vec![
             ("ITER_BIN".to_string(), iter_bin),
             ("ITER_PROJECT".to_string(), project_root.to_string_lossy().into_owned()),
+            // The project-wide requirements dir (global bizreq/techreq home), so
+            // agents can read or write it without re-deriving the override chain.
+            ("ITER_REQS".to_string(), reqs_dir.to_string_lossy().into_owned()),
+            // The per-component test directory name (globalsettings.test_dir), so
+            // agents scope test work without guessing the convention.
+            ("ITER_TEST_DIR".to_string(), cfg.globalsettings.test_dir.clone()),
             // Let the agent's Bash tool wait on long synchronous calls (critreview)
             // up to the agent's own work timeout — the natural upper bound.
             (

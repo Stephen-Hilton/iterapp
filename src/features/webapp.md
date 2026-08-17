@@ -107,7 +107,7 @@ everything). Contents, top to bottom (mirrors the mockup):
 - **Output** — the concatenated agent output, scrollable, monospace.
 - **Details buttons** → lightboxes:
   - **View Test Details** — per-group results from the item's `testfiles`
-    (`testgroups.iter.md` blocks): group label, lastrun, result, counts, scripts.
+    (`testgroup.iter.md` blocks): group label, lastrun, result, counts, scripts.
   - **View Time Records** — the `times` object as a timeline (added → start →
     preworkdone → mainworkdone → postworkdone → closed) with computed durations.
   - **View Context and Prompts** — `context` patterns + resolved files, source
@@ -118,9 +118,11 @@ everything). Contents, top to bottom (mirrors the mockup):
 Same lightbox for create, edit (Pause & Edit), clone, and follow-up — identical layout
 to the slide-down detail, except **(A)** every field is editable and **(B)** the header
 badges become an editable section: title, type (agent selector from `.iter/agents/`),
-priority + risk sliders (0–10), source (defaults `user`), codepath, context patterns
-(one per line), testfiles. Prework/Postwork pills toggle on click; a free-text row
-appends inline literal steps. One form, one footer for every mode:
+priority + risk sliders (0–10), source (defaults `user`), codepath, codepath_ignore
+(one gitignore-style pattern per line, relative to codepath — subtrees carved out of
+the item's lock scope so parallel items can own them; added 2026-08-15), context
+patterns (one per line), testfiles. Prework/Postwork pills toggle on click; a
+free-text row appends inline literal steps. One form, one footer for every mode:
 `Cancel · [Create|Save] and set to · [Queued | ToDo | Paused]`. The selector chooses
 the state the item lands in; only the default differs — create/clone/follow-up default
 to **Queued**, Pause & Edit defaults to the item's state **before** it was paused
@@ -190,7 +192,7 @@ iterapp-meaningful**; its **role comes from its frontmatter**, not its filename:
 | has `level:` | **structure node** — a row on the Projects map |
 | has `interface:` | **interface contract** — aggregated globally (see below) |
 | has `participants:` | **use-case thread** — drives the red line + step numbers |
-| none | **plain context document** (testgroups.iter.md, bizreq.iter.md, notes) — discoverable and attachable as context, never a map node |
+| none | **plain context document** (testgroup.iter.md, bizreq.iter.md, notes) — discoverable and attachable as context, never a map node |
 
 *(Naming note, locked 2026-08-11: an earlier draft used `*.iter.context.md`, where
 "context" meant generic agent-context — too easily read as the C4 CONTEXT level. The
@@ -238,8 +240,20 @@ requirements, interfaces, constraints. The marker IS the context file.
   everything the node uses/provides (the `{interfaces}` placeholder). iterloop itself
   stays ignorant: interfaces are just more context for prompts.
 - **Use-cases are `*.iter.md` files with `participants:`**: a name, description, and
-  an ordered participant list (`- 2.1 core/intake/orchestrator`). The red thread and
-  step numbers render from it; structure files never mention use-cases.
+  an ordered participant list (`- 2.1 core/intake/orchestrator`; `.` = the project-root
+  node). The red thread and step numbers render from it; structure files never mention
+  use-cases.
+- **Use-Cases section with CRUD (added 2026-08-15)**: the Projects page lists every
+  discovered use-case below Interfaces — expandable rows (file, participants with
+  resolved node names and unknown-key flags, story body) where expanding also threads
+  the red line, plus New/Edit/Delete. Created files land in
+  `globalsettings.usecase_default_location` (default `{codepath}/usecases/`) as
+  `<slug>.usecase.iter.md` — creation only; the scanner finds `*usecase.iter.md` anywhere;
+  edits rewrite the file wherever it lives; the API (`POST/PUT /api/usecases`,
+  `POST /api/usecases/delete`) refuses paths outside the project and files that aren't
+  use-case markers. A project whose scan finds zero use-cases is seeded ONCE (flag:
+  `.iter/.engine/usecases_seeded`) with the starter "Install iter framework" — the
+  getting-started story of iterapp itself; deleting it is a real delete, not a respawn.
 - **Discovery by search**: the engine scans configured roots for the single marker
   glob (default `**/*.iter.md`), sorts each hit into node / use-case / plain-context
   by frontmatter, and caches to `.iter/.engine/markers.json`; a **Rescan** button
@@ -257,7 +271,7 @@ requirements, interfaces, constraints. The marker IS the context file.
 
 **Why markers beat a central file here** (suggestions, adopted in this spec): the
 marker doubles as the agent-context document, so the model and the prompts can't
-drift apart; `testgroups.iter.md` naturally sits beside its component's marker,
+drift apart; `testgroup.iter.md` naturally sits beside its component's marker,
 aligning the test tree with the model; and git ownership of a node follows the code
 it describes (a component team owns its marker like its code).
 
@@ -281,6 +295,7 @@ form-open time, and every line supports the same globs as any work-item context:
 | `{ancestor_markers}` | the marker files of that node's parent chain, walking up to the project root (directory-derived, `parent:` overrides respected) — e.g. from `core/intake/evidence-vault`: the `core/intake`, `core`, and project-root markers |
 | `{interfaces}` | the contract marker files for every interface in the node's `uses:` + `provides:` |
 | `{codepath}` | the node's directory, absolute — use to scope a glob to the work item's own tree |
+| `{reqs}` | the project-wide reqs directory (resolved by the engine): the first-class home of the global `bizreq.iter.md`/`techreq.iter.md`. Default `.iter/reqs/`; relocated per project by a `reqs:` frontmatter key on the `level: project` marker (relative to the code root, `~` ok). Its files are auto-surfaced in every work item's spin-up and exported to agents as `$ITER_REQS`, so `{reqs}` globs are for narrowing, not for basic attachment |
 | any glob/path | passed through as a normal context entry |
 
 Worked example — *"attach this node's marker, everything above it, and every
@@ -306,7 +321,7 @@ Everything renders from existing engine files — no schema change required exce
 | Engine state chip | `stop.signal` presence/content + engine liveness |
 | Prework/postwork pill pool | `.iter/prepostwork/*` filenames (minus extension) |
 | Agent type selector | `.iter/agents/*.md` basenames |
-| Test results badge | **new engine behavior**: on close-out, the engine parses the item's `testgroups.iter.md` blocks and stamps a `tests` summary onto the workitem (`{"passed":98,"total":98}`); UI shows `T:98/98 – 100%`. Until then: blank badge (`T:–`) |
+| Test results badge | **new engine behavior**: on close-out, the engine parses the item's `testgroup.iter.md` blocks and stamps a `tests` summary onto the workitem (`{"passed":98,"total":98}`); UI shows `T:98/98 – 100%`. Until then: blank badge (`T:–`) |
 | Time records | `times` object |
 | Logs lightbox | engine log file filtered by worker tag |
 

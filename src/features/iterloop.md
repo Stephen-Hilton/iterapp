@@ -63,7 +63,7 @@ regularly do so. More complex interactions build on this framework later.
                                         │ spawns, cwd = workitem.codepath
                                         ▼
                         target project (e.g. sample/)
-                        code + tests + testgroups.iter.md + .iter.lock (while working)
+                        code + tests + testgroup.iter.md + .iter.lock (while working)
 ```
 
 Two distinct `.iter/` trees exist:
@@ -200,6 +200,7 @@ and be skeptical of the description).
     "test_min": 20,
     "test_max": 100,
     "test_default_path": "./test*/",
+    "test_dir": "test",
     "log_default_path": "./logs/{YYYYMMDD-hh}.log",
     "log_level": "info",
     "log_max_size_mb": 10,
@@ -235,22 +236,32 @@ location (common interfaces, project-wide requirements), or a computer-central l
 ```
 
 The engine resolves and validates these **deterministically and quickly** (glob expansion,
-existence check, `{codepath}` / `~` substitution) and hands the resulting concrete file
-list into the built prompt. The agent then reads the files itself as part of spin-up —
+existence check, `{codepath}` / `{reqs}` / `~` substitution) and hands the resulting concrete
+file list into the built prompt. The agent then reads the files itself as part of spin-up —
 the engine does not inline file contents into the prompt.
+
+**Project-wide requirements (first-class, added 2026-08-15):** the global
+`bizreq.iter.md` / `techreq.iter.md` live in the project reqs directory — default
+`.iter/reqs/` (scaffolded by the template), relocatable per project via a `reqs:`
+frontmatter key on the `level: project` marker at the code root (relative values
+resolve against the code root, `~` ok). The engine auto-lists the directory's markdown
+files in every work item's spin-up prompt (deduped against explicit context), exports
+the resolved path to agent sessions as `ITER_REQS`, and substitutes `{reqs}` in
+context/testfiles patterns. Component-local requirement files are unchanged — they
+stay beside their component.
 
 **The path rule** (one rule, everywhere): every path may be a glob; relative paths
 start at the **project root** (the directory holding `.iter/`); `~` = home;
 `{codepath}` anchors a pattern to the work item's own code. Codepath itself is always
 stored absolute.
 
-### 6. Test structure — `testgroups.iter.md` and `workitem.testfiles`
+### 6. Test structure — `testgroup.iter.md` and `workitem.testfiles`
 
 Tests live **with the code being modified** — the one data structure that must. Test
 *groups* are containers over deterministic tests: each group has a defined launcher (one
 or more scripts) that runs N tests and reports pass/fail.
 
-There is one `testgroups.iter.md` per **component** — "component" per the C4 model
+There is one `testgroup.iter.md` per **component** — "component" per the C4 model
 (context, container, component, code), where iterloop works mostly at the container or
 component level. We don't go down to the code level; full end-to-end testing sits at the
 project level. Typical placement:
@@ -260,7 +271,7 @@ project/
   subcomponent/
     src/
     test/
-      testgroups.iter.md
+      testgroup.iter.md
       testscript01.sh
       testscript02.sh
       testscript03.sh
@@ -307,8 +318,9 @@ serialization is plain JSON):
 | `priority` | int 0–10 | producer | 10 = most urgent |
 | `risk` | int 0–10 | producer | 10 = highest risk; informational in v1 |
 | `codepath` | path | producer | working directory for the agent; the lock scope |
+| `codepath_ignore` | [string] | producer | gitignore-like patterns (relative to codepath) carved OUT of the lock scope (added 2026-08-15): the item must not touch those subtrees, so a parallel item can own them — e.g. code locks `pth/object/` ignoring `test/` while a testwriter locks `pth/object/test/`. A pattern with `/` is anchored to the codepath, one without matches at any depth; a matched directory excludes everything beneath it; glob wildcards ok. Stored in `.iter.lock` (`ignore`) so other acquirers see the carve-out |
 | `context` | [glob] | producer | 0–N file searches, any local location (see §5) |
-| `testfiles` | [path] | producer | `testgroups.iter.md` paths; handed to `test*` agents |
+| `testfiles` | [path] | producer | `testgroup.iter.md` paths; handed to `test*` agents |
 | `prework` | [string] | producer | step names from `prepostwork/`, or inline literal prompts; executed sequentially, in order |
 | `mainwork` | string | producer | long prompt (often 1000s of chars) describing exactly the work |
 | `postwork` | [string] | producer | same semantics as `prework`, after mainwork |
@@ -567,7 +579,7 @@ Deliberately excluded from v1, but the file formats above leave room:
 - `llm_run_mode: terminal | tmux` for watch-live agent sessions.
 - `todo` state semantics: dependencies between work items, human approval gates.
 - Finer-grained locking (glob-scoped locks instead of whole-codepath).
-- Test generation loops driven by `testgroups.iter.md` group prompts; `test_min`/`test_max`
+- Test generation loops driven by `testgroup.iter.md` group prompts; `test_min`/`test_max`
   enforcement from config.
 - `risk`-aware scheduling and approval policies.
 
@@ -595,7 +607,7 @@ code dependency and can proceed in parallel with 3+.
       `agents`, `locks`, `runner`, `scheduler`, `cli`, `logging`.
 - [x] Rename `src/.iter/source/agent ({type}).md` → `src/.iter/source/agent.md` (and the
       `sample/.iter/` copy).
-- [x] Move this spec's decisions into stubs: fix `sample/test/testgroups.iter.md`
+- [x] Move this spec's decisions into stubs: fix `sample/test/testgroup.iter.md`
       structured block to valid JSONL with the `iterapp:testgroups` marker.
 - [x] `.gitignore`: add `target/`, `*.iter.lock`, `.iter/.engine/stop.signal`, logs.
 
@@ -656,7 +668,7 @@ complete, usable prompts.
 - [x] `sample/bizreq.md` + `sample/techreq.md` — small real requirements for a toy feature
       (enough for an end-to-end demo).
 - [x] `sample/test/` — make `testscript01.sh`(+02, 03) real, trivially-passing scripts
-      referenced by `testgroups.iter.md`.
+      referenced by `testgroup.iter.md`.
 - [x] Replace `sample/src/codefile.txt` with a minimal real code file the toy feature touches.
 
 ## Phase 2 — Data layer (Rust)

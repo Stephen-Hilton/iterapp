@@ -414,10 +414,56 @@
   .pdetail .dlabel { padding-top: 0; }
   .pdetail .actions { grid-column: 2; display: flex; gap: 8px; margin-top: 3px; }
 
+  /* ---------- C4 detail: uses/provides listboxes, breadcrumbs, requirements
+     split, testing interface ---------- */
+  .upgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .upbox { background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; padding: 6px 9px; min-height: 36px; }
+  .uphead { font-size: 10.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 4px; }
+  .refbtn {
+    display: inline-block; margin: 2px 5px 2px 0; font-size: 11.5px; font-family: var(--mono);
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    border-radius: 6px; padding: 2px 9px;
+  }
+  .refbtn.linked { border-color: var(--accent); color: var(--accent); }
+  .refbtn.linked:hover { background: var(--surface2); }
+  .refbtn.plain { cursor: default; color: var(--text-dim); }
+  .crumbs { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; margin: 0 0 12px; font-size: 12.5px; }
+  .crumbs button { background: none; border: none; color: var(--accent); padding: 2px 5px; border-radius: 5px; font-weight: 600; }
+  .crumbs button:hover { background: var(--surface2); }
+  .crumbs .csep { color: var(--text-dim); }
+  .crumbs .chere { color: var(--text); font-weight: 700; padding: 2px 5px; }
+  .longdesc { background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; padding: 9px 12px; font-size: 13px; white-space: pre-wrap; max-height: 34vh; overflow: auto; }
+  .longdesc.tbd { color: var(--text-dim); font-style: italic; }
+  .reqpathrow { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin: 12px 0 5px; font-size: 11.5px; color: var(--text-dim); flex-wrap: wrap; }
+  .reqpathrow:first-child { margin-top: 0; }
+  .reqlocal {
+    width: 100%; min-height: 160px; height: 28vh; resize: vertical;  /* native drag = the adjustable boundary */
+    background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 9px 12px; font-family: var(--mono); font-size: 12px;
+  }
+  .reqglobal {
+    border: 1px solid var(--border); border-radius: 7px; background: var(--surface2); opacity: 0.92;
+    padding: 9px 12px; overflow: auto; max-height: 34vh; white-space: pre-wrap;
+    font-family: var(--mono); font-size: 12px;
+  }
+  .tgwrap { display: grid; grid-template-columns: 240px 1fr; gap: 14px; min-height: 300px; }
+  .tglist { border: 1px solid var(--border); border-radius: 8px; overflow: auto; max-height: 62vh; align-self: start; }
+  .tgrow { display: flex; gap: 8px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 12.5px; }
+  .tgrow:last-child { border-bottom: none; }
+  .tgrow:hover { background: var(--surface2); }
+  .tgrow.sel { background: var(--surface2); font-weight: 700; }
+  .tgdot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--border); }
+  .tgrow small { margin-left: auto; color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; }
+  .runrow { cursor: pointer; }
+  .runrow:hover td { background: var(--surface2); }
+  .autofix { display: inline-flex; gap: 7px; align-items: center; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+  .autofix input { accent-color: var(--accent); width: 15px; height: 15px; }
+
   @media (max-width: 900px) {
     .app { grid-template-columns: 1fr; }
     .side { display: none; }
     .summary { grid-template-columns: repeat(4, 1fr); }
+    .upgrid, .tgwrap { grid-template-columns: 1fr; }
   }
 </style>
 
@@ -512,9 +558,10 @@ async function api(path, opts = {}) {
 }
 
 const PREPOST = ['deploy','git-commit','git-pr','git-pull','git-push','iterloop-stop','iterloop-wait-for-stop'];
-const AGENTS = ['plan','code','test','testwriter','refactor','ingest'];
+const AGENTS = ['plan','code','testwriter','refactor','ingest'];
 let PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // replaced by /api/meta in LIVE mode
 let HOME = '/Users/stephen.hilton';                              // replaced by /api/meta in LIVE mode
+let REQS_DIR = '';   // project-wide reqs dir (global bizreq/techreq) — replaced by /api/meta in LIVE mode
 
 /* codepath is entered relative but always resolved and shown absolute */
 function normPath(p){
@@ -542,6 +589,7 @@ function resolveLine(line, codepathAbs){
   };
   if (placeholders[line]) return placeholders[line];
   let p = line.split('{codepath}').join(codepathAbs || '(codepath)');
+  p = p.split('{reqs}').join(REQS_DIR || '(project-wide reqs dir)');
   if (p === '~') p = HOME;
   else if (p.startsWith('~/')) p = HOME + '/' + p.slice(2);
   if (!p.startsWith('/') && !p.startsWith('(')) p = PROJECT_ROOT + '/' + p;
@@ -645,7 +693,7 @@ function literalContextLines(){
 function mk(over) {
   return Object.assign({
     workid: uuid(), title:'', type:'code', state:'todo', source:'user',
-    priority:5, risk:0, codepath:'./src',
+    priority:5, risk:0, codepath:'./src', codepath_ignore:[],
     context:[], testfiles:[],
     prework:[], mainwork:'', postwork:[], output:'', attempts:0, lasterror:'',
     tests:null,
@@ -766,6 +814,7 @@ async function loadAll(){
     meta.prepostwork.forEach(p => PREPOST.push(p));
     PROJECT_ROOT = meta.code_root || meta.project_root;
     if (meta.home) HOME = meta.home;
+    if (meta.reqs_dir) REQS_DIR = meta.reqs_dir;
     if (Array.isArray(meta.default_context) && meta.default_context.length) {
       DEFAULT_CONTEXT = meta.default_context;
     }
@@ -916,6 +965,7 @@ function renderRows(){
             <span class="chip kv mono" title="Risk 0–10">R:${item.risk}</span>
             <span class="chip" style="background:var(--s-queued-bg);color:#fff" title="Requested by">${esc(sourceLabel(item.source))}</span>
             ${testChip(item)}
+            ${item.source_testgroup ? `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="Born from this testgroup (sweep provenance)${(item.source_tests||[]).length ? ' — red at birth: ' + esc(item.source_tests.join(', ')) : ''}">TG: ${esc(item.source_testgroup)}</span>` : ''}
             <span class="chip kv mono" title="Attempts">A:${item.attempts}</span>
             <span class="chip meta mono" title="Stored UTC: ${esc(item.times.added)}">Requested: <b>${esc(fmtTs(item.times.added))}</b></span>
             <span class="chip meta mono">ID: <b>${esc(shortId(item))}</b></span>
@@ -928,7 +978,8 @@ function renderRows(){
       </div>
       <div class="detailwrap"><div class="detail"><div class="detail-inner">
         <div class="dlabel">CodePath</div>
-        <div class="dvalrow"><span class="codepath" title="Lock scope and agent working directory">${esc(absCodepath(item.codepath))}</span>
+        <div class="dvalrow"><span class="codepath" title="Lock scope and agent working directory">${esc(absCodepath(item.codepath))}</span>${
+          (item.codepath_ignore||[]).length ? `<span class="codepath" title="Subtrees carved out of the lock scope — parallel items may own them" style="opacity:.75">ignoring: ${esc(item.codepath_ignore.join(', '))}</span>` : ''}
           <span class="fullid">ID: ${esc(item.workid)}</span></div>
         <div class="dlabel">Prework</div><div>${pillRow(item.prework,false,'prework')}</div>
         <div class="dlabel">Request</div><div class="textblock">${esc(item.mainwork)||'<i>—</i>'}</div>
@@ -984,7 +1035,7 @@ function openLb(title, bodyHtml, footHtml){
   $('lbFoot').innerHTML = footHtml || '<button class="btn" data-lbclose>Close</button>';
   $('overlay').classList.add('open');
 }
-function closeLb(){ $('overlay').classList.remove('open'); }
+function closeLb(){ $('overlay').classList.remove('open'); if (typeof lbStack !== 'undefined') lbStack = []; }
 
 function fakeGroups(item){
   if (!item.tests) return [];
@@ -1005,14 +1056,14 @@ function lbTests(item){
       const files = data.testfiles || [];
       if (!files.length || files.every(f => !f.groups.length)) {
         return openLb('Test Details — ' + shortId(item),
-          `<p style="color:var(--text-dim)">No test groups found for this work item's testfiles. Groups live in <span class="mono">testgroups.iter.md</span> blocks beside the code.</p>`);
+          `<p style="color:var(--text-dim)">No test groups found for this work item's testfiles. Groups live in <span class="mono">*testgroup.iter.md</span> files declared by each marker file.</p>`);
       }
       const rows = files.flatMap(f => f.groups.map(g => {
         const ok = g.result === 'passed';
         return `<tr><td><b>${esc(g.label)}</b></td>
           <td><span class="chip" style="background:${ok?'var(--s-complete-bg)':(g.result?'var(--s-failed-bg)':'var(--surface2)')};color:${g.result?'#fff':'var(--text-dim)'}">${esc(g.result || 'never run')}</span></td>
           <td class="mono">${esc(g.counts || '–')}</td><td class="mono">${esc(g.lastrun ? fmtTs(g.lastrun) : '–')}</td>
-          <td class="mono">${(g.testlist||[]).map(esc).join(', ')}</td></tr>`;
+          <td class="mono">${(g.testlist||[]).map(t => esc(typeof t === 'string' ? t : t.shell || t.id)).join(', ')}</td></tr>`;
       })).join('');
       openLb('Test Details — ' + shortId(item),
         `<table class="t"><thead><tr><th>Group</th><th>Result</th><th>Counts</th><th>Last run</th><th>Scripts</th></tr></thead><tbody>${rows}</tbody></table>
@@ -1022,7 +1073,7 @@ function lbTests(item){
   }
   const groups = fakeGroups(item);
   if (!groups.length) return openLb('Test Details — ' + shortId(item),
-    `<p style="color:var(--text-dim)">No test results recorded for this work item yet. The engine stamps results from <span class="mono">testgroups.iter.md</span> at close-out.</p>`);
+    `<p style="color:var(--text-dim)">No test results recorded for this work item yet. The engine stamps results from <span class="mono">*testgroup.iter.md</span> files at close-out.</p>`);
   const rows = groups.map(g => {
     const ok = g.result === 'passed';
     return `<tr>
@@ -1122,7 +1173,8 @@ function openForm(mode, source, priorState){
   if (mode === 'followup') {
     const parent = source;
     Object.assign(d, mk({ title:'Follow-up: ' + parent.title.slice(0,60), type:parent.type,
-      codepath:parent.codepath, context:parent.context.slice(), testfiles:parent.testfiles.slice(),
+      codepath:parent.codepath, codepath_ignore:(parent.codepath_ignore||[]).slice(),
+      context:parent.context.slice(), testfiles:parent.testfiles.slice(),
       mainwork:`Follow-up to ${shortId(parent)} ("${parent.title.slice(0,60)}").\n\n` , source:'user' }));
   }
   draft = { mode, base: mode==='edit' ? source.workid : null, data: d };
@@ -1152,6 +1204,12 @@ function openForm(mode, source, priorState){
         <input type="text" id="f_codepath" class="mono" value="${esc(d.codepath)}"
           placeholder="relative (./src) or absolute — resolved to absolute on save">
         <div class="pathhint" id="f_pathhint">→ ${esc(absCodepath(d.codepath))}</div>
+      </div>
+      <span class="flabel top-align">CodePath ignore</span>
+      <div>
+        <textarea id="f_codepath_ignore" rows="1" style="width:100%" class="mono"
+          placeholder="subtrees carved OUT of the lock scope — one .gitignore-style pattern per line, relative to CodePath (e.g. test/)">${esc((d.codepath_ignore||[]).join('\n'))}</textarea>
+        <div class="pathhint" style="opacity:.75">this item won’t lock or touch these subtrees, so another work item can own them in parallel (e.g. code ignores <span class="mono">test/</span> while a testwriter locks it)</div>
       </div>
       <span class="flabel top-align">Context</span>
       <div>
@@ -1216,6 +1274,7 @@ function saveDraft(targetState){
   d.risk = +$('f_risk').value;
   d.source = $('f_source').value;
   d.codepath = absCodepath($('f_codepath').value);   // entered relative, stored absolute
+  d.codepath_ignore = $('f_codepath_ignore').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.context = $('f_context').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.testfiles = $('f_testfiles').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.mainwork = $('f_mainwork').value;
@@ -1225,7 +1284,8 @@ function saveDraft(targetState){
     const done = () => { draft = null; closeLb(); return loadAll(); };
     if (mode === 'edit') {
       const fields = { title: d.title, type: d.type, priority: d.priority, risk: d.risk,
-        source: d.source, codepath: d.codepath, context: d.context, testfiles: d.testfiles,
+        source: d.source, codepath: d.codepath, codepath_ignore: d.codepath_ignore,
+        context: d.context, testfiles: d.testfiles,
         prework: d.prework, postwork: d.postwork, mainwork: d.mainwork };
       const stateAction = targetState === 'queued' ? 'queue' : targetState === 'todo' ? 'todo' : 'pause';
       api(`/api/workitems/${draft.base}`, { method: 'PATCH', body: JSON.stringify(fields) })
@@ -1587,10 +1647,21 @@ const CONFIG = {
     test_min: [20, 'minimum tests per group (testwriter floor)'],
     test_max: [100, 'maximum tests per group'],
     test_default_path: ['./test*/', 'where test groups live by default'],
+    test_dir: ['test', 'the per-component test directory name — testwriter items lock <component>/<test_dir>, code items list it in codepath_ignore; exported to agents as ITER_TEST_DIR'],
+    usecase_default_location: ['{codepath}/usecases/', 'where NEW use-case files are created ({codepath} = the resolved code root) — creation only; the scanner finds *usecase.iter.md anywhere'],
     log_default_path: ['./logs/{YYYYMMDD-hh}.log', 'engine log file pattern'],
     log_level: ['info', 'debug | info | warn | error'],
     log_max_size_mb: [10, 'rotate log at this size'],
     log_max_files: [50, 'rotated files kept'],
+  },
+  testing: {
+    test_sweep_active: [true, 'run the periodic deterministic test sweep (re-runs testgroups that aren’t provably green)'],
+    minutes_between_test_sweeps: [120, 'sweep cadence; first pass ~90s after engine start'],
+    test_green_stale_hours: [24, 'a group with a green run newer than this is left alone'],
+    test_sweep_timeout_minutes: [10, 'wall-clock budget per testgroup run; overrun = killed → error (never counts as red)'],
+    parallel_test_concurrency: [3, 'testgroups run concurrently during a sweep'],
+    workitem_priority_lastrun_not_green: [4, 'priority of fix items for never/no-longer-green groups — higher = sooner; default work is 5, so sweep items fill idle capacity'],
+    workitem_priority_lastrun_green: [2, 'priority of fix items for was-green-now-stale groups'],
   },
   limits: {
     probe_enabled: [false, 'run the background probe (tmux/screen + claude) that keeps account usage fresh while the engine works'],
@@ -1676,6 +1747,7 @@ async function renderIlSettings(){
   $('view-ilsettings').innerHTML = `<div class="setform">
     ${group('engine', CONFIG.engine, 'Scheduler, locking, and retry behavior — .iter/.engine/config.json')}
     ${group('globalsettings', CONFIG.globalsettings, 'Testing and logging defaults')}
+    ${group('testing', CONFIG.testing, 'The deterministic test engine: sweep cadence, timeouts, concurrency, and fix-item priorities (higher = sooner) — see features/TDD.md')}
     ${group('limits', CONFIG.limits, 'Account-usage throttle: tiered agent caps from Claude Code’s server-reported 5h/7d utilization, kept fresh by the probe session')}
     <div class="setfoot">
       <button class="btn" id="cfgReset">Reset to Defaults</button>
@@ -1855,18 +1927,25 @@ let USECASES = [
     desc:'Edge auth through policy check, then an orchestrated intake change',
     file:'./usecases/modify-sentinel.iter.md',
     steps:{ 'infra/seccomm/gateway':'1.1', 'infra/seccomm/authn':'1.2', 'infra/seccomm/authz':'1.3',
-            'core/intake':'2', 'core/intake/orchestrator':'2.1', 'core/intake/emancipator':'2.2' } },
+            'core/intake':'2', 'core/intake/orchestrator':'2.1', 'core/intake/emancipator':'2.2' },
+    participants:['1.1 infra/seccomm/gateway','1.2 infra/seccomm/authn','1.3 infra/seccomm/authz',
+            '2 core/intake','2.1 core/intake/orchestrator','2.2 core/intake/emancipator'],
+    body:'# Modify a Sentinel\n\nA capital provider authenticates at the edge, passes policy, and an orchestrated intake change lands.' },
   { name:'Worker requests early wage payout',
     desc:'Verified shift becomes an obligation, novates, and pays out',
     file:'./usecases/early-payout.iter.md',
     steps:{ 'infra/seccomm/gateway':'1', 'core/intake':'2', 'core/intake/ewo-origination':'2.1',
             'core/intake/onvl-novation':'2.2', 'core/payout':'3', 'core/payout/rail-selector':'3.1',
-            'core/payout/ledger':'3.2' } },
+            'core/payout/ledger':'3.2' },
+    participants:['1 infra/seccomm/gateway','2 core/intake','2.1 core/intake/ewo-origination',
+            '2.2 core/intake/onvl-novation','3 core/payout','3.1 core/payout/rail-selector','3.2 core/payout/ledger'],
+    body:'# Early payout\n\nA verified shift becomes an obligation, novates to the capital provider, and pays out over the selected rail.' },
 ];
 
 let projUC = -1;          // -1 = no use-case filter
 let projIface = '';       // '' = no interface thread; else an interface id
 let openIface = -1;       // index into INTERFACES of the expanded contract row
+let openUC = -1;          // index into USECASES of the expanded use-case row
 let projOrder = 'hierarchy';
 let projDepth = null;     // null = all levels; else index into LEVELS
 let openMarker = null;
@@ -1879,8 +1958,11 @@ async function loadProjects(){
     key: n.key, level: n.level || 'node', name: n.name, desc: n.description,
     uses: n.uses || [], provides: n.provides || [], depth: n.depth,
     dir: n.dir, path: n.path, body: n.body || '',
+    testgroup: n.testgroup || '', test_dir: n.test_dir || '',
+    bizreq: n.bizreq || '', techreq: n.techreq || '',
   }));
-  USECASES = scan.usecases.map(u => ({ name: u.name, desc: u.description, file: u.file, steps: u.steps }));
+  USECASES = scan.usecases.map(u => ({ name: u.name, desc: u.description, file: u.file, steps: u.steps,
+    participants: u.participants || [], body: u.body || '' }));
   INTERFACES = scan.interfaces.map(i => ({ id: i.id, kind: i.kind, endpoint: i.endpoint, description: i.description, file: i.file, body: i.body || '' }));
   projLoaded = true;
   return scan;
@@ -1904,6 +1986,8 @@ async function renderProjects(){
       return;
     }
   }
+  if (projUC >= USECASES.length) projUC = -1;   // CRUD can shrink the list
+  if (openUC >= USECASES.length) openUC = -1;
   const uc = projUC >= 0 ? USECASES[projUC] : null;
   const counts = LEVELS.map(l => MARKERS.filter(m => m.level === l).length);
   const threaded = uc || projIface;
@@ -1930,13 +2014,13 @@ async function renderProjects(){
         ${step ? `<span class="step">${esc(step)}</span>` : ''}
       </div>
       ${open ? `<div class="pdetail">
-        <div class="dlabel">Marker</div><div class="mono">${esc(m.path)}</div>
-        <div class="dlabel">CodePath</div><div class="mono">${esc(absCodepath(m.dir))}</div>
-        <div class="dlabel">Provides</div><div>${m.provides.length ? m.provides.map(u=>`<span class="useb prov">▲ ${esc(u)}</span>`).join(' ') : '<span style="color:var(--text-dim)">—</span>'}</div>
-        <div class="dlabel">Uses</div><div>${m.uses.length ? m.uses.map(u=>`<span class="useb">${esc(u)}</span>`).join(' ') : '<span style="color:var(--text-dim)">—</span>'}</div>
+        ${c4DetailRows(m)}
         <div class="dlabel">Use-cases</div><div>${USECASES.filter(u=>u.steps[m.key]).map(u=>`${esc(u.name)} <b class="mono">(${u.steps[m.key]})</b>`).join('<br>') || '<span style="color:var(--text-dim)">not a participant</span>'}</div>
         <div class="actions">
           <button class="btn primary" data-mkworkitem="${esc(m.key)}">Create WorkItem here</button>
+          <button class="btn" data-reqlb="bizreq" data-node="${esc(m.key)}">Biz Requirements</button>
+          <button class="btn" data-reqlb="techreq" data-node="${esc(m.key)}">Tech Requirements</button>
+          <button class="btn" data-testlb data-node="${esc(m.key)}">Testing</button>
           <button class="btn" data-viewmarker="${esc(m.key)}">View Marker File</button>
         </div>
       </div>` : ''}`;
@@ -1971,6 +2055,38 @@ async function renderProjects(){
     </div>` : ''}`;
   }).join('');
 
+  // Use-cases: participants: markers, threaded through the tree one-way — the
+  // use-case names its nodes; nodes never mention use-cases. Full CRUD here.
+  const ucRows = USECASES.map((u, idx) => {
+    const on = projUC === idx;
+    const open = openUC === idx;
+    const plist = (u.participants || []).map(line => {
+      const sp = line.trim().split(/\s+/);
+      const step = sp[0] || '';
+      const key = (sp.slice(1).join(' ') || '') === '.' ? '' : sp.slice(1).join(' ');
+      const node = MARKERS.find(m => m.key === key);
+      return `<div><b class="mono">${esc(step)}</b> ${node ? esc(node.name) : `<span class="mono">${esc(key || '(project root)')}</span>`}
+        <span class="mono" style="color:var(--text-dim)">${node ? '· ' + esc(key || '(project root)') : key ? '— no node with this key' : ''}</span></div>`;
+    }).join('');
+    return `<div class="prow ${on?'participant':''}" data-ucrow="${idx}" role="button" tabindex="0"
+        aria-expanded="${open}" title="Click to expand and thread this use-case's participants in the tree">
+      <span class="chev">${open ? '▾' : '▸'}</span>
+      <span class="pname">${esc(u.name)}</span>
+      <span class="pdesc">${esc(u.desc)}</span>
+      <span class="uses"><span class="useb">${Object.keys(u.steps || {}).length} participant${Object.keys(u.steps || {}).length===1?'':'s'}</span></span>
+    </div>
+    ${open ? `<div class="pdetail">
+      <div class="dlabel">File</div><div class="mono">${esc(u.file)}</div>
+      <div class="dlabel">Participants</div><div>${plist || '<span style="color:var(--text-dim)">none</span>'}</div>
+      <div class="dlabel">Story</div>
+      <div class="textblock" style="max-height:50vh">${esc(u.body || '(no body yet — click Edit to write the narrative)')}</div>
+      <div class="actions">
+        <button class="btn primary" data-ucedit="${idx}">Edit</button>
+        <button class="btn" data-ucdel="${idx}">Delete</button>
+      </div>
+    </div>` : ''}`;
+  }).join('');
+
   $('view-projects').innerHTML = `
     <div class="projtools">
       <label>Filter by use-case:
@@ -1991,11 +2107,14 @@ async function renderProjects(){
     <div class="legendbar">
       ${LEVELS.map((l,i) => `<button class="lvlchip ${projDepth===i?'active':''}" data-depth="${i}"
         style="background:var(--lvl-${l}-bg);color:var(--lvl-${l}-fg)">${l} · ${counts[i]}</button>`).join('')}
-      <span class="lhint">click a level to collapse below it · markers: <span class="mono">**/*.iter.md</span> with <span class="mono">level:</span> frontmatter</span>
+      <span class="lhint">click a level to collapse below it · nodes: <span class="mono">**/*marker.iter.md</span> (level: in frontmatter says which C4 level)</span>
     </div>
     <div class="ptree">${rows || '<div class="empty">No markers found — check scan roots in Project Settings.</div>'}</div>
     <h3 style="margin:16px 0 6px;font-size:13.5px">Interfaces <span style="color:var(--text-dim);font-weight:500;font-size:12px">— global: aggregated across all scan roots, referenced by nodes via <span class="mono">provides:</span> / <span class="mono">uses:</span>, never owned by the tree</span></h3>
-    <div class="ptree">${ifaceRows || '<div class="empty">No interfaces declared yet — add a marker with <span class="mono">interface:</span> frontmatter.</div>'}</div>`;
+    <div class="ptree">${ifaceRows || '<div class="empty">No interfaces declared yet — add a marker with <span class="mono">interface:</span> frontmatter.</div>'}</div>
+    <h3 style="margin:16px 0 6px;font-size:13.5px">Use-Cases <span style="color:var(--text-dim);font-weight:500;font-size:12px">— <span class="mono">participants:</span> markers threading scenarios through the tree; one-way, nodes never mention them</span>
+      <button class="btn" data-ucnew style="float:right;margin-top:-4px">New Use-Case</button></h3>
+    <div class="ptree">${ucRows || '<div class="empty">No use-cases yet — click New Use-Case, or drop a marker with <span class="mono">participants:</span> frontmatter anywhere in the tree.</div>'}</div>`;
 
   $('projUc').addEventListener('change', e => { projUC = +e.target.value; projIface = ''; openIface = -1; renderProjects(); });
   $('projOrder').addEventListener('change', e => { projOrder = e.target.value; renderProjects(); });
@@ -2017,6 +2136,65 @@ function markerAncestors(key){
   return out;
 }
 
+/* Use-case CRUD: create + edit share one lightbox form; files are ordinary
+   participants: markers (created ones land in globalsettings.usecase_default_location,
+   default {codepath}/usecases/). */
+function ucForm(idx){
+  const u = idx >= 0 ? USECASES[idx]
+    : { name:'', desc:'', file:'', participants:[], body:'' };
+  openLb(idx >= 0 ? 'Edit Use-Case — ' + u.name : 'New Use-Case', `
+    <div class="form">
+      <span class="flabel">Name</span>
+      <input type="text" id="uc_name" value="${esc(u.name)}" placeholder="Worker requests early wage payout">
+      <span class="flabel">Description</span>
+      <input type="text" id="uc_desc" value="${esc(u.desc)}" placeholder="one line: what happens, end to end">
+      <span class="flabel top-align">Participants</span>
+      <div>
+        <textarea id="uc_parts" rows="5" class="mono" style="width:100%"
+          placeholder="one per line: <step> <node key>   e.g.&#10;1 infra/gateway&#10;2.1 core/intake">${esc((u.participants||[]).join('\n'))}</textarea>
+        <div class="pathhint" style="opacity:.75">step numbers order the thread; the node key is the marker's directory relative to the project root (<span class="mono">.</span> = project root). Optional — the filename (*usecase.iter.md) is what makes it a use-case; participants only thread it through the tree.</div>
+      </div>
+      <span class="flabel top-align">Story</span>
+      <textarea id="uc_body" rows="9" placeholder="The narrative: what happens at each step, requirements it exercises, edge cases.">${esc(u.body)}</textarea>
+      ${idx >= 0 ? `<span class="flabel">File</span><div class="mono" style="align-self:center">${esc(u.file)}</div>` : ''}
+    </div>`,
+    `<button class="btn" data-lbclose>Cancel</button>
+     <button class="btn primary" id="ucSave">${idx >= 0 ? 'Save Use-Case' : 'Create Use-Case'}</button>`);
+  $('ucSave').addEventListener('click', async () => {
+    const payload = {
+      name: $('uc_name').value.trim(),
+      description: $('uc_desc').value.trim(),
+      participants: $('uc_parts').value.split('\n').map(s=>s.trim()).filter(Boolean),
+      body: $('uc_body').value,
+    };
+    if (!payload.name) { toast('A use-case needs a name'); return; }
+    // Participants are optional: the filename (*usecase.iter.md) declares the role.
+    if (!LIVE) { toast('Mock mode — nothing saved'); closeLb(); return; }
+    if (idx >= 0) payload.file = u.file;
+    try {
+      await api('/api/usecases', { method: idx >= 0 ? 'PUT' : 'POST', body: JSON.stringify(payload) });
+      closeLb();
+      projLoaded = false;
+      await renderProjects();
+      toast(idx >= 0 ? 'Use-case saved' : 'Use-case created');
+    } catch (e) { toast('Save failed: ' + e.message); }
+  });
+}
+
+async function ucDelete(idx){
+  const u = USECASES[idx];
+  if (!u) return;
+  if (!confirm(`Delete use-case "${u.name}"?\n\nThe marker file will be removed:\n${u.file}`)) return;
+  if (!LIVE) { toast('Mock mode — nothing deleted'); return; }
+  try {
+    await api('/api/usecases/delete', { method: 'POST', body: JSON.stringify({ file: u.file }) });
+    openUC = -1; projUC = -1;
+    projLoaded = false;
+    await renderProjects();
+    toast('Use-case deleted');
+  } catch (e) { toast('Delete failed: ' + e.message); }
+}
+
 function projClick(e){
   const mk_ = e.target.closest('[data-mkworkitem]');
   if (mk_) {
@@ -2033,7 +2211,7 @@ function projClick(e){
       else ctx.push(line);
     }
     openForm('create', mk({ codepath: m.dir, context: [...new Set(ctx)],
-      testfiles: [`${m.dir}/test/testgroups.iter.md`], title: '', mainwork: '', source: 'user' }));
+      testfiles: m.testgroup ? [`${m.dir}/${m.testgroup}`] : [], title: '', mainwork: '', source: 'user' }));
     return true;
   }
   const ifr = e.target.closest('[data-ifacerow]');
@@ -2045,7 +2223,27 @@ function projClick(e){
     } else {
       openIface = idx;
       projIface = INTERFACES[idx].id;
+      projUC = -1; openUC = -1;
+    }
+    renderProjects();
+    return true;
+  }
+  const ucnew = e.target.closest('[data-ucnew]');
+  if (ucnew) { ucForm(-1); return true; }
+  const uced = e.target.closest('[data-ucedit]');
+  if (uced) { ucForm(+uced.dataset.ucedit); return true; }
+  const ucdel = e.target.closest('[data-ucdel]');
+  if (ucdel) { ucDelete(+ucdel.dataset.ucdel); return true; }
+  const ucr = e.target.closest('[data-ucrow]');
+  if (ucr && !e.target.closest('.pdetail')) {
+    const idx = +ucr.dataset.ucrow;
+    if (openUC === idx) {
+      openUC = -1;
       projUC = -1;
+    } else {
+      openUC = idx;
+      projUC = idx;                    // expanding also threads the red line
+      projIface = ''; openIface = -1;
     }
     renderProjects();
     return true;
@@ -2101,13 +2299,323 @@ document.addEventListener('click', (e) => {
   if (document.getElementById('view-projects').classList.contains('active')) projClick(e);
 });
 
+/* ----------------------------------------------- C4 detail + drill-down UI */
+
+/* Extract the "# Long Description" section from a marker body (any heading level
+   1–3; ends at the next heading or EOF). */
+function longDescOf(body){
+  const m = (body || '').match(/(?:^|\n)#{1,3}\s*Long Description[^\n]*\n([\s\S]*?)(?=\n#{1,3}\s|$)/i);
+  return m ? m[1].trim() : '';
+}
+function replaceLongDescSection(content, text){
+  const re = /((?:^|\n)#{1,3}\s*Long Description[^\n]*\n)[\s\S]*?(?=\n#{1,3}\s|$)/i;
+  if (re.test(content)) return content.replace(re, (_, head) => head + text + '\n');
+  return content.trimEnd() + '\n\n# Long Description\n' + text + '\n';
+}
+
+/* uses/provides as two clickable listboxes: interfaces open their contract,
+   C4 nodes open their detail — drill through dependencies infinitely, with a
+   breadcrumb trail to walk back. */
+function refBtn(name){
+  const iface = INTERFACES.find(i => i.id === name);
+  const node = !iface && MARKERS.find(x => x.key === name || x.name === name);
+  if (iface) return `<button class="refbtn linked" data-refiface="${esc(name)}" title="interface — click for the contract">${esc(name)}</button>`;
+  if (node) return `<button class="refbtn linked" data-refnode="${esc(node.key)}" title="C4 object — click for detail">${esc(name)}</button>`;
+  return `<button class="refbtn plain" disabled title="no interface or C4 object declared with this id">${esc(name)}</button>`;
+}
+function upBoxesHtml(m){
+  const none = '<span style="color:var(--text-dim);font-size:12px">—</span>';
+  return `<div class="upgrid">
+    <div class="upbox"><div class="uphead">uses</div>${(m.uses||[]).map(refBtn).join('') || none}</div>
+    <div class="upbox"><div class="uphead">provides</div>${(m.provides||[]).map(refBtn).join('') || none}</div>
+  </div>`;
+}
+
+/* Shared detail rows: the tree's expanded section and the drill-down lightbox
+   render the same fields from the same data. */
+function c4DetailRows(m){
+  const ld = longDescOf(m.body);
+  return `
+    <div class="dlabel">Short desc</div><div>${esc(m.desc) || '<span style="color:var(--text-dim)">—</span>'}</div>
+    <div class="dlabel">Long desc</div>
+    <div><div class="longdesc ${ld?'':'tbd'}">${esc(ld || 'TBD — this marker has no Long Description yet. Click Edit to write one: plain language, no jargon, acronyms defined on first use ("three letter acronym (TLA)").')}</div>
+      <button class="btn" style="margin-top:6px" data-editlong="${esc(m.key)}">Edit Long Description</button></div>
+    <div class="dlabel">Marker</div><div class="mono">${esc(m.path)}</div>
+    <div class="dlabel">CodePath</div><div class="mono">${esc(absCodepath(m.dir))}</div>
+    <div class="dlabel">Uses / Provides</div><div>${upBoxesHtml(m)}</div>`;
+}
+
+/* ------------------------- breadcrumb lightbox stack (replace, don't stack) */
+
+let lbStack = [];   // [{label, title, build:()=>html, wire?:()=>void}]
+function crumbsHtml(){
+  if (lbStack.length < 2) return '';
+  return `<div class="crumbs">${lbStack.map((s,i) => i === lbStack.length-1
+    ? `<span class="chere">${esc(s.label)}</span>`
+    : `<button data-crumb="${i}">${esc(s.label)}</button><span class="csep">›</span>`).join('')}</div>`;
+}
+function lbRenderTop(){
+  const top = lbStack[lbStack.length-1];
+  if (!top) return;
+  openLb(top.title, crumbsHtml() + top.build(), top.foot);
+  if (top.wire) top.wire();
+}
+function lbNav(entry){
+  if ($('overlay').classList.contains('open') && lbStack.length) lbStack.push(entry);
+  else lbStack = [entry];
+  lbRenderTop();
+}
+
+function navNode(key){
+  const m = MARKERS.find(x => x.key === key);
+  if (!m) { toast('No C4 object with key "' + key + '"'); return; }
+  lbNav({ label: m.name, title: `${m.level[0].toUpperCase()+m.level.slice(1)} — ${m.name}`,
+    build: () => `<div class="pdetail" style="border:none;background:none;padding:0">
+      ${c4DetailRows(m)}
+      <div class="actions">
+        <button class="btn" data-reqlb="bizreq" data-node="${esc(m.key)}">Biz Requirements</button>
+        <button class="btn" data-reqlb="techreq" data-node="${esc(m.key)}">Tech Requirements</button>
+        <button class="btn" data-testlb data-node="${esc(m.key)}">Testing</button>
+      </div></div>` });
+}
+
+function navIface(id){
+  const defs = INTERFACES.filter(i => i.id === id);
+  if (!defs.length) { toast('No interface declared with id "' + id + '"'); return; }
+  const providers = MARKERS.filter(m => (m.provides||[]).includes(id));
+  const consumers = MARKERS.filter(m => (m.uses||[]).includes(id));
+  lbNav({ label: id, title: 'Interface — ' + id,
+    build: () => defs.map(i => `
+      <div style="margin-bottom:14px">
+        <p style="margin:0 0 8px"><span class="kindchip k-${esc(i.kind||'other')}">${esc(i.kind||'?')}</span>
+          ${i.endpoint ? ` <span class="mono">${esc(i.endpoint)}</span>` : ''}
+          ${defs.length > 1 ? ' <span class="dupflag">duplicate id — rationalize</span>' : ''}</p>
+        <p style="margin:0 0 8px;color:var(--text-dim);font-size:12px">${esc(i.description)} · <span class="mono">${esc(i.file)}</span></p>
+        <div class="textblock mono" style="max-height:40vh">${esc(i.body || '(no contract body in the marker yet)')}</div>
+      </div>`).join('') + `
+      <div class="upgrid" style="margin-top:4px">
+        <div class="upbox"><div class="uphead">providers</div>${providers.map(m=>`<button class="refbtn linked" data-refnode="${esc(m.key)}">▲ ${esc(m.name)}</button>`).join('') || '<span style="color:var(--text-dim);font-size:12px">none declared — who serves this?</span>'}</div>
+        <div class="upbox"><div class="uphead">consumers</div>${consumers.map(m=>`<button class="refbtn linked" data-refnode="${esc(m.key)}">${esc(m.name)}</button>`).join('') || '<span style="color:var(--text-dim);font-size:12px">none declared</span>'}</div>
+      </div>` });
+}
+
+/* ------------------------------------------------ long description editor */
+
+async function editLongDesc(key){
+  const m = MARKERS.find(x => x.key === key);
+  if (!m) return;
+  if (!LIVE) { toast('Mock mode — open via iter start to edit'); return; }
+  let file;
+  try { file = await api('/api/file/read', { method:'POST', body: JSON.stringify({ path: m.path }) }); }
+  catch (e) { toast('Read failed: ' + e.message); return; }
+  const cur = longDescOf(file.content);
+  openLb('Long Description — ' + m.name, `
+    <p style="margin:0 0 8px;color:var(--text-dim);font-size:12.5px">Plain language for a non-technical reader:
+      describe, don’t state · no jargon · define every acronym on first use ("three letter acronym (TLA)") ·
+      reference other parts of the project by their marker path.</p>
+    <textarea id="ldText" class="reqlocal" style="min-height:38vh">${esc(cur)}</textarea>
+    <p class="mono" style="color:var(--text-dim);font-size:11.5px;margin:8px 0 0">writes the “# Long Description” section of ${esc(m.path)}</p>`,
+    `<button class="btn" data-lbclose>Cancel</button>
+     <button class="btn primary" id="ldSave">Save Long Description</button>`);
+  lbStack = [];
+  $('ldSave').addEventListener('click', async () => {
+    const updated = replaceLongDescSection(file.content, $('ldText').value.trim());
+    try {
+      await api('/api/file', { method:'PUT', body: JSON.stringify({ path: file.path, content: updated }) });
+      closeLb(); toast('Long description saved');
+      projLoaded = false; await renderProjects();
+    } catch (e) { toast('Save failed: ' + e.message); }
+  });
+}
+
+/* ------------------------------------- requirements lightbox (local+global) */
+
+async function reqLb(key, kind){
+  const m = MARKERS.find(x => x.key === key);
+  if (!m) return;
+  const label = kind === 'bizreq' ? 'Business Requirements' : 'Technical Requirements';
+  // The marker file may declare where its requirement files live; fall back to
+  // the conventional name beside the marker.
+  const declared = kind === 'bizreq' ? m.bizreq : m.techreq;
+  const localPath = absCodepath(m.dir) + '/' + (declared || kind + '.iter.md');
+  const globalPath = (REQS_DIR || '(reqs dir unknown)') + '/' + kind + '.iter.md';
+  let local = { content: '', exists: false };
+  let globalTxt = '';
+  if (LIVE) {
+    try { const r = await api('/api/file/read', { method:'POST', body: JSON.stringify({ path: localPath }) }); local = { content: r.content, exists: true }; } catch (e) {}
+    try { const g = await api('/api/file/read', { method:'POST', body: JSON.stringify({ path: globalPath }) }); globalTxt = g.content; } catch (e) { globalTxt = '(no global file found at this path)'; }
+  } else { globalTxt = '(mock mode — open via iter start for live content)'; }
+  lbNav({ label, title: `${label} — ${m.name}`,
+    build: () => `
+      <div class="reqpathrow"><span><b>LOCAL — specific to this ${esc(m.level)}</b> (editable): <span class="mono">${esc(localPath)}</span>${local.exists ? '' : ' — <i>does not exist yet; saving creates it</i>'}</span></span></div>
+      <textarea id="reqLocal" class="reqlocal">${esc(local.content)}</textarea>
+      <div class="reqpathrow" title="drag the bottom edge of the box above to adjust the boundary">
+        <span><b>GLOBAL — generic, project-wide</b> (read-only): <span class="mono">${esc(globalPath)}</span></span>
+        <span>global requirements are edited on disk, deliberately — this path is shown so they’re easy to find</span></div>
+      <div class="reqglobal">${esc(globalTxt)}</div>`,
+    foot: `<button class="btn" data-lbclose>Close</button>
+           <button class="btn primary" id="reqSave">Save Local ${esc(kind)}.iter.md</button>`,
+    wire: () => {
+      $('reqSave').addEventListener('click', async () => {
+        if (!LIVE) { toast('Mock mode — nothing saved'); return; }
+        try {
+          await api('/api/file', { method:'PUT', body: JSON.stringify({ path: localPath, content: $('reqLocal').value }) });
+          local = { content: $('reqLocal').value, exists: true };
+          toast('Saved ' + localPath.split('/').pop());
+        } catch (e) { toast('Save failed: ' + e.message); }
+      });
+    } });
+}
+
+/* ------------------------------------------------ testing interface lightbox */
+
+let tg = { entries: [], sel: 0, runs: {}, node: null, logOpen: null };
+
+function tgEntrySel(){ return tg.entries[tg.sel]; }
+function tgSanitize(id){ return String(id).replace(/[^A-Za-z0-9_-]/g, '_'); }
+function tgResultColor(r){
+  return r === 'passed' ? 'var(--s-complete-bg)' : r === 'failed' ? 'var(--s-failed-bg)'
+    : r === 'error' ? 'var(--s-paused-bg)' : 'var(--border)';
+}
+
+async function testingLb(key){
+  tg.node = key === null ? null : MARKERS.find(x => x.key === key) || null;
+  if (!LIVE) { toast('Mock mode — open via iter start for live test data'); return; }
+  let data;
+  try { data = await api('/api/testgroups'); } catch (e) { toast('Testgroups: ' + e.message); return; }
+  const nodeDir = tg.node ? absCodepath(tg.node.dir) : null;
+  const mine = (data.files || [])
+    .filter(f => !nodeDir || f.c4_dir === nodeDir || (f.c4_dir || '').startsWith(nodeDir + '/'));
+  tg.missing = mine.filter(f => f.missing);
+  tg.entries = mine
+    .filter(f => !f.missing)
+    .flatMap(f => f.groups.map(g => ({ ...g, file: f.file, test_dir: f.test_dir, c4_key: f.c4_key, c4_name: f.c4_name })));
+  tg.orphans = data.orphans || [];
+  tg.undeclared = data.undeclared || [];
+  tg.sel = 0; tg.logOpen = null;
+  await tgLoadRuns();
+  lbNav({ label: 'Testing', title: 'Testing — ' + (tg.node ? tg.node.name : 'all testgroups'),
+    build: tgBuild, wire: null });
+}
+
+async function tgLoadRuns(){
+  const e = tgEntrySel();
+  if (!e || tg.runs[e.test_dir]) return;
+  try { tg.runs[e.test_dir] = (await api('/api/testruns', { method:'POST', body: JSON.stringify({ dir: e.test_dir }) })).runs || []; }
+  catch (err) { tg.runs[e.test_dir] = []; }
+}
+
+function tgNotesHtml(){
+  let out = '';
+  for (const f of (tg.missing || [])) {
+    out += `<p style="color:var(--s-failed-bg);font-size:12px;margin:8px 0 0">${esc(f.c4_name)}'s marker file declares
+      <span class="mono">${esc(f.file)}</span> but the file does not exist — a testwriter item should create it.</p>`;
+  }
+  if (!tg.node && (tg.undeclared || []).length) {
+    out += `<p style="color:var(--text-dim);font-size:12px;margin:8px 0 0">${tg.undeclared.length} C4 object(s) have no
+      <span class="mono">testgroup:</span> key in their marker file — deliberately outside the sweep.</p>`;
+  }
+  if (!tg.node && (tg.orphans || []).length) {
+    out += `<p style="color:var(--s-paused-bg);font-size:12px;margin:8px 0 0">Unowned (no marker file declares them):
+      <span class="mono">${tg.orphans.map(esc).join(' · ')}</span></p>`;
+  }
+  return out;
+}
+
+function tgBuild(){
+  if (!tg.entries.length) {
+    return `<p style="color:var(--text-dim)">No declared testgroups found${tg.node ? ' for ' + esc(tg.node.name) : ''}.
+      A C4 object's marker file names its testgroup.iter.md with a <span class="mono">testgroup:</span> frontmatter
+      key — no key means deliberately untested. The plan agent writes the definitions; the testwriter registers the
+      tests (and adds the key + file when missing).</p>` + tgNotesHtml();
+  }
+  const e = tgEntrySel();
+  const left = tg.entries.map((g, i) => `
+    <div class="tgrow ${i === tg.sel ? 'sel' : ''}" data-tgsel="${i}">
+      <span class="tgdot" style="background:${tgResultColor(g.result)}"></span>
+      <span>${esc(g.label)}</span><small>${esc(g.counts || '')}</small>
+    </div>`).join('');
+  const runs = (tg.runs[e.test_dir] || []).filter(r =>
+    (e.testlist || []).some(t => r.name.endsWith('-' + tgSanitize(t.id) + '.log')));
+  const openItem = items.find(i => i.source_testgroup === e.label && i.state !== 'complete');
+  const tests = (e.testlist || []).map(t => `
+    <tr><td class="mono"><b>${esc(t.id)}</b></td><td>${esc(t.name || '')}</td>
+      <td style="color:var(--text-dim)">${esc(t.desc || '')}</td><td class="mono">${esc(t.shell)}</td></tr>`).join('');
+  const runRows = runs.slice(0, 40).map(r => `
+    <tr class="runrow" data-runlog="${esc(r.path)}" title="Click to view the captured output">
+      <td class="mono">${esc(r.name)}</td><td class="mono">${(r.size/1024).toFixed(1)} KB</td></tr>`).join('');
+  return `<div class="tgwrap">
+    <div class="tglist">${left}</div>
+    <div>
+      <p style="margin:0 0 6px">
+        <span class="chip" style="background:${tgResultColor(e.result)};color:#fff">${esc(e.result || 'never run')}</span>
+        <span class="chip kv mono">${esc(e.counts || '–')}</span>
+        <span class="chip meta mono">last run: <b>${e.lastrun ? esc(fmtTs(e.lastrun)) : '—'}</b></span>
+        ${openItem ? `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="An open work item exists for this group (dedup guard active)">fix item: ${esc(openItem.state)} · ${esc(shortId(openItem))}</span>` : ''}
+      </p>
+      <p style="margin:0 0 10px;color:var(--text-dim);font-size:12.5px">${esc(e.desc || '(no group description — add "desc" in the testgroups block)')}</p>
+      <label class="autofix" title="OFF: a red run births a fix work item in todo, for your review. ON: it lands queued and an agent is dispatched automatically.">
+        <input type="checkbox" data-autofix ${e.auto_fix ? 'checked' : ''}> auto-fix
+        <span style="font-weight:500;color:var(--text-dim)">red run → fix item ${e.auto_fix ? 'QUEUED (auto-dispatch)' : 'in TODO (human review)'}</span>
+      </label>
+      <h4 style="margin:14px 0 4px">Tests (${(e.testlist||[]).length})</h4>
+      ${tests ? `<table class="t"><thead><tr><th>id</th><th>name</th><th>what it proves</th><th>script</th></tr></thead><tbody>${tests}</tbody></table>`
+        : '<p style="color:var(--text-dim);font-size:12.5px;margin:4px 0">No tests registered yet — a testwriter item fills the testlist.</p>'}
+      <h4 style="margin:14px 0 4px">Run history <span style="color:var(--text-dim);font-weight:500;font-size:11.5px">· ${esc(e.test_dir)}/runs/ · newest first</span></h4>
+      ${runRows ? `<table class="t"><tbody>${runRows}</tbody></table>` : '<p style="color:var(--text-dim);font-size:12.5px;margin:4px 0">No recorded runs yet — the sweep and <span class="mono">iter runtests</span> write one log per test per run.</p>'}
+      ${tgNotesHtml()}
+    </div></div>`;
+}
+
+async function tgToggleAutofix(checked){
+  const e = tgEntrySel();
+  if (!e) return;
+  try {
+    await api('/api/testgroups/autofix', { method:'POST', body: JSON.stringify({ path: e.file, label: e.label, auto_fix: checked }) });
+    e.auto_fix = checked;
+    toast(`auto-fix ${checked ? 'ON — red runs dispatch a fix agent automatically' : 'OFF — red runs wait in todo for review'}`);
+    lbRenderTop();
+  } catch (err) { toast('auto-fix: ' + err.message); lbRenderTop(); }
+}
+
+async function openRunLog(path){
+  try {
+    const f = await api('/api/file/read', { method:'POST', body: JSON.stringify({ path }) });
+    lbNav({ label: path.split('/').pop(), title: 'Test Run — ' + path.split('/').pop(),
+      build: () => `<p class="mono" style="color:var(--text-dim);font-size:11.5px;margin:0 0 8px">${esc(path)}</p>
+        <div class="textblock mono" style="max-height:60vh">${esc(f.content)}</div>` });
+  } catch (e) { toast('Log: ' + e.message); }
+}
+
+/* delegated clicks for all the drill-down machinery (works inside lightboxes) */
+document.addEventListener('click', (e) => {
+  const crumb = e.target.closest('[data-crumb]');
+  if (crumb) { lbStack = lbStack.slice(0, +crumb.dataset.crumb + 1); lbRenderTop(); return; }
+  const rn = e.target.closest('[data-refnode]');
+  if (rn) { navNode(rn.dataset.refnode); return; }
+  const ri = e.target.closest('[data-refiface]');
+  if (ri) { navIface(ri.dataset.refiface); return; }
+  const el = e.target.closest('[data-editlong]');
+  if (el) { editLongDesc(el.dataset.editlong); return; }
+  const rq = e.target.closest('[data-reqlb]');
+  if (rq) { reqLb(rq.dataset.node, rq.dataset.reqlb); return; }
+  const tl = e.target.closest('[data-testlb]');
+  if (tl) { testingLb(tl.dataset.node ?? null); return; }
+  const ts = e.target.closest('[data-tgsel]');
+  if (ts) { tg.sel = +ts.dataset.tgsel; tgLoadRuns().then(lbRenderTop); return; }
+  const af = e.target.closest('[data-autofix]');
+  if (af) { tgToggleAutofix(af.checked); return; }
+  const rl = e.target.closest('[data-runlog]');
+  if (rl) { openRunLog(rl.dataset.runlog); return; }
+});
+
 /* --------------------------------------------------------- project settings */
 const PROJSET = {
   project_name: ['Paydaay Core Product', 'display name: sidebar, Projects root row'],
   url_slug: ['pdy-dev', 'hostname + tab title + favicon tint: http://pdy-dev.localhost:{port}/'],
   scan_roots: ['.', 'directories searched for markers — one per line; may be outside this repo'],
-  marker_glob: ['**/*.iter.md', 'ONE glob finds every iterapp file; frontmatter declares each file’s role (see legend above)'],
-  testgroups_glob: ['**/testgroups.iter.md', 'test-group files aligned to nodes'],
+  marker_glob: ['**/*.iter.md', 'ONE glob finds every iterapp file; the FILENAME suffix declares each file’s role (see legend above)'],
+  testgroups_glob: ['**/*testgroup.iter.md', 'testgroup files (singular suffix; ownership is declared by each marker file)'],
   default_context: ['{marker}\n{ancestor_markers}\n{interfaces}', 'context prefilled on Create-WorkItem-from-node — one entry per line; placeholders in the legend above'],
 };
 const PS_MULTILINE = ['scan_roots', 'default_context'];
@@ -2126,17 +2634,22 @@ async function renderIaSettings(){
     <h3>Project Settings</h3>
     <div class="sub">Marker discovery and Create-WorkItem defaults — stored in <span class="mono">.iter/projects.json</span></div>
     <div class="sub" style="border:1px solid var(--border);border-radius:7px;padding:10px 12px;line-height:1.7">
-      <b>How markers work:</b> any file matching <span class="mono">marker_glob</span> is iterapp-meaningful;
-      its <b>frontmatter declares its role</b> —
-      <span class="mono">level:</span> → a node on the Projects map ·
-      <span class="mono">interface:</span> → a globally-aggregated interface contract ·
-      <span class="mono">participants:</span> → a use-case thread ·
-      none → a plain context doc (bizreq, techreq, testgroups, notes), attachable but never a map node.<br>
+      <b>How iter files work:</b> any file matching <span class="mono">marker_glob</span> is iterapp-meaningful;
+      its <b>FILENAME declares its role</b> — the word right before <span class="mono">.iter.md</span> (any prefix allowed, e.g.
+      <span class="mono">gateway.marker.iter.md</span>):
+      <span class="mono">*marker.iter.md</span> → a node on the Projects map (frontmatter <span class="mono">level:</span> says which C4 level) ·
+      <span class="mono">*interface.iter.md</span> → a globally-aggregated interface contract ·
+      <span class="mono">*usecase.iter.md</span> → a use-case thread ·
+      <span class="mono">*testgroup.iter.md</span> → test definitions (owned via the marker's <span class="mono">testgroup:</span> key) ·
+      <span class="mono">*bizreq.iter.md</span> / <span class="mono">*techreq.iter.md</span> → requirement docs ·
+      any other name → a plain context doc. Stray frontmatter never changes a file's role — renaming the file is the only way.<br>
       <b>Placeholders in default_context:</b>
       <span class="mono">{marker}</span> = the clicked node’s own .iter.md file ·
       <span class="mono">{ancestor_markers}</span> = markers of that node’s parent chain up to the project root ·
       <span class="mono">{interfaces}</span> = the contract files for everything in the node’s uses:/provides: ·
-      <span class="mono">{codepath}</span> = the node’s directory (anchors a glob to the work item’s own tree).
+      <span class="mono">{codepath}</span> = the node’s directory (anchors a glob to the work item’s own tree) ·
+      <span class="mono">{reqs}</span> = the project-wide reqs dir — global bizreq/techreq home (default <span class="mono">.iter/reqs/</span>,
+      relocated by a <span class="mono">reqs:</span> key on the project-level marker; its files are auto-surfaced to every agent).
     </div>
     ${Object.entries(PROJSET).map(([k,[v,why]]) => {
       const value = val(k, v);

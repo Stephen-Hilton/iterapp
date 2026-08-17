@@ -11,4 +11,5 @@ out=$(./src/greet.sh; echo x); out="${out%x}"
 " ] && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: exactly one line expected" >&2; }
 
 total=$((pass+fail))
-if [ "$fail" -eq 0 ]; then echo "passed $pass/$total"; exit 0; else echo "failed $pass/$total"; exit 1; fi
+echo "ITER_RESULT pass=$pass fail=$fail total=$total"
+if [ "$fail" -eq 0 ]; then exit 0; else exit 1; fi

@@ -1,16 +1,77 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 pub const BLOCK_START: &str = "<!-- iterapp:testgroups";
 pub const BLOCK_END: &str = "-->";
+
+/// One registered test: a shell script plus its human-facing identity. The script
+/// is the entire contract (see features/TDD.md "Test Contract"): exit 0 = green,
+/// 1 = red, anything else = the script itself broke (`error`); the last stdout line
+/// may be `ITER_RESULT pass=X fail=Y total=Z` for per-test counts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default, from = "TestEntryDe")]
+pub struct TestEntry {
+    pub id: String,
+    pub name: String,
+    pub desc: String,
+    pub shell: String,
+}
+
+/// Back-compat: testlists written before the structured schema were bare script
+/// names (`"testscript03.sh"`). Those deserialize into a full entry with the id
+/// derived from the filename stem.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TestEntryDe {
+    Script(String),
+    Entry {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        desc: String,
+        #[serde(default)]
+        shell: String,
+    },
+}
+
+impl From<TestEntryDe> for TestEntry {
+    fn from(de: TestEntryDe) -> TestEntry {
+        match de {
+            TestEntryDe::Script(shell) => {
+                let id = shell.trim_end_matches(".sh").to_string();
+                TestEntry { id: id.clone(), name: id, desc: String::new(), shell }
+            }
+            TestEntryDe::Entry { id, name, desc, shell } => {
+                let id = if id.is_empty() { shell.trim_end_matches(".sh").to_string() } else { id };
+                TestEntry { id, name, desc, shell }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct TestGroup {
     pub label: String,
+    /// What this group is supposed to prove — surfaced in the testing UI.
+    pub desc: String,
+    /// Gates the STATE of sweep-born fix items, never their existence: red run →
+    /// fix item `queued` when true (work proceeds next pick), `todo` when false
+    /// (sits for human review). Defaults false.
+    pub auto_fix: bool,
     pub lastrun: String,
     pub result: String,
     pub counts: String,
-    pub testlist: Vec<String>,
+    pub testlist: Vec<TestEntry>,
+}
+
+impl TestGroup {
+    /// "Provably green right now": the last recorded run passed.
+    pub fn is_green(&self) -> bool {
+        self.result == "passed"
+    }
 }
 
 /// Parse the `iterapp:testgroups` JSONL block from a testgroups.iter.md document.
@@ -53,18 +114,58 @@ pub fn update(content: &str, groups: &[TestGroup]) -> String {
     format!("{}\n\n{}\n", content.trim_end(), block)
 }
 
+/// Every testgroup file under `code_root` (skipping VCS/build noise), identified
+/// by FILENAME role: any `*testgroup.iter.md` (see markers::role_of). Scripts and
+/// the `runs/` history resolve relative to the file's directory; which C4 object
+/// OWNS a file is declared by that object's marker (`testgroup:` key), never
+/// inferred from position.
+pub fn find_files(code_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_files(code_root, &mut out);
+    out.sort();
+    out
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_dir() {
+            if matches!(name.as_str(), ".git" | "target" | "node_modules") {
+                continue;
+            }
+            collect_files(&path, out);
+        } else if crate::markers::role_of(&name) == Some(crate::markers::Role::Testgroup) {
+            out.push(path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_sample_testgroups() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sample/test/testgroups.iter.md");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sample/test/testgroup.iter.md");
         let content = std::fs::read_to_string(path).unwrap();
         let groups = parse(&content);
         assert_eq!(groups.len(), 3);
         assert_eq!(groups[0].label, "default greeting");
-        assert_eq!(groups[2].testlist, vec!["testscript03.sh"]);
+        assert_eq!(groups[2].testlist[0].shell, "testscript03.sh");
+    }
+
+    #[test]
+    fn bare_string_testlist_still_parses() {
+        let doc = "<!-- iterapp:testgroups\n{\"label\":\"legacy\",\"testlist\":[\"testscript03.sh\",{\"id\":\"t2\",\"name\":\"named\",\"desc\":\"d\",\"shell\":\"t2.sh\"}]}\n-->";
+        let groups = parse(doc);
+        assert_eq!(groups[0].testlist.len(), 2);
+        assert_eq!(groups[0].testlist[0].id, "testscript03");
+        assert_eq!(groups[0].testlist[0].shell, "testscript03.sh");
+        assert_eq!(groups[0].testlist[1].id, "t2");
+        assert_eq!(groups[0].testlist[1].name, "named");
+        assert!(!groups[0].auto_fix, "auto_fix defaults false");
     }
 
     #[test]
@@ -78,6 +179,7 @@ mod tests {
         let reparsed = parse(&updated);
         assert_eq!(reparsed[0].result, "passed");
         assert_eq!(reparsed[0].counts, "5/5");
+        assert!(reparsed[0].is_green());
     }
 
     #[test]
@@ -87,5 +189,20 @@ mod tests {
         let updated = update(doc, &groups);
         assert_eq!(parse(&updated).len(), 1);
         assert!(updated.starts_with("# no block here"));
+    }
+
+    #[test]
+    fn finds_testgroup_files_by_filename_role() {
+        let root = std::env::temp_dir().join(format!("iter-tgfind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("comp/test")).unwrap();
+        std::fs::create_dir_all(root.join("target/skip")).unwrap();
+        std::fs::write(root.join("comp/test/testgroup.iter.md"), "x").unwrap();
+        std::fs::write(root.join("comp/extra.testgroup.iter.md"), "x").unwrap();
+        std::fs::write(root.join("comp/testgroups.iter.md"), "x").unwrap(); // old plural: NOT the role
+        std::fs::write(root.join("target/skip/testgroup.iter.md"), "x").unwrap();
+        let found = find_files(&root);
+        assert_eq!(found.len(), 2, "singular-suffix files only, target/ skipped: {:?}", found);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

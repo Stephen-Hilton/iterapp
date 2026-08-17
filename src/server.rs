@@ -125,7 +125,7 @@ pub fn project_settings(project_root: &Path) -> Value {
         "url_slug": cleaned.trim_matches('-'),
         "scan_roots": ["."],
         "marker_glob": "**/*.iter.md",
-        "testgroups_glob": "**/testgroups.iter.md",
+        "testgroups_glob": "**/*testgroup.iter.md",
         "default_context": ["{marker}", "{ancestor_markers}", "{interfaces}"],
     });
     if let Ok(text) = std::fs::read_to_string(project_root.join(".iter/projects.json")) {
@@ -136,6 +136,18 @@ pub fn project_settings(project_root: &Path) -> Value {
         }
     }
     settings
+}
+
+/// The project's marker scan roots (projects.json `scan_roots`) resolved to
+/// absolute paths — `~` expanded, relative values resolved against the project
+/// root. THE one resolution everything must share (API, sweep, validate,
+/// stubdesc): pdy's roots are written as `~/dev/pdy-dev/`, and a resolver that
+/// forgets `~` silently scans nothing.
+pub fn scan_roots(project: &Path) -> Vec<PathBuf> {
+    project_settings(project)["scan_roots"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(expand_root(project)).collect())
+        .unwrap_or_else(|| vec![project.to_path_buf()])
 }
 
 /* ------------------------------------------------------------ http plumbing */
@@ -276,6 +288,15 @@ fn route(req: &Req, engine: &Engine, port: u16) -> Resp {
         ("GET", ["api", "projectsettings"]) => json_resp(200, project_settings(project)),
         ("PUT", ["api", "projectsettings"]) => api_projectsettings_put(req, project),
         ("GET", ["api", "markers"]) | ("POST", ["api", "markers", "rescan"]) => api_markers(project),
+        ("POST", ["api", "file", "read"]) => api_file_read(req, project),
+        ("PUT", ["api", "file"]) => api_file_write(req, project),
+        ("GET", ["api", "testgroups"]) => api_testgroups(project),
+        ("POST", ["api", "testgroups", "autofix"]) => api_testgroups_autofix(req, project),
+        ("POST", ["api", "testruns"]) => api_testruns(req, project),
+        ("POST", ["api", "validate"]) => api_validate(req, project),
+        ("POST", ["api", "usecases"]) => api_usecases(req, project, "create"),
+        ("PUT", ["api", "usecases"]) => api_usecases(req, project, "update"),
+        ("POST", ["api", "usecases", "delete"]) => api_usecases(req, project, "delete"),
         ("GET", ["api", "servers"]) => {
             json_resp(200, serde_json::to_value(registry::live()).unwrap_or_else(|_| json!([])))
         }
@@ -382,13 +403,15 @@ fn api_meta(project: &Path) -> Resp {
         .unwrap_or_default();
     prepost.sort();
     let settings = project_settings(project);
+    let code_root = config::code_root(project, &config::load(project));
     json_resp(
         200,
         json!({
             "agents": agents,
             "prepostwork": prepost,
             "project_root": project.canonicalize().unwrap_or_else(|_| project.to_path_buf()).to_string_lossy(),
-            "code_root": config::code_root(project, &config::load(project)).to_string_lossy(),
+            "code_root": code_root.to_string_lossy(),
+            "reqs_dir": context::reqs_dir(project, &code_root).to_string_lossy(),
             "project_name": settings["project_name"],
             "url_slug": settings["url_slug"],
             "default_context": settings["default_context"],
@@ -451,8 +474,10 @@ fn api_get(project: &Path, id: &str) -> Resp {
     }
 }
 
-const EDITABLE: &[&str] =
-    &["title", "type", "priority", "risk", "source", "codepath", "context", "testfiles", "prework", "postwork", "mainwork"];
+const EDITABLE: &[&str] = &[
+    "title", "type", "priority", "risk", "source", "codepath", "codepath_ignore", "context", "testfiles", "prework",
+    "postwork", "mainwork",
+];
 
 fn api_patch(req: &Req, project: &Path, id: &str) -> Resp {
     let Ok(Value::Object(patch)) = serde_json::from_slice::<Value>(&req.body) else {
@@ -595,7 +620,8 @@ fn api_tests(project: &Path, id: &str) -> Resp {
     } else {
         code_root.join(&item.codepath)
     };
-    let (files, _warnings) = context::resolve(&item.testfiles, &codepath, &code_root);
+    let reqs = context::reqs_dir(project, &code_root);
+    let (files, _warnings) = context::resolve(&item.testfiles, &codepath, &code_root, &reqs);
     let groups: Vec<Value> = files
         .iter()
         .filter_map(|f| {
@@ -791,13 +817,400 @@ fn api_projectsettings_put(req: &Req, project: &Path) -> Resp {
 
 fn api_markers(project: &Path) -> Resp {
     let settings = project_settings(project);
-    let roots: Vec<PathBuf> = settings["scan_roots"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(expand_root(project)).collect())
-        .unwrap_or_else(|| vec![project.to_path_buf()]);
+    let roots = scan_roots(project);
     let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md");
-    let scan = markers::scan(project, &roots, glob);
+    let mut scan = markers::scan(project, &roots, glob);
+    if scan.usecases.is_empty() && seed_starter_usecase(project) {
+        scan = markers::scan(project, &roots, glob); // pick the seeded file up
+    }
     json_resp(200, serde_json::to_value(scan).unwrap_or(Value::Null))
+}
+
+/// A project with zero use-cases gets a starter: the getting-started story of this
+/// very app. Seeded ONCE (flag file) so deleting it is a real delete, not a respawn.
+fn seed_starter_usecase(project: &Path) -> bool {
+    let flag = config::engine_dir(project).join("usecases_seeded");
+    if flag.exists() {
+        return false;
+    }
+    let dir = config::usecase_dir(project, &config::load(project));
+    let path = dir.join("install-iter-framework.usecase.iter.md");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let stub = r#"---
+name: "Install iter framework"
+description: "Getting started: install iterapp, scaffold a project, and run the first loop"
+participants:
+  - 1 .
+---
+
+# Install the iter framework
+
+The getting-started use-case for iterapp itself: from an empty directory to a
+running loop with agents picking up work. (This is a seeded starter — edit it,
+repoint the participants at your real nodes, or delete it.)
+
+## Steps
+
+1. **Get the binary.** Build from source (`cargo build --release`) or copy a
+   built `iter` onto the box. Deploy with a fresh inode (`rm` + `cp`, or
+   `cp` + `mv`) — never overwrite a live executable in place.
+2. **Scaffold.** `iter init .` (or just `iter start` — missing pieces heal on
+   boot) creates `.iter/`: agent personas in `agents/`, pre/post steps in
+   `prepostwork/`, engine config in `.engine/config.json`, and the project-wide
+   requirements home in `reqs/`.
+3. **Describe the project.** Drop a `level: project` marker (`*.iter.md`) at the
+   code root so the Projects map has a top; add component markers as you go.
+   Fill `reqs/bizreq.iter.md` and `reqs/techreq.iter.md` with the requirements
+   every agent should know.
+4. **Tune.** Review `.iter/.engine/config.json` (models, budgets, agent caps)
+   and Project Settings in the webapp (scan roots, default context).
+5. **Run.** `iter start` launches the engine plus this webapp and prints the
+   URL. `iter stop --wait` drains cleanly.
+6. **Feed it.** Create the first work item — from a Projects node, the New
+   WorkItem form, or `"$ITER_BIN" add ...` — and watch the loop take it from
+   `queued` to `complete`.
+"#;
+    if std::fs::write(&path, stub).is_err() {
+        return false;
+    }
+    let _ = std::fs::write(&flag, workitems::now_iso());
+    true
+}
+
+/// Shape a use-case marker file from its parts. Participants are "step key" lines.
+fn usecase_file_text(name: &str, description: &str, participants: &[String], body: &str) -> String {
+    let clean = |s: &str| s.replace(['"', '\n', '\r'], " ").trim().to_string();
+    let mut t = format!("---\nname: \"{}\"\ndescription: \"{}\"\nparticipants:\n", clean(name), clean(description));
+    for p in participants {
+        let p = p.trim();
+        if !p.is_empty() {
+            t.push_str(&format!("  - {}\n", p));
+        }
+    }
+    t.push_str("---\n\n");
+    t.push_str(body.trim_end());
+    t.push('\n');
+    t
+}
+
+/// Validate a client-supplied path for use-case update/delete: must exist, live
+/// under the project or code root, and BE a use-case BY FILENAME (`*usecase.iter.md`
+/// — the filename declares the role) — this endpoint must not touch other file kinds.
+fn usecase_path(project: &Path, raw: &str) -> Result<PathBuf, String> {
+    if raw.is_empty() {
+        return Err("missing file".into());
+    }
+    let path = PathBuf::from(raw);
+    let path = path.canonicalize().map_err(|e| format!("no such file: {}", e))?;
+    let fname = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    if markers::role_of(&fname) != Some(markers::Role::Usecase) {
+        return Err("not a use-case file (the name must end in usecase.iter.md)".into());
+    }
+    let code_root = config::code_root(project, &config::load(project));
+    let proj = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
+    if !path.starts_with(&proj) && !path.starts_with(&code_root) {
+        return Err("file is outside the project".into());
+    }
+    Ok(path)
+}
+
+/// POST /api/usecases (create), PUT /api/usecases (update: body carries `file`),
+/// POST /api/usecases/delete. Use-cases are ordinary marker files; created ones land
+/// in `globalsettings.usecase_default_location` (default `{codepath}/usecases/` —
+/// keep it inside the project or code root, or update/delete will refuse the path),
+/// updates rewrite the file wherever it already lives.
+fn api_usecases(req: &Req, project: &Path, action: &str) -> Resp {
+    let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_resp(400, "body must be a JSON object");
+    };
+    let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let participants: Vec<String> = body
+        .get("participants")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+    match action {
+        "delete" => match usecase_path(project, &s("file")) {
+            Ok(path) => match std::fs::remove_file(&path) {
+                Ok(()) => json_resp(200, json!({ "deleted": path.to_string_lossy() })),
+                Err(e) => err_resp(500, &format!("cannot delete: {}", e)),
+            },
+            Err(e) => err_resp(400, &e),
+        },
+        "create" | "update" => {
+            let (name, description) = (s("name"), s("description"));
+            if name.trim().is_empty() {
+                return err_resp(400, "a use-case needs a name");
+            }
+            // Participants are optional: the FILENAME (*usecase.iter.md) classifies
+            // the file; participant lines only thread it through the tree.
+            let path = if action == "update" {
+                match usecase_path(project, &s("file")) {
+                    Ok(p) => p,
+                    Err(e) => return err_resp(400, &e),
+                }
+            } else {
+                let slug: String = name
+                    .to_lowercase()
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    .collect();
+                let slug = slug.trim_matches('-').to_string();
+                let dir = config::usecase_dir(project, &config::load(project));
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    return err_resp(500, &format!("cannot create {}: {}", dir.display(), e));
+                }
+                // The filename IS the role: created use-cases are *.usecase.iter.md.
+                let p = dir.join(format!("{}.usecase.iter.md", if slug.is_empty() { "new" } else { &slug }));
+                if p.exists() {
+                    return err_resp(409, &format!("{} already exists — edit it instead", p.display()));
+                }
+                p
+            };
+            match std::fs::write(&path, usecase_file_text(&name, &description, &participants, &s("body"))) {
+                Ok(()) => json_resp(if action == "create" { 201 } else { 200 }, json!({ "file": path.to_string_lossy() })),
+                Err(e) => err_resp(500, &format!("cannot write {}: {}", path.display(), e)),
+            }
+        }
+        _ => err_resp(404, "no such usecase action"),
+    }
+}
+
+/* -------------------------------------------------- file + testgroups API */
+
+/// Containment check for client-supplied paths: must resolve inside the project
+/// root or the code root. `path` must already be canonical.
+fn path_contained(project: &Path, path: &Path) -> bool {
+    let proj = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
+    let code_root = config::code_root(project, &config::load(project));
+    path.starts_with(&proj) || path.starts_with(&code_root)
+}
+
+fn body_str<'a>(body: &'a Value, key: &str) -> &'a str {
+    body.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// POST /api/file/read {path} → {path, content, readonly}. Read-only surface for
+/// the UI's lightboxes: markdown (markers, requirements), run logs, and test
+/// scripts. Files under the project-wide reqs dir are flagged readonly — the
+/// global bizreq/techreq are never edited through the UI.
+fn api_file_read(req: &Req, project: &Path) -> Resp {
+    let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_resp(400, "body must be a JSON object");
+    };
+    let raw = body_str(&body, "path");
+    let path = match PathBuf::from(raw).canonicalize() {
+        Ok(p) => p,
+        Err(e) => return err_resp(404, &format!("no such file: {}", e)),
+    };
+    if !path_contained(project, &path) {
+        return err_resp(400, "path is outside the project");
+    }
+    let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let ok_ext = name.ends_with(".md") || name.ends_with(".log") || name.ends_with(".sh") || name.ends_with(".txt");
+    if !ok_ext {
+        return err_resp(400, "only .md, .log, .sh, and .txt files are readable here");
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return err_resp(500, &format!("cannot read: {}", e)),
+    };
+    let reqs = context::reqs_dir(project, &config::code_root(project, &config::load(project)));
+    let readonly = path.starts_with(&reqs) || !name.ends_with(".md");
+    json_resp(200, json!({ "path": path.to_string_lossy(), "content": content, "readonly": readonly }))
+}
+
+/// PUT /api/file {path, content} — markdown only, inside the project/code root,
+/// and NEVER under the project-wide reqs dir (the global bizreq/techreq are
+/// read-only by design; edit them on disk deliberately). The file may be new
+/// (e.g. a component's first local bizreq.iter.md): the parent must exist.
+fn api_file_write(req: &Req, project: &Path) -> Resp {
+    let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_resp(400, "body must be a JSON object");
+    };
+    let raw = body_str(&body, "path");
+    let Some(content) = body.get("content").and_then(|v| v.as_str()) else {
+        return err_resp(400, "missing content");
+    };
+    if raw.is_empty() {
+        return err_resp(400, "missing path");
+    }
+    let path = PathBuf::from(raw);
+    let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    if !name.ends_with(".md") {
+        return err_resp(400, "only markdown files are writable here");
+    }
+    let parent = match path.parent().and_then(|p| p.canonicalize().ok()) {
+        Some(p) => p,
+        None => return err_resp(400, "parent directory does not exist"),
+    };
+    let path = parent.join(&name);
+    if !path_contained(project, &path) {
+        return err_resp(400, "path is outside the project");
+    }
+    let reqs = context::reqs_dir(project, &config::code_root(project, &config::load(project)));
+    if path.starts_with(&reqs) {
+        return err_resp(403, &format!("global requirements are read-only in the UI — edit {} on disk deliberately", path.display()));
+    }
+    let tmp = path.with_extension("md.tmp");
+    if std::fs::write(&tmp, content).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        return err_resp(500, "cannot write file");
+    }
+    json_resp(200, json!({ "path": path.to_string_lossy() }))
+}
+
+/// GET /api/testgroups — marker-driven, matching the sweep: each `level:` marker
+/// file's MANDATORY `testgroup:` key names its testgroup.iter.md (no key = that
+/// C4 object is deliberately untested). `test_dir` in the response is the
+/// directory holding the testgroup.iter.md — where the `runs/` history lives.
+/// testgroup.iter.md files no marker claims are listed as orphans.
+fn api_testgroups(project: &Path) -> Resp {
+    let settings = project_settings(project);
+    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md");
+    let roots = scan_roots(project);
+    let scan = markers::scan(project, &roots, glob);
+    let mut claimed: Vec<PathBuf> = Vec::new();
+    let files: Vec<Value> = scan
+        .nodes
+        .iter()
+        .filter(|n| !n.testgroup.is_empty())
+        .map(|n| {
+            let object_dir = PathBuf::from(&n.dir);
+            let declared = object_dir.join(&n.testgroup);
+            match declared.canonicalize().ok().and_then(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t))) {
+                Some((tg_file, text)) => {
+                    claimed.push(tg_file.clone());
+                    json!({
+                        "file": tg_file.to_string_lossy(),
+                        "test_dir": tg_file.parent().unwrap_or(&object_dir).to_string_lossy(),
+                        "c4_dir": n.dir,
+                        "c4_key": n.key,
+                        "c4_name": n.name,
+                        "c4_level": n.level,
+                        "marker": n.path,
+                        "groups": testgroups::parse(&text),
+                    })
+                }
+                None => json!({
+                    "file": declared.to_string_lossy(),
+                    "missing": true,
+                    "c4_dir": n.dir,
+                    "c4_key": n.key,
+                    "c4_name": n.name,
+                    "c4_level": n.level,
+                    "marker": n.path,
+                    "groups": [],
+                }),
+            }
+        })
+        .collect();
+    let code_root = config::code_root(project, &config::load(project));
+    let orphans: Vec<String> = testgroups::find_files(&code_root)
+        .into_iter()
+        .filter(|f| {
+            let canon = f.canonicalize().unwrap_or_else(|_| f.clone());
+            !claimed.contains(&canon)
+        })
+        .map(|f| f.to_string_lossy().into_owned())
+        .collect();
+    let undeclared: Vec<Value> = scan
+        .nodes
+        .iter()
+        .filter(|n| n.testgroup.is_empty())
+        .map(|n| json!({ "c4_name": n.name, "c4_level": n.level, "marker": n.path }))
+        .collect();
+    json_resp(200, json!({ "files": files, "orphans": orphans, "undeclared": undeclared }))
+}
+
+/// POST /api/testgroups/autofix {file, label, auto_fix} — flip one group's
+/// auto-fix gate (queued vs todo for sweep-born fix items).
+fn api_testgroups_autofix(req: &Req, project: &Path) -> Resp {
+    let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_resp(400, "body must be a JSON object");
+    };
+    let label = body_str(&body, "label");
+    let Some(auto_fix) = body.get("auto_fix").and_then(|v| v.as_bool()) else {
+        return err_resp(400, "auto_fix must be true or false");
+    };
+    let path = match PathBuf::from(body_str(&body, "path")).canonicalize() {
+        Ok(p) => p,
+        Err(e) => return err_resp(404, &format!("no such file: {}", e)),
+    };
+    if !path_contained(project, &path)
+        || path.file_name().map(|f| markers::role_of(&f.to_string_lossy()) != Some(markers::Role::Testgroup)).unwrap_or(true)
+    {
+        return err_resp(400, "path must be a *testgroup.iter.md file inside the project");
+    }
+    let Ok(content) = std::fs::read_to_string(&path) else { return err_resp(500, "cannot read file") };
+    let mut groups = testgroups::parse(&content);
+    let Some(g) = groups.iter_mut().find(|g| g.label == label) else {
+        return err_resp(404, "no such testgroup in this file");
+    };
+    g.auto_fix = auto_fix;
+    let updated = testgroups::update(&content, &groups);
+    if std::fs::write(&path, updated).is_err() {
+        return err_resp(500, "cannot write file");
+    }
+    json_resp(200, json!({ "label": label, "auto_fix": auto_fix }))
+}
+
+/// POST /api/testruns {dir} → the run-history files under `<dir>/runs/`,
+/// newest first (timestamped filenames make time-ordering = name-ordering).
+fn api_testruns(req: &Req, project: &Path) -> Resp {
+    let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+        return err_resp(400, "body must be a JSON object");
+    };
+    let dir = match PathBuf::from(body_str(&body, "dir")).canonicalize() {
+        Ok(p) => p,
+        Err(e) => return err_resp(404, &format!("no such directory: {}", e)),
+    };
+    if !path_contained(project, &dir) {
+        return err_resp(400, "dir is outside the project");
+    }
+    let runs_dir = dir.join("runs");
+    let mut rows: Vec<Value> = std::fs::read_dir(&runs_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().map(|x| x == "log").unwrap_or(false))
+                .filter_map(|e| {
+                    let meta = e.metadata().ok()?;
+                    Some(json!({
+                        "name": e.file_name().to_string_lossy(),
+                        "path": e.path().to_string_lossy(),
+                        "size": meta.len(),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str()));
+    json_resp(200, json!({ "runs": rows }))
+}
+
+/// POST /api/validate {path?, fix?} — the same role-aware checks as `iter
+/// validate`. Without `path` every *.iter.md under the scan roots is checked;
+/// with `path` just that file (which must sit inside the project or code root).
+/// `fix: true` applies the safe mechanical corrections in place.
+fn api_validate(req: &Req, project: &Path) -> Resp {
+    let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    let fix = body.get("fix").and_then(|v| v.as_bool()).unwrap_or(false);
+    let single = body.get("path").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let single_path = match single {
+        Some(raw) => match PathBuf::from(raw).canonicalize() {
+            Ok(p) if path_contained(project, &p) => Some(p),
+            Ok(_) => return err_resp(400, "path is outside the project"),
+            Err(e) => return err_resp(404, &format!("no such file: {}", e)),
+        },
+        None => None,
+    };
+    let roots = scan_roots(project);
+    match crate::validate::run(&roots, single_path.as_deref(), fix) {
+        Ok(report) => json_resp(200, serde_json::to_value(&report).unwrap_or(Value::Null)),
+        Err(e) => err_resp(500, &e.to_string()),
+    }
 }
 
 fn expand_root(project: &Path) -> impl Fn(&str) -> PathBuf + '_ {
@@ -914,7 +1327,7 @@ mod tests {
         let d = project_settings(&dir);
         assert_eq!(d["project_name"], "X");
         assert_eq!(d["marker_glob"], "**/*.x.md");
-        assert_eq!(d["testgroups_glob"], "**/testgroups.iter.md", "unset keys keep defaults");
+        assert_eq!(d["testgroups_glob"], "**/*testgroup.iter.md", "unset keys keep defaults");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

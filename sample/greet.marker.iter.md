@@ -2,6 +2,8 @@
 name: Greet
 level: project
 description: "Tiny CLI greeter used to demo iterloop end-to-end"
+testgroup: test/testgroup.iter.md
+test_dir: test
 ---
 
 # Greet — project context

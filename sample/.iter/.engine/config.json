@@ -31,5 +31,14 @@
         "snapshot_stale_warn_sec": 900,
         "snapshot_path": "~/.claude/iter-usage-snapshot.json",
         "probe_model": "haiku"
+    },
+    "testing": {
+        "test_sweep_active": true,
+        "minutes_between_test_sweeps": 120,
+        "test_green_stale_hours": 24,
+        "test_sweep_timeout_minutes": 10,
+        "parallel_test_concurrency": 3,
+        "workitem_priority_lastrun_not_green": 4,
+        "workitem_priority_lastrun_green": 2
     }
 }

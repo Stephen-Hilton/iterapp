@@ -204,7 +204,11 @@ mod tests {
         assert_eq!(code.model_flags, "--dangerously-skip-permissions");
         assert_eq!(code.llm_run_mode, "headless");
         assert!(code.body.contains("code"));
-        assert!(agents.len() >= 6, "expected 6 template agents, got {}", agents.len());
+        assert!(agents.len() >= 5, "expected 5 template agents, got {}", agents.len());
+        assert!(
+            !agents.iter().any(|a| a.type_name == "test"),
+            "the test agent is retired — the deterministic sweep runs tests now"
+        );
         assert!(
             !agents.iter().any(|a| a.type_name.starts_with('_')),
             "underscore-prefixed helper files must not become agent types"

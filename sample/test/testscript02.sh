@@ -15,4 +15,5 @@ case "$(./src/greet.sh Ada)" in
 esac
 
 total=$((pass+fail))
-if [ "$fail" -eq 0 ]; then echo "passed $pass/$total"; exit 0; else echo "failed $pass/$total"; exit 1; fi
+echo "ITER_RESULT pass=$pass fail=$fail total=$total"
+if [ "$fail" -eq 0 ]; then exit 0; else exit 1; fi

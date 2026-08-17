@@ -51,6 +51,16 @@ pub struct GlobalSettings {
     pub test_min: u32,
     pub test_max: u32,
     pub test_default_path: String,
+    /// The per-component test directory name (relative to a component's root).
+    /// Definitive, not a guess: testwriter items scope their codepath/lock to
+    /// `<component>/<test_dir>` and code items list `<test_dir>/` in codepath_ignore
+    /// so the two can run in parallel. Exported to agents as ITER_TEST_DIR.
+    pub test_dir: String,
+    /// Where NEW use-case files are created (webapp CRUD, starter seed). Creation
+    /// only — the scanner finds `*usecase.iter.md` anywhere, so there is no
+    /// preferred read location. `{codepath}` expands to the resolved code root;
+    /// a relative path resolves against the engine home.
+    pub usecase_default_location: String,
     pub log_default_path: String,
     pub log_level: String,
     pub log_max_size_mb: u64,
@@ -65,10 +75,49 @@ impl Default for GlobalSettings {
             test_min: 20,
             test_max: 100,
             test_default_path: "./test*/".into(),
+            test_dir: "test".into(),
+            usecase_default_location: "{codepath}/usecases/".into(),
             log_default_path: "./logs/{YYYYMMDD-hh}.log".into(),
             log_level: "info".into(),
             log_max_size_mb: 10,
             log_max_files: 50,
+        }
+    }
+}
+
+/// The deterministic test engine (see runtests.rs / testsweep.rs): every test is a
+/// shell script; the sweep re-runs testgroups that aren't provably green and births
+/// fix work items from red runs. Priorities are higher-is-sooner (default work is 5,
+/// so sweep items fill idle capacity instead of starving user work).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TestingConfig {
+    pub test_sweep_active: bool,
+    /// Sweep cadence: how often the engine wakes to interrogate all testgroups.
+    pub minutes_between_test_sweeps: u64,
+    /// A group with a green run newer than this is left alone by the sweep.
+    pub test_green_stale_hours: u64,
+    /// Wall-clock budget for one testgroup's scripts, shared across the group;
+    /// a script still running at the deadline is killed and recorded as `error`.
+    pub test_sweep_timeout_minutes: u64,
+    /// How many testgroups run concurrently during a sweep.
+    pub parallel_test_concurrency: usize,
+    /// Priority for fix items born from a group with no green run recorded.
+    pub workitem_priority_lastrun_not_green: i64,
+    /// Priority for fix items born from a group whose green run went stale.
+    pub workitem_priority_lastrun_green: i64,
+}
+
+impl Default for TestingConfig {
+    fn default() -> Self {
+        TestingConfig {
+            test_sweep_active: true,
+            minutes_between_test_sweeps: 120,
+            test_green_stale_hours: 24,
+            test_sweep_timeout_minutes: 10,
+            parallel_test_concurrency: 3,
+            workitem_priority_lastrun_not_green: 4,
+            workitem_priority_lastrun_green: 2,
         }
     }
 }
@@ -120,6 +169,7 @@ pub struct Config {
     pub engine: EngineConfig,
     pub globalsettings: GlobalSettings,
     pub limits: LimitsConfig,
+    pub testing: TestingConfig,
 }
 
 pub fn engine_dir(project_root: &Path) -> std::path::PathBuf {
@@ -143,6 +193,16 @@ pub fn code_root(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
     let path = std::path::PathBuf::from(&p);
     let abs = if path.is_absolute() { path } else { project_root.join(path) };
     abs.canonicalize().unwrap_or(abs)
+}
+
+/// Directory where NEW use-case files are created
+/// (`globalsettings.usecase_default_location`, default `{codepath}/usecases/`).
+pub fn usecase_dir(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
+    let raw = cfg.globalsettings.usecase_default_location.trim();
+    let raw = if raw.is_empty() { "{codepath}/usecases/" } else { raw };
+    let expanded = raw.replace("{codepath}", &code_root(project_root, cfg).to_string_lossy());
+    let path = std::path::PathBuf::from(expanded);
+    if path.is_absolute() { path } else { project_root.join(path) }
 }
 
 pub fn load(project_root: &Path) -> Config {

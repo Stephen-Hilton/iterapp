@@ -35,6 +35,18 @@ pub struct WorkItem {
     pub priority: i64,
     pub risk: i64,
     pub codepath: String,
+    /// Gitignore-like patterns (relative to codepath) carved OUT of this item's lock
+    /// scope: the item neither locks nor may edit those subtrees, so another item can
+    /// work there in parallel (e.g. code owns `pth/object/` ignoring `test/` while a
+    /// testwriter owns `pth/object/test/`).
+    pub codepath_ignore: Vec<String>,
+    /// Provenance of sweep-born fix items: the testgroup label this item exists to
+    /// turn green. Dedup key (one open item per group), the `--broken`/`--fixed`
+    /// target, and the UI's run-history → workitem link. Empty on ordinary items.
+    pub source_testgroup: String,
+    /// Informational snapshot: which tests were red when this item was born.
+    /// Diagnosis starting point only — enforcement is group-level.
+    pub source_tests: Vec<String>,
     pub context: Vec<String>,
     pub testfiles: Vec<String>,
     pub prework: Vec<String>,
@@ -57,6 +69,9 @@ impl Default for WorkItem {
             priority: 5,
             risk: 0,
             codepath: ".".into(),
+            codepath_ignore: Vec::new(),
+            source_testgroup: String::new(),
+            source_tests: Vec::new(),
             context: Vec::new(),
             testfiles: Vec::new(),
             prework: Vec::new(),
@@ -265,7 +280,7 @@ mod tests {
         let cfg = Config::default();
         let queue = Queue::new(&root, &cfg);
         let items = queue.load();
-        assert_eq!(items.len(), 4, "expected 4 seed items");
+        assert_eq!(items.len(), 3, "expected 3 seed items (no test items — the sweep runs tests)");
         let code = items.iter().find(|i| i.item_type == "code").unwrap();
         assert_eq!(code.state, STATE_QUEUED);
         assert_eq!(code.prework, vec!["git-pull"]);

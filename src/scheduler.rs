@@ -45,10 +45,11 @@ struct Shared {
     /// Codepath-conflict backoff: workid → don't re-pick before this instant. Purely
     /// in-memory noise suppression; a restart just retries sooner.
     deferred: Mutex<HashMap<String, Instant>>,
-    /// Resolved codepaths of items currently running in THIS engine (workid → path).
-    /// pick_next skips candidates that overlap one, so an occupied lock scope never
-    /// costs a pick; entries are removed when the worker thread finishes.
-    running_paths: Mutex<HashMap<String, PathBuf>>,
+    /// Resolved lock scopes of items currently running in THIS engine
+    /// (workid → (path, codepath_ignore)). pick_next skips candidates that overlap
+    /// one, so an occupied lock scope never costs a pick; entries are removed when
+    /// the worker thread finishes.
+    running_paths: Mutex<HashMap<String, (PathBuf, Vec<String>)>>,
     /// Usage-limit hold: pick nothing until this instant (set by a worker that hit a
     /// window limit; lifted early when a fresh snapshot shows utilization back
     /// under 95%). Unlike the stop signal, the engine stays alive and auto-resumes.
@@ -70,8 +71,20 @@ impl Drop for PathClaim {
 
 /// True when one path contains the other (or they are equal) — the same overlap rule
 /// the on-disk .iter.lock enforces between ancestors and descendants.
-fn paths_overlap(a: &Path, b: &Path) -> bool {
-    a.starts_with(b) || b.starts_with(a)
+/// Do two lock scopes overlap? Same-or-nested paths overlap UNLESS the outer scope's
+/// codepath_ignore patterns carve the inner path out (mirrors locks::ignored, which
+/// governs the on-disk `.iter.lock` conflict rules).
+fn scopes_overlap(a: &Path, a_ignore: &[String], b: &Path, b_ignore: &[String]) -> bool {
+    if a == b {
+        return true;
+    }
+    if let Ok(rel) = a.strip_prefix(b) {
+        return !locks::ignored(rel, b_ignore); // a is inside b's scope unless carved out
+    }
+    if let Ok(rel) = b.strip_prefix(a) {
+        return !locks::ignored(rel, a_ignore);
+    }
+    false
 }
 
 impl Shared {
@@ -152,6 +165,15 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
     let mut probe_last = Instant::now() - std::time::Duration::from_secs(24 * 3600);
     let mut probe_count: u64 = 0;
     let probe_in_flight = Arc::new(AtomicBool::new(false));
+    // Deterministic test sweep (testsweep.rs): first pass ~90s after start (a
+    // restart shouldn't immediately re-run every stale group), then on cadence.
+    let sweep_interval = |cfg: &Config| {
+        std::time::Duration::from_secs(cfg.testing.minutes_between_test_sweeps.max(1) * 60)
+    };
+    let mut sweep_last = Instant::now()
+        .checked_sub(sweep_interval(&shared.cfg()).saturating_sub(std::time::Duration::from_secs(90)))
+        .unwrap_or_else(Instant::now);
+    let sweep_in_flight = Arc::new(AtomicBool::new(false));
 
     loop {
         tick += 1;
@@ -274,7 +296,11 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
                 // Claim the resolved codepath before spawning, so a second pick in
                 // this same tick already sees it as occupied.
                 let resolved = resolve_codepath(&config::code_root(&shared.project_root, &cfg), &item.codepath);
-                shared.running_paths.lock().unwrap().insert(item.workid.clone(), resolved);
+                shared
+                    .running_paths
+                    .lock()
+                    .unwrap()
+                    .insert(item.workid.clone(), (resolved, item.codepath_ignore.clone()));
                 let claim = PathClaim { shared: Arc::clone(&shared), workid: item.workid.clone() };
                 let type_name = agent.type_name.clone();
                 let handle = std::thread::spawn(move || {
@@ -284,6 +310,31 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
                 running.push((type_name, handle));
                 std::thread::sleep(std::time::Duration::from_millis(cfg.engine.agent_stagger_ms));
             }
+        }
+
+        // Deterministic test sweep, on cadence, in its own thread (a group's whole
+        // run budget can be minutes — the tick loop must not stall). Draining or
+        // holding engines don't sweep: results would only mint work nobody picks.
+        if cfg.testing.test_sweep_active
+            && !stop_picking
+            && !holding
+            && !sweep_in_flight.load(Ordering::SeqCst)
+            && sweep_last.elapsed() >= sweep_interval(&cfg)
+        {
+            sweep_last = Instant::now();
+            sweep_in_flight.store(true, Ordering::SeqCst);
+            let sweep_root = project_root.clone();
+            let sweep_cfg = cfg.clone();
+            let flag = Arc::clone(&sweep_in_flight);
+            std::thread::spawn(move || {
+                logging::info("sweep", "test sweep starting");
+                let report = crate::testsweep::sweep(&sweep_root, &sweep_cfg);
+                logging::info("sweep", &report.summary());
+                for note in &report.notes {
+                    logging::info("sweep", note);
+                }
+                flag.store(false, Ordering::SeqCst);
+            });
         }
 
         // Tick summary (only when it changes, to keep the stream readable).
@@ -393,8 +444,9 @@ fn pick_next(shared: &Shared, allowed_types: &[&str]) -> Option<WorkItem> {
     let items = queue.load();
     let now = chrono::Utc::now();
     let code_root = config::code_root(&shared.project_root, &cfg);
-    let occupied: Vec<PathBuf> = shared.running_paths.lock().unwrap().values().cloned().collect();
+    let occupied: Vec<(PathBuf, Vec<String>)> = shared.running_paths.lock().unwrap().values().cloned().collect();
     let mut best: Option<usize> = None;
+    let mut best_repairs: Vec<String> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if !allowed_types.contains(&item.item_type.as_str())
             || !item.eligible(&cfg, now)
@@ -407,24 +459,45 @@ fn pick_next(shared: &Shared, allowed_types: &[&str]) -> Option<WorkItem> {
         // engine, or a leftover) covers it — is skipped, not picked, so it never
         // wastes the free agent slot. It's reconsidered fresh every tick.
         let cand_path = resolve_codepath(&code_root, &item.codepath);
-        if occupied.iter().any(|r| paths_overlap(r, &cand_path)) {
+        // Disjointness guard (features/TDD.md step 4): a code item whose scope
+        // swallows an OPEN testwriter item's scope is misconfigured — the plan
+        // agent forgot codepath_ignore. Repair deterministically (carve the test
+        // subtree out) instead of trusting prompts; the repair also applies to the
+        // overlap check below so the pair can actually run in parallel.
+        let repairs = disjointness_repairs(item, &cand_path, &items, &code_root, &cfg.globalsettings.test_dir);
+        let effective_ignore: Vec<String> =
+            item.codepath_ignore.iter().cloned().chain(repairs.iter().cloned()).collect();
+        if occupied.iter().any(|(r, r_ign)| scopes_overlap(r, r_ign, &cand_path, &effective_ignore)) {
             continue;
         }
         if locks::find_ancestor_lock(&cand_path, now).is_some() {
             continue;
         }
-        best = match best {
-            None => Some(i),
+        let better = match best {
+            None => true,
             Some(b) => {
-                let (cur, cand) = (&items[b], item);
-                let better = cand.effective_priority() > cur.effective_priority()
-                    || (cand.effective_priority() == cur.effective_priority()
-                        && cand.times.added < cur.times.added);
-                if better { Some(i) } else { Some(b) }
+                let cur = &items[b];
+                item.effective_priority() > cur.effective_priority()
+                    || (item.effective_priority() == cur.effective_priority()
+                        && item.times.added < cur.times.added)
             }
         };
+        if better {
+            best = Some(i);
+            best_repairs = repairs;
+        }
     }
     let workid = items[best?].workid.clone();
+    if !best_repairs.is_empty() {
+        logging::warn(
+            "engine",
+            &format!(
+                "disjointness guard: code item {} scope covered an open testwriter scope; auto-added codepath_ignore {:?}",
+                short(&workid),
+                best_repairs
+            ),
+        );
+    }
     // Claim under the record lock so the API server / iter add can't race the pick.
     let claimed = queue.with_lock(|items| {
         let item = items.iter_mut().find(|i| i.workid == workid)?;
@@ -434,6 +507,7 @@ fn pick_next(shared: &Shared, allowed_types: &[&str]) -> Option<WorkItem> {
         item.state = workitems::STATE_IN_PROGRESS.into();
         item.attempts += 1;
         item.times.start = workitems::now_iso();
+        item.codepath_ignore.extend(best_repairs.iter().cloned());
         Some(item.clone())
     });
     match claimed {
@@ -443,6 +517,43 @@ fn pick_next(shared: &Shared, allowed_types: &[&str]) -> Option<WorkItem> {
             None
         }
     }
+}
+
+/// The ignore patterns a `code` candidate is missing: one per open testwriter item
+/// whose TEST-DIR scope (`…/<test_dir>`, per globalsettings.test_dir) sits strictly
+/// inside the candidate's scope without being carved out. Tests belong to the
+/// testwriter — code items must never lock (or edit) them. Deliberately narrow:
+/// only test-dir-named scopes are carved, so a testwriter item with an odd codepath
+/// can never strip a code item of its own sources.
+fn disjointness_repairs(
+    item: &WorkItem,
+    cand_path: &Path,
+    items: &[WorkItem],
+    code_root: &Path,
+    test_dir: &str,
+) -> Vec<String> {
+    if item.item_type != "code" {
+        return Vec::new();
+    }
+    let mut repairs = Vec::new();
+    for other in items {
+        if other.item_type != "testwriter" || other.workid == item.workid {
+            continue;
+        }
+        let tw_path = resolve_codepath(code_root, &other.codepath);
+        if tw_path.file_name().map(|f| f != test_dir).unwrap_or(true) {
+            continue;
+        }
+        if let Ok(rel) = tw_path.strip_prefix(cand_path) {
+            if !rel.as_os_str().is_empty() && !locks::ignored(rel, &item.codepath_ignore) {
+                let pat = format!("{}/", rel.to_string_lossy());
+                if !repairs.contains(&pat) {
+                    repairs.push(pat);
+                }
+            }
+        }
+    }
+    repairs
 }
 
 fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: String) {
@@ -466,7 +577,7 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
     }
 
     // Codepath lock (see .iter/.engine/codepath_lock.md).
-    let lock = match locks::acquire_codepath_lock(&codepath, &item.workid, &agent.type_name, lock_timeout) {
+    let lock = match locks::acquire_codepath_lock(&codepath, &item.workid, &agent.type_name, lock_timeout, &item.codepath_ignore) {
         Ok(lock) => {
             logging::info(&tag, &format!("codepath lock acquired: {}", codepath.display()));
             lock
@@ -764,7 +875,8 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
     // Relative context/testfile patterns resolve against code_root, like codepaths;
     // agent/source/prepostwork definitions stay with the engine home (.iter/).
     let code_root = config::code_root(&shared.project_root, &shared.cfg());
-    let (context_files, warnings) = context::resolve(&item.context, codepath, &code_root);
+    let reqs_dir = context::reqs_dir(&shared.project_root, &code_root);
+    let (context_files, warnings) = context::resolve(&item.context, codepath, &code_root, &reqs_dir);
     for w in &warnings {
         logging::warn(tag, w);
     }
@@ -782,6 +894,19 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
         codepath.display()
     ));
     spinup.push_str(&previous_attempt_section(item));
+    // Project-wide requirements are surfaced to EVERY work item — that is what makes
+    // the reqs dir first-class. Files already attached as context aren't repeated.
+    let reqs_files: Vec<_> =
+        context::reqs_files(&reqs_dir).into_iter().filter(|f| !context_files.contains(f)).collect();
+    if !reqs_files.is_empty() {
+        spinup.push_str(&format!(
+            "\n# Project-wide requirements ($ITER_REQS = {})\nGlobal requirements for the whole project — read what applies before starting:\n",
+            reqs_dir.display()
+        ));
+        for f in &reqs_files {
+            spinup.push_str(&format!("- {}\n", f.display()));
+        }
+    }
     if !context_files.is_empty() {
         spinup.push_str("\n# Context files\nRead each of these before starting:\n");
         for f in &context_files {
@@ -789,7 +914,7 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
         }
     }
     if item.item_type.starts_with("test") && !item.testfiles.is_empty() {
-        let (test_files, twarn) = context::resolve(&item.testfiles, codepath, &code_root);
+        let (test_files, twarn) = context::resolve(&item.testfiles, codepath, &code_root, &reqs_dir);
         for w in &twarn {
             logging::warn(tag, w);
         }
@@ -933,12 +1058,105 @@ mod tests {
             .running_paths
             .lock()
             .unwrap()
-            .insert("running".into(), root.join("a").canonicalize().unwrap());
-        let _lock = locks::acquire_codepath_lock(&root.join("b"), "other-engine", "code", 600).unwrap();
+            .insert("running".into(), (root.join("a").canonicalize().unwrap(), Vec::new()));
+        let _lock = locks::acquire_codepath_lock(&root.join("b"), "other-engine", "code", 600, &[]).unwrap();
         let picked = pick_next(&shared, &["code"]).expect("must keep moving down the queue");
         assert_eq!(picked.workid, "w-free");
         // Nothing else runnable now.
         assert!(pick_next(&shared, &["code"]).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pick_allows_item_inside_running_scopes_ignored_subtree() {
+        let root = std::env::temp_dir().join(format!("iterloop-cpign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("obj/test")).unwrap();
+        std::fs::create_dir_all(root.join("obj/src")).unwrap();
+        let shared = test_shared(&root);
+        // A code item is running on obj/ but its lock scope carves out test/.
+        shared
+            .running_paths
+            .lock()
+            .unwrap()
+            .insert("running-code".into(), (root.join("obj").canonicalize().unwrap(), vec!["test/".into()]));
+        // A testwriter item scoped to the carved-out subtree is runnable NOW…
+        let tw = WorkItem {
+            workid: "w-tw".into(),
+            item_type: "testwriter".into(),
+            priority: 5,
+            codepath: "obj/test".into(),
+            ..Default::default()
+        };
+        // …while a sibling touching non-ignored code is not.
+        let clash = WorkItem {
+            workid: "w-clash".into(),
+            item_type: "testwriter".into(),
+            priority: 9,
+            codepath: "obj/src".into(),
+            ..Default::default()
+        };
+        shared.queue().append(&clash).unwrap();
+        shared.queue().append(&tw).unwrap();
+        let picked = pick_next(&shared, &["testwriter"]).expect("ignored subtree must be pickable");
+        assert_eq!(picked.workid, "w-tw");
+        assert!(pick_next(&shared, &["testwriter"]).is_none(), "non-ignored sibling stays blocked");
+
+        // Mirror image: testwriter running on obj/test; a code item on obj/ that
+        // ignores test/ is pickable. One that doesn't gets REPAIRED by the
+        // disjointness guard (test/ carved out deterministically) and then runs
+        // in parallel too — misconfigured pairs are fixed, not trusted.
+        shared.running_paths.lock().unwrap().clear();
+        shared
+            .running_paths
+            .lock()
+            .unwrap()
+            .insert("running-tw".into(), (root.join("obj/test").canonicalize().unwrap(), Vec::new()));
+        let code_ign = WorkItem {
+            workid: "w-code-ign".into(),
+            item_type: "code".into(),
+            priority: 5,
+            codepath: "obj".into(),
+            codepath_ignore: vec!["test/".into()],
+            ..Default::default()
+        };
+        let code_full = WorkItem {
+            workid: "w-code-full".into(),
+            item_type: "code".into(),
+            priority: 9,
+            codepath: "obj".into(),
+            ..Default::default()
+        };
+        shared.queue().append(&code_full).unwrap();
+        shared.queue().append(&code_ign).unwrap();
+        let picked = pick_next(&shared, &["code"]).expect("guard-repaired item must be pickable");
+        assert_eq!(picked.workid, "w-code-full", "higher priority wins once the guard repairs its scope");
+        assert!(
+            picked.codepath_ignore.contains(&"test/".to_string()),
+            "the repair is persisted on the claimed item: {:?}",
+            picked.codepath_ignore
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disjointness_guard_carves_only_test_dirs() {
+        let root = std::env::temp_dir().join(format!("iterloop-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("obj/test")).unwrap();
+        std::fs::create_dir_all(root.join("obj/src")).unwrap();
+        let code_root = root.canonicalize().unwrap();
+        let code = WorkItem { workid: "w-code".into(), item_type: "code".into(), codepath: "obj".into(), ..Default::default() };
+        let tw_test = WorkItem { workid: "w-tw".into(), item_type: "testwriter".into(), codepath: "obj/test".into(), ..Default::default() };
+        let tw_weird = WorkItem { workid: "w-weird".into(), item_type: "testwriter".into(), codepath: "obj/src".into(), ..Default::default() };
+        let items = vec![code.clone(), tw_test, tw_weird];
+        let cand_path = resolve_codepath(&code_root, "obj");
+        let repairs = disjointness_repairs(&code, &cand_path, &items, &code_root, "test");
+        assert_eq!(repairs, vec!["test/".to_string()], "test dir carved, src/ never");
+        // Already-ignored scope needs no repair; non-code items are never repaired.
+        let mut ignoring = code.clone();
+        ignoring.codepath_ignore = vec!["test/".into()];
+        assert!(disjointness_repairs(&ignoring, &cand_path, &items, &code_root, "test").is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -109,6 +109,10 @@ fn run_engine(root: &Path, stub: &Path, timeout: Duration) -> String {
     let mut child = Command::new(BIN)
         .args(["run", "--project", root.to_str().unwrap(), "--until-idle"])
         .env("ITER_CLAUDE_BIN", stub)
+        // Isolate from the developer machine: ~ resolves inside the test root, so the
+        // REAL ~/.claude/iter-usage-snapshot.json (which may show 95%+ while other
+        // iter projects run on this box) can't throttle the test engine to 0 agents.
+        .env("HOME", root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -165,7 +169,8 @@ fn full_lifecycle_concurrency_and_handoff() {
     // mid-run via `iter add`, exactly like a real agent would.
     seed(&root, &workitem_json("e2e-code-1", "code", "code seed", "./src", "implement the thing", r#""git-pull""#, r#""git-commit""#));
     seed(&root, &workitem_json("e2e-plan-1", "plan", "plan seed", ".", "plan the thing HANDOFF_TRIGGER", "", ""));
-    seed(&root, &workitem_json("e2e-test-1", "test", "test seed", ".", "run the tests", r#""inline literal prework step""#, ""));
+    // (type "testwriter": the old test agent is retired — the deterministic sweep runs tests.)
+    seed(&root, &workitem_json("e2e-test-1", "testwriter", "testwriter seed", ".", "write the tests", r#""inline literal prework step""#, ""));
 
     let stdout = run_engine(&root, &stub, Duration::from_secs(120));
 
@@ -336,6 +341,7 @@ fn start_serves_webapp_and_runs_engine() {
     let port = 21000 + (std::process::id() % 20000) as u16;
     let mut child = Command::new(BIN)
         .args(["start", "--project", dest.to_str().unwrap(), "--port", &port.to_string()])
+        .env("HOME", &dest) // isolate ~ (usage snapshot, server registry) from the real machine
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -424,16 +430,16 @@ fn api_crud_history_markers_and_settings() {
         r#"{"engine":{"tick_interval_sec":1,"max_open_workitems":3},"globalsettings":{"log_default_path":""}}"#,
     )
     .unwrap();
-    // A marker tree: node, interface, use-case, plain doc.
+    // An iter-file tree: node, interface, plain doc — roles come from the FILENAMES.
     std::fs::create_dir_all(dest.join("svc")).unwrap();
-    std::fs::write(dest.join("root.iter.md"), "---\nname: API Test Project\nlevel: project\n---\n").unwrap();
+    std::fs::write(dest.join("root.marker.iter.md"), "---\nname: API Test Project\nlevel: project\n---\n").unwrap();
     std::fs::write(
-        dest.join("svc/svc.iter.md"),
+        dest.join("svc/svc.marker.iter.md"),
         "---\nname: Svc\nlevel: component\nuses: [pay-api]\nprovides: [svc-api]\n---\ncontext",
     )
     .unwrap();
     std::fs::write(
-        dest.join("svc/svc-api.iter.md"),
+        dest.join("svc/svc-api.interface.iter.md"),
         "---\ninterface: svc-api\nkind: http\nendpoint: GET /svc\n---\ncontract",
     )
     .unwrap();
@@ -443,6 +449,7 @@ fn api_crud_history_markers_and_settings() {
     let mut child = Command::new(BIN)
         .args(["start", "--project", dest.to_str().unwrap(), "--port", &port.to_string()])
         .env("ITER_CLAUDE_BIN", "/usr/bin/false") // any picked-up item fails fast, no real claude
+        .env("HOME", &dest) // isolate ~ (usage snapshot, server registry) from the real machine
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -491,6 +498,15 @@ fn api_crud_history_markers_and_settings() {
     assert!(markers.contains("API Test Project"), "{}", markers);
     assert!(markers.contains("\"svc-api\""));
     assert!(markers.contains("bizreq.iter.md"));
+
+    // usecase create lands in globalsettings.usecase_default_location
+    // (default {codepath}/usecases/), named <slug>.usecase.iter.md
+    let uc = http(port, "POST", "/api/usecases", Some(r#"{"name":"Pay Flow","description":"d","participants":["1 svc"]}"#));
+    assert!(uc.contains("201"), "{}", uc);
+    assert!(
+        dest.join("usecases/pay-flow.usecase.iter.md").is_file(),
+        "created use-case must land under <code_root>/usecases/"
+    );
 
     // config roundtrip
     let put = http(port, "PUT", "/api/config", Some(r#"{"engine":{"tick_interval_sec":2},"globalsettings":{}}"#));
@@ -669,6 +685,85 @@ fn critfail_flag_fails_item_even_when_agent_reports_success() {
         closed[0]["lasterror"]
     );
     assert!(!root.join(".iter/.engine/critfail-e2e-critflag-1.txt").exists(), "flag is consumed");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The TDD loop end-to-end, no engine required: `iter runtests` neutral/claim
+/// modes (exit codes, run logs, block updates, the critfail fail-flag) and
+/// `iter testsweep` (fix-item birth with provenance, dedup, stale auto-close).
+#[test]
+fn runtests_claims_and_sweep_lifecycle() {
+    let (root, _stub) = setup_project("runtests", 3, 200);
+    let test_dir = root.join("comp/test");
+    std::fs::create_dir_all(&test_dir).unwrap();
+    // The marker file declares the C4 object's tests — mandatory for the sweep.
+    std::fs::write(
+        root.join("comp/comp.marker.iter.md"),
+        "---\nname: \"Comp\"\nlevel: component\ndescription: \"e2e\"\ntestgroup: test/testgroup.iter.md\ntest_dir: test\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(test_dir.join("t1.sh"), "echo 'ITER_RESULT pass=0 fail=1 total=1'\nexit 1\n").unwrap();
+    std::fs::write(
+        test_dir.join("testgroup.iter.md"),
+        "# comp tests\n\n<!-- iterapp:testgroups\n{\"label\":\"G\",\"desc\":\"demo\",\"auto_fix\":false,\"lastrun\":\"\",\"result\":\"\",\"counts\":\"\",\"testlist\":[{\"id\":\"t1\",\"name\":\"one\",\"desc\":\"d\",\"shell\":\"t1.sh\"}]}\n-->\n",
+    )
+    .unwrap();
+    let run = |args: &[&str], workid: Option<&str>| {
+        let mut cmd = Command::new(BIN);
+        cmd.args(args).arg("--project").arg(root.to_str().unwrap());
+        if let Some(w) = workid {
+            cmd.env("ITER_WORKID", w);
+        }
+        cmd.output().unwrap()
+    };
+
+    // Neutral run on a red group: exit 1, block stamped, run log captured.
+    let out = run(&["runtests", "--group", "G"], None);
+    assert_eq!(out.status.code(), Some(1), "neutral red exits 1: {}", String::from_utf8_lossy(&out.stdout));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("tests 0/1"), "{}", stdout);
+    let tg = std::fs::read_to_string(test_dir.join("testgroup.iter.md")).unwrap();
+    assert!(tg.contains("\"result\":\"failed\"") && tg.contains("\"counts\":\"0/1\""), "{}", tg);
+    assert!(test_dir.join("runs").read_dir().unwrap().next().is_some(), "run log must exist");
+
+    // --broken upheld on a red group (exit 0); --fixed false → critfail + exit 3.
+    assert_eq!(run(&["runtests", "--group", "G", "--broken"], Some("w-e2e")).status.code(), Some(0));
+    assert!(!root.join(".iter/.engine/critfail-w-e2e.txt").exists(), "upheld claim writes no flag");
+    let out = run(&["runtests", "--group", "G", "--fixed"], Some("w-e2e"));
+    assert_eq!(out.status.code(), Some(3), "false --fixed claim exits 3");
+    let flag = root.join(".iter/.engine/critfail-w-e2e.txt");
+    assert!(flag.exists(), "false claim writes the fail-flag");
+    assert!(std::fs::read_to_string(&flag).unwrap().contains("--fixed claim failed"));
+    std::fs::remove_file(&flag).unwrap();
+
+    // Sweep on the red group: one code fix item, todo (auto_fix false), with provenance.
+    let out = run(&["testsweep"], None);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let open = open_items(&root);
+    assert_eq!(open.len(), 1, "{:?}", open);
+    assert_eq!(open[0]["type"], "code");
+    assert_eq!(open[0]["state"], "todo");
+    assert_eq!(open[0]["source"], "testsweep");
+    assert_eq!(open[0]["source_testgroup"], "G");
+    assert_eq!(open[0]["source_tests"][0], "t1");
+    assert_eq!(open[0]["codepath_ignore"][0], "test/");
+    // Dedup: a second sweep creates nothing.
+    run(&["testsweep"], None);
+    assert_eq!(open_items(&root).len(), 1, "dedup guard must hold");
+
+    // The defect gets fixed by other means; sweep goes green and auto-closes the stale item.
+    std::fs::write(test_dir.join("t1.sh"), "echo 'ITER_RESULT pass=1 fail=0 total=1'\nexit 0\n").unwrap();
+    let out = run(&["testsweep"], None);
+    assert!(out.status.success());
+    assert!(open_items(&root).is_empty(), "stale unstarted item auto-closes");
+    let closed = closed_items(&root);
+    assert!(closed.iter().any(|c| c["output"].as_str().unwrap_or("").contains("auto-closed by test sweep")), "{:?}", closed);
+
+    // --broken on a green group is a false claim: stale item, flag written, exit 3.
+    let out = run(&["runtests", "--group", "G", "--broken"], Some("w-e2e"));
+    assert_eq!(out.status.code(), Some(3));
+    assert!(std::fs::read_to_string(root.join(".iter/.engine/critfail-w-e2e.txt")).unwrap().contains("stale"));
 
     let _ = std::fs::remove_dir_all(&root);
 }
