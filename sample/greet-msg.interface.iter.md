@@ -4,8 +4,7 @@ kind: json
 description: "The greeter's command-line contract: args in, one line out"
 ---
 
-
-## Machine-readable contract
+# greet-msg — contract
 
 ```json
 {

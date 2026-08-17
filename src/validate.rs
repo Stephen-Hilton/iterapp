@@ -244,7 +244,96 @@ pub fn validate_file(path: &Path, fix: bool) -> std::io::Result<Vec<Finding>> {
                 push(Severity::Error, "missing-key", "interface file has no `interface:` id — nothing can reference it from uses:/provides:".into(), false);
             }
             if front.get("kind").map(|v| v.trim().is_empty()).unwrap_or(true) {
-                push(Severity::Warn, "missing-key", "interface file has no `kind:` (http | grpc | kafka | sql | file | cli | library | …)".into(), false);
+                push(Severity::Warn, "missing-key", "interface file has no `kind:` (json | xml | http | grpc | kafka | sql | cli | library | …)".into(), false);
+            }
+            // The body IS the contract: an example of the data exchanged. The
+            // format is free (json, xml, kwargs, argv/stdout …), so the checks
+            // are shape-level: an example block exists, tagged examples parse,
+            // and no usage (who/how) prose rides along.
+            let contract = body.trim();
+            if contract.is_empty() {
+                push(
+                    Severity::Warn,
+                    "empty-contract-body",
+                    "interface body is empty — the body IS the contract: a fenced example of the data exchanged (model: sample/greet-msg.interface.iter.md)".into(),
+                    false,
+                );
+            } else {
+                // Walk ``` fences: collect (language-tag, content) per block and
+                // the lines outside all blocks.
+                let mut in_fence = false;
+                let mut fence_lang = String::new();
+                let mut block = String::new();
+                let mut blocks: Vec<(String, String)> = Vec::new();
+                let mut outside: Vec<&str> = Vec::new();
+                for line in contract.lines() {
+                    let t = line.trim_start();
+                    if t.starts_with("```") {
+                        if in_fence {
+                            blocks.push((fence_lang.clone(), std::mem::take(&mut block)));
+                        } else {
+                            fence_lang = t.trim_start_matches('`').trim().to_lowercase();
+                        }
+                        in_fence = !in_fence;
+                        continue;
+                    }
+                    if in_fence {
+                        block.push_str(line);
+                        block.push('\n');
+                    } else {
+                        outside.push(line);
+                    }
+                }
+                if in_fence {
+                    push(
+                        Severity::Warn,
+                        "unclosed-fence",
+                        "a ``` fence never closes — everything after it reads as part of the example".into(),
+                        false,
+                    );
+                } else if blocks.is_empty() {
+                    push(
+                        Severity::Warn,
+                        "no-example-block",
+                        "interface body has no fenced example block — show the data shape as a fenced example (pseudo-JSON/XML/kwargs are fine), not prose about it".into(),
+                        false,
+                    );
+                }
+                for (lang, content) in &blocks {
+                    if lang == "json" && serde_json::from_str::<serde_json::Value>(content).is_err() {
+                        push(
+                            Severity::Warn,
+                            "bad-json-example",
+                            "an example fence is tagged `json` but does not parse as strict JSON — fix the example or untag the fence (pseudo-JSON stays untagged)".into(),
+                            false,
+                        );
+                    }
+                }
+                // WHAT, never WHO/HOW: usage phrasing outside the example blocks.
+                const USAGE_PHRASES: &[&str] = &[
+                    "used by", "consumed by", "called by", "caller:", "callers:",
+                    "consumer:", "consumers:", "provider:", "providers:", "## owns", "## consumes",
+                ];
+                let mut hits: Vec<&str> = Vec::new();
+                for line in &outside {
+                    let low = line.to_lowercase();
+                    for p in USAGE_PHRASES {
+                        if low.contains(p) && !hits.contains(p) {
+                            hits.push(p);
+                        }
+                    }
+                }
+                if !hits.is_empty() {
+                    push(
+                        Severity::Warn,
+                        "usage-in-contract",
+                        format!(
+                            "usage details in the contract body (\"{}\") — an interface file records WHAT crosses the boundary, never who provides/consumes it or how; marker `provides:`/`uses:` keys carry that",
+                            hits.join("\", \"")
+                        ),
+                        false,
+                    );
+                }
             }
         }
         Some(Role::Usecase) => {
@@ -460,6 +549,43 @@ mod tests {
         let n = dir.join("notes.iter.md");
         std::fs::write(&n, "just notes\n").unwrap();
         assert!(codes(&validate_file(&n, false).unwrap()).contains(&"no-role"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interface_body_is_the_contract() {
+        let dir = tmp("ifacebody");
+        let p = dir.join("api.interface.iter.md");
+
+        // Clean: id + kind + a strict-JSON example, no usage prose → no findings.
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\ndescription: \"d\"\n---\n# pay-msg — contract\n```json\n{ \"amount_cents\": 1200, \"currency\": \"USD\" }\n```\n").unwrap();
+        assert!(validate_file(&p, false).unwrap().is_empty());
+
+        // Empty body.
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n").unwrap();
+        assert!(codes(&validate_file(&p, false).unwrap()).contains(&"empty-contract-body"));
+
+        // Prose but no fenced example.
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\ntwo pages of prose about the payload\n").unwrap();
+        assert!(codes(&validate_file(&p, false).unwrap()).contains(&"no-example-block"));
+
+        // Tagged json that does not parse; pseudo-JSON untagged is fine.
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n```json\n{ \"amount\": … }\n```\n").unwrap();
+        assert!(codes(&validate_file(&p, false).unwrap()).contains(&"bad-json-example"));
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n```\n{ \"amount\": … }\n```\n").unwrap();
+        assert!(!codes(&validate_file(&p, false).unwrap()).contains(&"bad-json-example"));
+
+        // Unclosed fence.
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n```json\n{ \"a\": 1 }\n").unwrap();
+        assert!(codes(&validate_file(&p, false).unwrap()).contains(&"unclosed-fence"));
+
+        // Usage prose outside the fence is flagged; the same words INSIDE an
+        // example (e.g. a kafka `consumer:` config key) are not.
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\nThis is consumed by the settlement service.\n```json\n{ \"a\": 1 }\n```\n").unwrap();
+        let fs = validate_file(&p, false).unwrap();
+        assert!(codes(&fs).contains(&"usage-in-contract"), "{:?}", fs);
+        std::fs::write(&p, "---\ninterface: pay-msg\nkind: json\n---\n```\nconsumer: settlement-group\n```\n").unwrap();
+        assert!(!codes(&validate_file(&p, false).unwrap()).contains(&"usage-in-contract"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

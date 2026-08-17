@@ -124,14 +124,30 @@ frontmatter; without it the node has no name/level on the Projects map.
   the test sweep: no key = this C4 object is deliberately outside the sweep (its
   tests never run automatically). If tests should exist, declare the key.
 
-- Interface marker (`*.interface.iter.md`):
+- Interface marker (`*.interface.iter.md`) — the DATA CONTRACT between C4 objects:
 
       ---
       interface: interface-id
-      kind: http              # http | grpc | kafka | sql | file | cli | library | …
-      endpoint: "POST /v1/example"
-      description: "one line on the contract"
+      kind: json              # the wire/format kind: json | xml | http | grpc | kafka | sql | cli | library | …
+      endpoint: "POST /v1/example"    # optional — only when a fixed address exists
+      description: "one line on what data crosses this boundary"
       ---
+
+  **The body IS the contract: an EXAMPLE of the data exchanged, never prose
+  about it.** One provider emits this shape, any consumer accepts it. Show the
+  shape as a fenced code block holding a concrete or pseudo example — JSON, XML,
+  argv/stdout, a function signature with kwargs, whatever fits `kind:` — and
+  encode invariants as fields of the example where possible (patterns, limits,
+  exit codes), as `sample/greet-msg.interface.iter.md` does. At most a few
+  invariant bullets for what an example cannot express. Tag the fence with a
+  language (```json) only when the block strictly parses as that language;
+  pseudo-examples with ellipses stay untagged.
+
+  **WHAT, never WHO or HOW.** An interface is used by many C4 objects; the file
+  must not name providers, consumers, or callers, nor describe how or where
+  anyone uses it — the structure graph already carries that through marker
+  `provides:`/`uses:` keys. Sentences like "consumed by X" go stale the moment a
+  second consumer appears, and `iter validate` flags them.
 
   **Interfaces are shared contracts — reuse before creating.** Before adding a
   new interface, check the existing ids (every `*.interface.iter.md` in the tree
