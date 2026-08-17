@@ -348,6 +348,13 @@
   .setrow.wide { grid-template-columns: 250px 1fr; }
   .setrow.wide textarea { font-family: var(--mono); font-size: 12px; }
   .setfoot { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+  .setsearch { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 2px 0 10px; }
+  .setsearch input {
+    width: 100%; box-sizing: border-box; background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); border-radius: 9px; padding: 9px 13px; font: inherit;
+  }
+  .sethead { margin: 18px 0 8px; font-size: 15px; }
+  .sethead small { color: var(--text-dim); font-weight: 500; font-size: 12px; margin-left: 8px; }
 
   /* ---------- projects ---------- */
   :root {
@@ -476,19 +483,22 @@
       <nav class="nav">
         <a href="#/dashboard" data-view="dashboard">Dashboard</a>
         <a href="#/workitems" data-view="workitems" class="here">Work Items</a>
-        <a href="#/ilsettings" data-view="ilsettings">Settings</a>
       </nav>
     </div>
     <div class="navgroup">
       <div class="navhead">Iterapp</div>
       <nav class="nav">
         <a href="#/projects" data-view="projects">Projects</a>
-        <a href="#/iasettings" data-view="iasettings">Settings</a>
       </nav>
     </div>
     <div class="navgroup">
       <div class="navhead">Running Servers</div>
       <nav class="nav" id="serverSwitch"></nav>
+      <!-- One running server per project; iterloop and iterapp are its two
+           halves, so THIS server's settings live here, under the server list. -->
+      <nav class="nav">
+        <a href="#/settings" data-view="settings">Settings</a>
+      </nav>
     </div>
   </aside>
 
@@ -524,9 +534,8 @@
     </div><!-- /view-workitems -->
 
     <div class="view" id="view-dashboard"></div>
-    <div class="view" id="view-ilsettings"></div>
+    <div class="view" id="view-settings"></div>
     <div class="view" id="view-projects"></div>
-    <div class="view" id="view-iasettings"></div>
   </main>
 </div>
 
@@ -1473,18 +1482,19 @@ $('sortBy').addEventListener('change', (e) => { sortBy = e.target.value; render(
 
 /* ================================================================== views */
 
-const VIEWS = { workitems:'Work Items', dashboard:'Dashboard', ilsettings:'Iterloop Settings',
-                projects:'Projects', iasettings:'Project Settings' };
+const VIEWS = { workitems:'Work Items', dashboard:'Dashboard',
+                projects:'Projects', settings:'Settings' };
 
 function navTo(view){
+  // Old bookmarks: the two per-half settings pages merged into one.
+  if (view === 'ilsettings' || view === 'iasettings') view = 'settings';
   if (!VIEWS[view]) view = 'workitems';
   document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('here', a.dataset.view === view));
   $('pageTitle').textContent = VIEWS[view];
   if (view === 'dashboard') renderDashboard();
-  if (view === 'ilsettings') renderIlSettings();
   if (view === 'projects') renderProjects();
-  if (view === 'iasettings') renderIaSettings();
+  if (view === 'settings') renderSettings();
 }
 window.addEventListener('hashchange', () => navTo(location.hash.replace(/^#\//,'')));
 
@@ -1724,37 +1734,101 @@ function tzSelectHtml(cfgKey, current){
     ${rest ? `<optgroup label="All timezones (IANA)">${rest}</optgroup>` : ''}</select>`;
 }
 
-async function renderIlSettings(){
-  let live = null;
+/* One running server per project; iterloop and iterapp are its two halves,
+   so ONE Settings page serves both. Each setting is placed by what it affects
+   — the loop runner under Iterloop; project management, visualization, and
+   file layout in C4 context under Iterapp — regardless of which file stores
+   it: data-cfg inputs save to .iter/.engine/config.json, data-ps inputs to
+   .iter/projects.json. Save All writes both. Built lazily so CONFIG and
+   PROJSET (declared elsewhere) are both in scope at call time. */
+function settingsLayout(){
+  const cfg = (section, key) => ({ src: 'cfg', section, key });
+  const psi = (key) => ({ src: 'ps', key });
+  return [
+    ['Iterloop', 'the loop runner: scheduler, agents, the test loop, spend and usage guards', [
+      ['Engine', 'Scheduler, locking, and retry behavior — .iter/.engine/config.json',
+        Object.keys(CONFIG.engine).map(k => cfg('engine', k))],
+      ['Test loop', 'The deterministic test engine: sweep cadence, timeouts, concurrency, and fix-item priorities (higher = sooner) — see features/TDD.md',
+        Object.keys(CONFIG.testing).map(k => cfg('testing', k))],
+      ['Testing defaults', 'What testwriter agents produce, and where the loop locks test work',
+        ['test_min','test_max','test_default_path','test_dir'].map(k => cfg('globalsettings', k))],
+      ['Usage limits', 'Account-usage throttle: tiered agent caps from Claude Code’s server-reported 5h/7d utilization, kept fresh by the probe session',
+        Object.keys(CONFIG.limits).map(k => cfg('limits', k))],
+      ['Logging', 'Engine log output and rotation',
+        ['log_default_path','log_level','log_max_size_mb','log_max_files'].map(k => cfg('globalsettings', k))],
+    ]],
+    ['Iterapp', 'project management and the C4 map: markers, file layout, display', [
+      ['Project identity', 'This server’s name and address — .iter/projects.json',
+        ['project_name','url_slug'].map(psi)],
+      ['Marker discovery', 'How the Projects scan finds iter files — .iter/projects.json',
+        ['scan_roots','marker_glob','testgroups_glob'].map(psi)],
+      ['Creation defaults', 'Where NEW iter files land, and the context new work items start with',
+        [psi('default_context'), cfg('globalsettings','usecase_default_path'), cfg('globalsettings','interface_default_path')]],
+      ['Display and layout', 'Timestamp display, and the code root every relative path resolves against',
+        [cfg('globalsettings','user_timezone'), cfg('globalsettings','code_root')]],
+    ]],
+  ];
+}
+
+async function renderSettings(){
+  let live = null, ps = null;
   let agents = MOCK_AGENT_DEFS;
   if (LIVE) {
     try { live = await api('/api/config'); } catch (e) { toast('Config: ' + e.message); }
+    try { ps = await api('/api/projectsettings'); } catch (e) { toast('Settings: ' + e.message); }
     try { agents = (await api('/api/agents')).agents || []; } catch (e) { toast('Agents: ' + e.message); }
   }
-  const val = (section, key, fallback) =>
+  const cfgVal = (section, key, fallback) =>
     live && live[section] && live[section][key] !== undefined ? live[section][key] : fallback;
-  const group = (name, obj, sub) => `<div class="setgroup"><h3>${name}</h3><div class="sub">${sub}</div>
-    ${Object.entries(obj).map(([k,[v,why]]) => {
-      const cur = String(val(name, k, v));
-      let control;
-      if (k === 'user_timezone') control = tzSelectHtml(`${name}.${k}`, cur);
-      else if (typeof v === 'boolean') control = `<select data-cfg="${name}.${k}" data-bool="true">
-        <option${cur === 'true' ? ' selected' : ''}>true</option><option${cur !== 'true' ? ' selected' : ''}>false</option></select>`;
-      else control = `<input type="text" data-cfg="${name}.${k}" data-num="${typeof v === 'number'}" value="${esc(cur)}">`;
-      return `<div class="setrow"><label>${k}</label>${control}<span class="why">${why}</span></div>`;
-    }).join('')}</div>`;
+  const psVal = (k, fallback) => {
+    if (!ps || ps[k] === undefined) return fallback;
+    return Array.isArray(ps[k]) ? ps[k].join('\n') : String(ps[k]);
+  };
+  const cfgRow = ({ section, key }) => {
+    const [v, why] = CONFIG[section][key];
+    const cur = String(cfgVal(section, key, v));
+    let control;
+    if (key === 'user_timezone') control = tzSelectHtml(`${section}.${key}`, cur);
+    else if (typeof v === 'boolean') control = `<select data-cfg="${section}.${key}" data-bool="true">
+      <option${cur === 'true' ? ' selected' : ''}>true</option><option${cur !== 'true' ? ' selected' : ''}>false</option></select>`;
+    else control = `<input type="text" data-cfg="${section}.${key}" data-num="${typeof v === 'number'}" value="${esc(cur)}">`;
+    return `<div class="setrow"><label>${key}</label>${control}<span class="why">${why}</span></div>`;
+  };
+  const psRow = ({ key }) => {
+    const [v, why] = PROJSET[key];
+    const value = psVal(key, v);
+    return PS_MULTILINE.includes(key)
+      ? `<div class="setrow wide"><label>${key}</label>
+           <div><textarea rows="${value.split('\n').length + 1}" style="width:100%" data-ps="${key}" id="ps_${key}">${esc(value)}</textarea>
+           <div class="pathhint" id="ps_hint_${key}"></div>
+           <div class="why" style="margin-top:4px">${why}</div></div></div>`
+      : `<div class="setrow"><label>${key}</label><input type="text" data-ps="${key}" value="${esc(value)}"><span class="why">${why}</span></div>`;
+  };
+  const row = (item) => item.src === 'cfg' ? cfgRow(item) : psRow(item);
+  const legend = `<div class="sub" style="border:1px solid var(--border);border-radius:7px;padding:10px 12px;line-height:1.7">
+      <b>How iter files work:</b> any file matching <span class="mono">marker_glob</span> is iterapp-meaningful;
+      its <b>FILENAME declares its role</b> — the word right before <span class="mono">.iter.md</span> (any prefix allowed, e.g.
+      <span class="mono">gateway.marker.iter.md</span>):
+      <span class="mono">*marker.iter.md</span> → a node on the Projects map (frontmatter <span class="mono">level:</span> says which C4 level) ·
+      <span class="mono">*interface.iter.md</span> → a globally-aggregated interface contract ·
+      <span class="mono">*usecase.iter.md</span> → a use-case thread ·
+      <span class="mono">*testgroup.iter.md</span> → test definitions (owned via the marker's <span class="mono">testgroup:</span> key) ·
+      <span class="mono">*bizreq.iter.md</span> / <span class="mono">*techreq.iter.md</span> → requirement docs ·
+      any other name → a plain context doc. Stray frontmatter never changes a file's role — renaming the file is the only way.<br>
+      <b>Placeholders in default_context:</b>
+      <span class="mono">{marker}</span> = the clicked node’s own .iter.md file ·
+      <span class="mono">{ancestor_markers}</span> = markers of that node’s parent chain up to the project root ·
+      <span class="mono">{interfaces}</span> = the contract files for everything in the node’s uses:/provides: ·
+      <span class="mono">{codepath}</span> = the node’s directory (anchors a glob to the work item’s own tree) ·
+      <span class="mono">{reqs}</span> = the project-wide reqs dir — global bizreq/techreq home (default <span class="mono">.iter/reqs/</span>,
+      relocated by a <span class="mono">reqs:</span> key on the project-level marker; its files are auto-surfaced to every agent).
+    </div>`;
+  const groupHtml = ([name, sub, items]) => `<div class="setgroup"><h3>${name}</h3><div class="sub">${sub}</div>
+    ${name === 'Marker discovery' ? legend : ''}
+    ${items.map(row).join('')}</div>`;
   const agentOptions = agents.map((a, i) =>
     `<option value="${esc(a.type)}"${i === 0 ? ' selected' : ''}>${esc(a.type)}</option>`).join('');
-  $('view-ilsettings').innerHTML = `<div class="setform">
-    ${group('engine', CONFIG.engine, 'Scheduler, locking, and retry behavior — .iter/.engine/config.json')}
-    ${group('globalsettings', CONFIG.globalsettings, 'Testing and logging defaults')}
-    ${group('testing', CONFIG.testing, 'The deterministic test engine: sweep cadence, timeouts, concurrency, and fix-item priorities (higher = sooner) — see features/TDD.md')}
-    ${group('limits', CONFIG.limits, 'Account-usage throttle: tiered agent caps from Claude Code’s server-reported 5h/7d utilization, kept fresh by the probe session')}
-    <div class="setfoot">
-      <button class="btn" id="cfgReset">Reset to Defaults</button>
-      <button class="btn primary" id="cfgSave">Save config.json</button>
-    </div>
-    <div class="setgroup">
+  const agentsGroup = `<div class="setgroup">
       <h3>Agents Settings</h3>
       <div class="sub">Per-agent settings and prompt — <span class="mono">.iter/agents/&lt;name&gt;.md</span>.
         Add an agent by adding a new .md file there; the engine and this list pick it up automatically.
@@ -1768,25 +1842,75 @@ async function renderIlSettings(){
         <button class="btn" id="agReset">Reload</button>
         <button class="btn primary" id="agSave">Save agent file</button>
       </div>` : '<div class="sub">No agent files found in .iter/agents/.</div>'}
-    </div></div>`;
+    </div>`;
+  const sectionHtml = ([title, subtitle, groups], extra = '') => `<div class="setsection">
+    <h2 class="sethead">${title}<small>${subtitle}</small></h2>
+    ${groups.map(groupHtml).join('')}${extra}
+  </div>`;
+  const layout = settingsLayout();
+  $('view-settings').innerHTML = `<div class="setform">
+    <div class="setsearch"><input type="search" id="setSearch"
+      placeholder="Search settings — any part of a name, group, or description"
+      autocomplete="off" spellcheck="false"></div>
+    ${sectionHtml(layout[0], agentsGroup)}
+    ${sectionHtml(layout[1])}
+    <div class="setfoot">
+      <button class="btn" id="cfgReload">Reload from disk</button>
+      <button class="btn" id="cfgReset">Reset engine config to defaults</button>
+      <button class="btn primary" id="cfgSave">Save All</button>
+    </div>
+  </div>`;
+  wirePathHints('ps_scan_roots', 'ps_hint_scan_roots', null);
+  wirePathHints('ps_default_context', 'ps_hint_default_context', null);
+  $('setSearch').addEventListener('input', () => {
+    const q = $('setSearch').value.trim().toLowerCase();
+    document.querySelectorAll('#view-settings .setgroup').forEach(g => {
+      const titleHit = q && g.querySelector('h3').textContent.toLowerCase().includes(q);
+      let any = false;
+      g.querySelectorAll('.setrow').forEach(r => {
+        const hit = !q || titleHit || r.textContent.toLowerCase().includes(q);
+        r.style.display = hit ? '' : 'none';
+        if (hit) any = true;
+      });
+      g.style.display = (any || titleHit) ? '' : 'none';
+    });
+    document.querySelectorAll('#view-settings .setsection').forEach(sec => {
+      const any = [...sec.querySelectorAll('.setgroup')].some(g => g.style.display !== 'none');
+      sec.style.display = any ? '' : 'none';
+    });
+  });
   $('cfgSave').addEventListener('click', () => {
-    const out = {};
+    const cfgOut = {};
     document.querySelectorAll('[data-cfg]').forEach(input => {
       const [section, key] = input.dataset.cfg.split('.');
       const raw = input.value.trim();
-      (out[section] = out[section] || {})[key] =
+      (cfgOut[section] = cfgOut[section] || {})[key] =
         input.dataset.bool === 'true' ? raw === 'true'
         : input.dataset.num === 'true' ? (Number(raw) || 0) : raw;
     });
+    const psOut = {};
+    document.querySelectorAll('[data-ps]').forEach(el => {
+      const k = el.dataset.ps;
+      psOut[k] = PS_MULTILINE.includes(k)
+        ? el.value.split('\n').map(x => x.trim()).filter(Boolean)
+        : el.value.trim();
+    });
     const applyTz = () => {
-      USER_TZ = out.globalsettings.user_timezone || 'UTC';
+      USER_TZ = (cfgOut.globalsettings && cfgOut.globalsettings.user_timezone) || 'UTC';
       render();
     };
-    if (!LIVE) { applyTz(); toast('config.json saved (mock) — engine applies it on its next tick'); return; }
-    api('/api/config', { method: 'PUT', body: JSON.stringify(out) })
-      .then(() => { applyTz(); toast('config.json saved — engine applies it on its next tick'); })
+    if (!LIVE) { applyTz(); toast('config.json + projects.json saved (mock) — engine applies config on its next tick'); return; }
+    Promise.all([
+      api('/api/config', { method: 'PUT', body: JSON.stringify(cfgOut) }),
+      api('/api/projectsettings', { method: 'PUT', body: JSON.stringify(psOut) }),
+    ]).then(() => {
+        applyTz();
+        projLoaded = false;
+        toast('Saved — engine applies config on its next tick; rescan applies new globs');
+      })
       .catch(e => toast('Save failed: ' + e.message));
   });
+  $('cfgReload').addEventListener('click', () => { renderSettings(); toast('Reloaded from disk'); });
   $('cfgReset').addEventListener('click', () => {
     if (LIVE) {
       const defaults = {};
@@ -1794,11 +1918,11 @@ async function renderIlSettings(){
         for (const [k, [v]] of Object.entries(obj)) (defaults[section] = defaults[section] || {})[k] = v;
       }
       api('/api/config', { method: 'PUT', body: JSON.stringify(defaults) })
-        .then(() => { toast('Reset to defaults and saved'); USER_TZ = 'UTC'; render(); renderIlSettings(); })
+        .then(() => { toast('Engine config reset to defaults and saved — projects.json untouched'); USER_TZ = 'UTC'; render(); renderSettings(); })
         .catch(e => toast('Reset failed: ' + e.message));
       return;
     }
-    renderIlSettings();
+    renderSettings();
     toast('Reset to defaults (unsaved)');
   });
   if (agents.length) {
@@ -1824,7 +1948,7 @@ async function renderIlSettings(){
         })
         .catch(e => toast('Save failed: ' + e.message));
     });
-    $('agReset').addEventListener('click', () => { renderIlSettings(); toast('Reloaded from disk'); });
+    $('agReset').addEventListener('click', () => { renderSettings(); toast('Reloaded from disk'); });
   }
 }
 
@@ -2110,7 +2234,7 @@ async function renderProjects(){
         style="background:var(--lvl-${l}-bg);color:var(--lvl-${l}-fg)">${l} · ${counts[i]}</button>`).join('')}
       <span class="lhint">click a level to collapse below it · nodes: <span class="mono">**/*marker.iter.md</span> (level: in frontmatter says which C4 level)</span>
     </div>
-    <div class="ptree">${rows || '<div class="empty">No markers found — check scan roots in Project Settings.</div>'}</div>
+    <div class="ptree">${rows || '<div class="empty">No markers found — check scan roots in Settings.</div>'}</div>
     <h3 style="margin:16px 0 6px;font-size:13.5px">Interfaces <span style="color:var(--text-dim);font-weight:500;font-size:12px">— global: aggregated across all scan roots, referenced by nodes via <span class="mono">provides:</span> / <span class="mono">uses:</span>, never owned by the tree</span></h3>
     <div class="ptree">${ifaceRows || '<div class="empty">No interfaces declared yet — add a marker with <span class="mono">interface:</span> frontmatter.</div>'}</div>
     <h3 style="margin:16px 0 6px;font-size:13.5px">Use-Cases <span style="color:var(--text-dim);font-weight:500;font-size:12px">— <span class="mono">participants:</span> markers threading scenarios through the tree; one-way, nodes never mention them</span>
@@ -2621,67 +2745,6 @@ const PROJSET = {
 };
 const PS_MULTILINE = ['scan_roots', 'default_context'];
 if (!LIVE) DEFAULT_CONTEXT = PROJSET.default_context[0].split('\n');
-
-async function renderIaSettings(){
-  let live = null;
-  if (LIVE) {
-    try { live = await api('/api/projectsettings'); } catch (e) { toast('Settings: ' + e.message); }
-  }
-  const val = (k, fallback) => {
-    if (!live || live[k] === undefined) return fallback;
-    return Array.isArray(live[k]) ? live[k].join('\n') : String(live[k]);
-  };
-  $('view-iasettings').innerHTML = `<div class="setform"><div class="setgroup">
-    <h3>Project Settings</h3>
-    <div class="sub">Marker discovery and Create-WorkItem defaults — stored in <span class="mono">.iter/projects.json</span></div>
-    <div class="sub" style="border:1px solid var(--border);border-radius:7px;padding:10px 12px;line-height:1.7">
-      <b>How iter files work:</b> any file matching <span class="mono">marker_glob</span> is iterapp-meaningful;
-      its <b>FILENAME declares its role</b> — the word right before <span class="mono">.iter.md</span> (any prefix allowed, e.g.
-      <span class="mono">gateway.marker.iter.md</span>):
-      <span class="mono">*marker.iter.md</span> → a node on the Projects map (frontmatter <span class="mono">level:</span> says which C4 level) ·
-      <span class="mono">*interface.iter.md</span> → a globally-aggregated interface contract ·
-      <span class="mono">*usecase.iter.md</span> → a use-case thread ·
-      <span class="mono">*testgroup.iter.md</span> → test definitions (owned via the marker's <span class="mono">testgroup:</span> key) ·
-      <span class="mono">*bizreq.iter.md</span> / <span class="mono">*techreq.iter.md</span> → requirement docs ·
-      any other name → a plain context doc. Stray frontmatter never changes a file's role — renaming the file is the only way.<br>
-      <b>Placeholders in default_context:</b>
-      <span class="mono">{marker}</span> = the clicked node’s own .iter.md file ·
-      <span class="mono">{ancestor_markers}</span> = markers of that node’s parent chain up to the project root ·
-      <span class="mono">{interfaces}</span> = the contract files for everything in the node’s uses:/provides: ·
-      <span class="mono">{codepath}</span> = the node’s directory (anchors a glob to the work item’s own tree) ·
-      <span class="mono">{reqs}</span> = the project-wide reqs dir — global bizreq/techreq home (default <span class="mono">.iter/reqs/</span>,
-      relocated by a <span class="mono">reqs:</span> key on the project-level marker; its files are auto-surfaced to every agent).
-    </div>
-    ${Object.entries(PROJSET).map(([k,[v,why]]) => {
-      const value = val(k, v);
-      return PS_MULTILINE.includes(k)
-        ? `<div class="setrow wide"><label>${k}</label>
-             <div><textarea rows="${value.split('\n').length + 1}" style="width:100%" data-ps="${k}" id="ps_${k}">${esc(value)}</textarea>
-             <div class="pathhint" id="ps_hint_${k}"></div></div></div>
-           <div class="setrow wide"><span></span><span class="why">${why}</span></div>`
-        : `<div class="setrow"><label>${k}</label><input type="text" data-ps="${k}" value="${esc(value)}"><span class="why">${why}</span></div>`;
-    }).join('')}
-    <div class="setfoot">
-      <button class="btn" id="psReset">Reset</button>
-      <button class="btn primary" id="psSave">Save projects.json</button>
-    </div></div></div>`;
-  wirePathHints('ps_scan_roots', 'ps_hint_scan_roots', null);
-  wirePathHints('ps_default_context', 'ps_hint_default_context', null);
-  $('psSave').addEventListener('click', () => {
-    if (!LIVE) { toast('projects.json saved (mock) — rescan to apply new globs'); return; }
-    const out = {};
-    document.querySelectorAll('[data-ps]').forEach(el => {
-      const k = el.dataset.ps;
-      out[k] = PS_MULTILINE.includes(k)
-        ? el.value.split('\n').map(s => s.trim()).filter(Boolean)
-        : el.value.trim();
-    });
-    api('/api/projectsettings', { method: 'PUT', body: JSON.stringify(out) })
-      .then(() => { toast('projects.json saved — rescan to apply new globs'); projLoaded = false; })
-      .catch(e => toast('Save failed: ' + e.message));
-  });
-  $('psReset').addEventListener('click', () => { renderIaSettings(); toast('Reloaded from disk'); });
-}
 
 /* -------------------------------------------------- multi-server identity */
 /* In the wired version: url_slug + project_name from /api/projectsettings, the
