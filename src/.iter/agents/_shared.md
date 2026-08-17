@@ -176,7 +176,10 @@ frontmatter; without it the node has no name/level on the Projects map.
   new interface, check the existing ids (every `*.interface.iter.md` in the tree
   — the Projects scan aggregates them globally) for a contract that already fits;
   extend or reference it instead of creating a near-duplicate. Create a new id
-  only when no existing contract covers the need.
+  only when no existing contract covers the need. NEW interface files are named
+  `<id>.interface.iter.md` and land in `$ITER_INTERFACE_DIR`
+  (`globalsettings.interface_default_path`, default `{codepath}/interfaces/`) —
+  the scanner finds them anywhere, but new ones belong there.
 
   **Copy the quotes** on the prose fields (`name`, `description`, `endpoint`). Prose
   routinely contains a colon-plus-space, and while the engine parses that fine

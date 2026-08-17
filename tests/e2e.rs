@@ -499,7 +499,7 @@ fn api_crud_history_markers_and_settings() {
     assert!(markers.contains("\"svc-api\""));
     assert!(markers.contains("bizreq.iter.md"));
 
-    // usecase create lands in globalsettings.usecase_default_location
+    // usecase create lands in globalsettings.usecase_default_path
     // (default {codepath}/usecases/), named <slug>.usecase.iter.md
     let uc = http(port, "POST", "/api/usecases", Some(r#"{"name":"Pay Flow","description":"d","participants":["1 svc"]}"#));
     assert!(uc.contains("201"), "{}", uc);

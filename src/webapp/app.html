@@ -1648,7 +1648,8 @@ const CONFIG = {
     test_max: [100, 'maximum tests per group'],
     test_default_path: ['./test*/', 'where test groups live by default'],
     test_dir: ['test', 'the per-component test directory name — testwriter items lock <component>/<test_dir>, code items list it in codepath_ignore; exported to agents as ITER_TEST_DIR'],
-    usecase_default_location: ['{codepath}/usecases/', 'where NEW use-case files are created ({codepath} = the resolved code root) — creation only; the scanner finds *usecase.iter.md anywhere'],
+    usecase_default_path: ['{codepath}/usecases/', 'where NEW use-case files are created ({codepath} = the resolved code root) — creation only; the scanner finds *usecase.iter.md anywhere'],
+    interface_default_path: ['{codepath}/interfaces/', 'where NEW interface files are created (<id>.interface.iter.md, one file per id — shared contracts, 1:M with C4 objects) — creation only; the scanner finds *interface.iter.md anywhere; exported to agents as ITER_INTERFACE_DIR'],
     log_default_path: ['./logs/{YYYYMMDD-hh}.log', 'engine log file pattern'],
     log_level: ['info', 'debug | info | warn | error'],
     log_max_size_mb: [10, 'rotate log at this size'],
@@ -2137,7 +2138,7 @@ function markerAncestors(key){
 }
 
 /* Use-case CRUD: create + edit share one lightbox form; files are ordinary
-   participants: markers (created ones land in globalsettings.usecase_default_location,
+   participants: markers (created ones land in globalsettings.usecase_default_path,
    default {codepath}/usecases/). */
 function ucForm(idx){
   const u = idx >= 0 ? USECASES[idx]

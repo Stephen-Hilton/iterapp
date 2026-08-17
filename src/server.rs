@@ -918,7 +918,7 @@ fn usecase_path(project: &Path, raw: &str) -> Result<PathBuf, String> {
 
 /// POST /api/usecases (create), PUT /api/usecases (update: body carries `file`),
 /// POST /api/usecases/delete. Use-cases are ordinary marker files; created ones land
-/// in `globalsettings.usecase_default_location` (default `{codepath}/usecases/` —
+/// in `globalsettings.usecase_default_path` (default `{codepath}/usecases/` —
 /// keep it inside the project or code root, or update/delete will refuse the path),
 /// updates rewrite the file wherever it already lives.
 fn api_usecases(req: &Req, project: &Path, action: &str) -> Resp {

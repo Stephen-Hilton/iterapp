@@ -247,7 +247,7 @@ requirements, interfaces, constraints. The marker IS the context file.
   discovered use-case below Interfaces — expandable rows (file, participants with
   resolved node names and unknown-key flags, story body) where expanding also threads
   the red line, plus New/Edit/Delete. Created files land in
-  `globalsettings.usecase_default_location` (default `{codepath}/usecases/`) as
+  `globalsettings.usecase_default_path` (default `{codepath}/usecases/`) as
   `<slug>.usecase.iter.md` — creation only; the scanner finds `*usecase.iter.md` anywhere;
   edits rewrite the file wherever it lives; the API (`POST/PUT /api/usecases`,
   `POST /api/usecases/delete`) refuses paths outside the project and files that aren't

@@ -60,7 +60,13 @@ pub struct GlobalSettings {
     /// only — the scanner finds `*usecase.iter.md` anywhere, so there is no
     /// preferred read location. `{codepath}` expands to the resolved code root;
     /// a relative path resolves against the engine home.
-    pub usecase_default_location: String,
+    #[serde(alias = "usecase_default_location")]
+    pub usecase_default_path: String,
+    /// Where NEW interface files are created (`<id>.interface.iter.md`, one file
+    /// per interface id — shared logical contracts, 1:M with C4 objects). Creation
+    /// only — the scanner finds `*interface.iter.md` anywhere. Same expansion
+    /// rules as `usecase_default_path`. Exported to agents as ITER_INTERFACE_DIR.
+    pub interface_default_path: String,
     pub log_default_path: String,
     pub log_level: String,
     pub log_max_size_mb: u64,
@@ -76,7 +82,8 @@ impl Default for GlobalSettings {
             test_max: 100,
             test_default_path: "./test*/".into(),
             test_dir: "test".into(),
-            usecase_default_location: "{codepath}/usecases/".into(),
+            usecase_default_path: "{codepath}/usecases/".into(),
+            interface_default_path: "{codepath}/interfaces/".into(),
             log_default_path: "./logs/{YYYYMMDD-hh}.log".into(),
             log_level: "info".into(),
             log_max_size_mb: 10,
@@ -196,10 +203,20 @@ pub fn code_root(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
 }
 
 /// Directory where NEW use-case files are created
-/// (`globalsettings.usecase_default_location`, default `{codepath}/usecases/`).
+/// (`globalsettings.usecase_default_path`, default `{codepath}/usecases/`).
 pub fn usecase_dir(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
-    let raw = cfg.globalsettings.usecase_default_location.trim();
-    let raw = if raw.is_empty() { "{codepath}/usecases/" } else { raw };
+    default_dir(project_root, cfg, &cfg.globalsettings.usecase_default_path, "{codepath}/usecases/")
+}
+
+/// Directory where NEW interface files are created
+/// (`globalsettings.interface_default_path`, default `{codepath}/interfaces/`).
+pub fn interface_dir(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
+    default_dir(project_root, cfg, &cfg.globalsettings.interface_default_path, "{codepath}/interfaces/")
+}
+
+fn default_dir(project_root: &Path, cfg: &Config, raw: &str, fallback: &str) -> std::path::PathBuf {
+    let raw = raw.trim();
+    let raw = if raw.is_empty() { fallback } else { raw };
     let expanded = raw.replace("{codepath}", &code_root(project_root, cfg).to_string_lossy());
     let path = std::path::PathBuf::from(expanded);
     if path.is_absolute() { path } else { project_root.join(path) }

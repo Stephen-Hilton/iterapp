@@ -58,6 +58,12 @@ impl Session {
             // The per-component test directory name (globalsettings.test_dir), so
             // agents scope test work without guessing the convention.
             ("ITER_TEST_DIR".to_string(), cfg.globalsettings.test_dir.clone()),
+            // Where NEW interface files are created (globalsettings.
+            // interface_default_path, resolved) — shared contracts, one file per id.
+            (
+                "ITER_INTERFACE_DIR".to_string(),
+                crate::config::interface_dir(&project_root, &cfg).to_string_lossy().into_owned(),
+            ),
             // Let the agent's Bash tool wait on long synchronous calls (critreview)
             // up to the agent's own work timeout — the natural upper bound.
             (
