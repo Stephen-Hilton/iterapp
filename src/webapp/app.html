@@ -477,7 +477,8 @@
 <div class="app">
   <aside class="side">
     <h1>Iter<span class="loop">Loop</span></h1>
-    <div class="projbrand"><b>Paydaay Core Product</b><span>pdy-dev.localhost:9741</span></div>
+    <div class="projbrand"><b>Paydaay Core Product</b><span>pdy-dev.localhost:9741</span><span
+      id="srvClock" title="server time, shown in the preferences timezone (Settings → user_timezone)"></span></div>
     <div class="navgroup">
       <div class="navhead">Iterloop</div>
       <nav class="nav">
@@ -650,6 +651,24 @@ function nowIso(){ return new Date().toISOString().replace(/\.\d+Z$/, 'Z'); }
 /* Display timezone: data stays UTC on disk; user_timezone (globalsettings) is
    applied only when rendering. IANA ids via Intl, so DST is handled for free. */
 let USER_TZ = 'UTC';
+
+/* Sidebar clock (#srvClock, under the server DNS line): wall time in the
+   preferences timezone. Reads USER_TZ on every tick, so a timezone change
+   takes effect on the next second without a reload. */
+function tickClock(){
+  const el = document.getElementById('srvClock');
+  if (!el) return;
+  try {
+    el.textContent = new Intl.DateTimeFormat(undefined, {
+      timeZone: USER_TZ, weekday: 'short', hour: '2-digit', minute: '2-digit',
+      second: '2-digit', hour12: false, timeZoneName: 'short',
+    }).format(new Date());
+  } catch (e) {
+    el.textContent = new Date().toLocaleTimeString(); // bad tz id: browser-local fallback
+  }
+}
+setInterval(tickClock, 1000);
+tickClock(); // first paint now, not a second from now
 const TZ_COMMON = [
   ['UTC', 'UTC'],
   ['America/Los_Angeles', 'US Pacific'],
