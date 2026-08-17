@@ -51,19 +51,22 @@ context — it will not appear in the project structure at all.
       (context body other agents read)
 
   Give the code root itself a `level: project` marker so the tree has a top.
-- **Each `*.interface.iter.md`** declares ONE data contract:
+- **Each `*.interface.iter.md`** declares ONE logical data contract:
 
       ---
       interface: interface-id
-      kind: json              # wire/format kind: json | xml | http | grpc | kafka | sql | cli | library | …
-      endpoint: "POST /v1/example"    # optional — only when a fixed address exists
+      kind: json              # format family of the messages: json | xml | text | binary | library | …
       description: "one line on what data crosses this boundary"
       ---
-      (the body is an EXAMPLE of the data exchanged — a fenced block of the
-      format, pseudo-JSON/XML/kwargs welcome; encode invariants as fields of
-      the example. NEVER who provides/consumes it or how it is used — the
-      structure graph carries that via marker provides:/uses: keys. Model:
-      sample/greet-msg.interface.iter.md)
+      (the body is the logical messages exchanged, shown as EXAMPLES — fenced
+      request/reply shapes with constraints as inline comments, plus a
+      strict-JSON worked-examples block. Transport-neutral: the same messages
+      must survive any carrier, so routes/ports/topics/flags/exit codes are
+      binding facts that live on the serving object's marker, never here.
+      NEVER who provides/consumes it — marker provides:/uses: keys carry that.
+      Test: a stranger could implement either side from this file alone, and
+      nothing changes if a component is rebuilt or redeployed differently.
+      Model: sample/greet-msg.interface.iter.md)
 
 - `*.bizreq.iter.md` / `*.techreq.iter.md` need no frontmatter (they are plain
   context), but the node and interface markers above are not optional.
