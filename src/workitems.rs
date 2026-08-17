@@ -11,6 +11,43 @@ pub const STATE_IN_PROGRESS: &str = "in-progress";
 pub const STATE_PAUSED: &str = "paused";
 pub const STATE_FAILED: &str = "failed";
 pub const STATE_COMPLETE: &str = "complete";
+/// A schedule template (itersched.rs): never picked by the loop — itersched
+/// clones it into queued runs on cadence. Pausing it stops the schedule;
+/// completing it retires the schedule.
+pub const STATE_SCHEDULED: &str = "scheduled";
+
+pub const EXEC_AGENT: &str = "agent";
+pub const EXEC_SHELL: &str = "shell";
+
+/// When a `scheduled` template fires (itersched.rs): the schedule spec.
+/// Minute granularity by design — the check cadence is 59s.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct Sched {
+    /// "every" (every_min minutes) | "daily" (at HH:MM tz) | "weekly" (day + at
+    /// HH:MM tz) | "stale" (when no clone has COMPLETED within every_min minutes).
+    pub kind: String,
+    pub every_min: u64,
+    /// "HH:MM" 24h, for daily/weekly.
+    pub at: String,
+    /// "mon".."sun", for weekly.
+    pub day: String,
+    /// IANA timezone; empty = globalsettings.user_timezone.
+    pub tz: String,
+    /// ISO timestamp of the last fire (clone creation) — the durable restart
+    /// memory; the audit trail is .iter/.engine/sched_log.jsonl.
+    pub last_fired: String,
+}
+
+impl Sched {
+    pub fn is_none(&self) -> bool {
+        self.kind.is_empty()
+    }
+}
+
+fn is_agent_exec(s: &str) -> bool {
+    s.is_empty() || s == EXEC_AGENT
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -47,6 +84,17 @@ pub struct WorkItem {
     /// Informational snapshot: which tests were red when this item was born.
     /// Diagnosis starting point only — enforcement is group-level.
     pub source_tests: Vec<String>,
+    /// Provenance of itersched-born runs: the workid of the `scheduled` template
+    /// this item was cloned from. Dedup key — one OPEN clone per schedule.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub source_schedule: String,
+    /// Executor: "agent" (default — a claude session) or "shell" (the engine runs
+    /// prework/mainwork/postwork lines as shell commands directly; no LLM).
+    #[serde(skip_serializing_if = "is_agent_exec")]
+    pub exec: String,
+    /// The schedule spec; only meaningful while state == "scheduled".
+    #[serde(skip_serializing_if = "Sched::is_none")]
+    pub sched: Sched,
     pub context: Vec<String>,
     pub testfiles: Vec<String>,
     pub prework: Vec<String>,
@@ -72,6 +120,9 @@ impl Default for WorkItem {
             codepath_ignore: Vec::new(),
             source_testgroup: String::new(),
             source_tests: Vec::new(),
+            source_schedule: String::new(),
+            exec: EXEC_AGENT.into(),
+            sched: Sched::default(),
             context: Vec::new(),
             testfiles: Vec::new(),
             prework: Vec::new(),

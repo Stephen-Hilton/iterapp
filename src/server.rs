@@ -389,19 +389,27 @@ fn api_meta(project: &Path) -> Resp {
                     "max_agent_count": a.max_agent_count, "model": a.model })
         })
         .collect();
-    let mut prepost: Vec<String> = std::fs::read_dir(project.join(".iter/prepostwork"))
+    // .md files are prompt steps (run in the agent conversation); .sh files are
+    // shell steps — flagged so the UI can render them differently.
+    let mut prepost: Vec<Value> = std::fs::read_dir(project.join(".iter/prepostwork"))
         .map(|entries| {
             entries
                 .flatten()
                 .filter_map(|e| {
                     let p = e.path();
-                    (p.extension().and_then(|x| x.to_str()) == Some("md"))
-                        .then(|| p.file_stem().unwrap().to_string_lossy().into_owned())
+                    let ext = p.extension().and_then(|x| x.to_str())?;
+                    let exec = match ext {
+                        "md" => "agent",
+                        "sh" => "shell",
+                        _ => return None,
+                    };
+                    let name = p.file_stem()?.to_string_lossy().into_owned();
+                    Some(json!({ "name": name, "exec": exec }))
                 })
                 .collect()
         })
         .unwrap_or_default();
-    prepost.sort();
+    prepost.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     let settings = project_settings(project);
     let code_root = config::code_root(project, &config::load(project));
     json_resp(
@@ -447,11 +455,21 @@ fn api_create(req: &Req, project: &Path) -> Resp {
     if item.times.added.is_empty() {
         item.times.added = workitems::now_iso();
     }
-    if !matches!(item.state.as_str(), "queued" | "todo" | "paused") {
+    if !item.sched.is_none() {
+        // A schedule template (itersched.rs): user-created only — this API is the
+        // user's path; `iter add` (the agents' path) refuses schedules. Valid
+        // states are scheduled (live) or paused (schedule off).
+        if !matches!(item.sched.kind.as_str(), "every" | "daily" | "weekly" | "stale") {
+            return err_resp(400, "sched.kind must be every|daily|weekly|stale");
+        }
+        if !matches!(item.state.as_str(), "scheduled" | "paused") {
+            item.state = workitems::STATE_SCHEDULED.into();
+        }
+    } else if !matches!(item.state.as_str(), "queued" | "todo" | "paused") {
         item.state = workitems::STATE_QUEUED.into();
     }
     let known: Vec<String> = crate::agents::discover(project).into_iter().map(|a| a.type_name).collect();
-    let warning = (!known.is_empty() && !known.contains(&item.item_type))
+    let warning = (item.exec != workitems::EXEC_SHELL && !known.is_empty() && !known.contains(&item.item_type))
         .then(|| format!("type \"{}\" matches no agent in .iter/agents/", item.item_type));
     if let Err(e) = queue.append(&item) {
         return err_resp(500, &format!("cannot append: {}", e));
@@ -476,7 +494,7 @@ fn api_get(project: &Path, id: &str) -> Resp {
 
 const EDITABLE: &[&str] = &[
     "title", "type", "priority", "risk", "source", "codepath", "codepath_ignore", "context", "testfiles", "prework",
-    "postwork", "mainwork",
+    "postwork", "mainwork", "exec", "sched",
 ];
 
 fn api_patch(req: &Req, project: &Path, id: &str) -> Resp {
@@ -488,8 +506,11 @@ fn api_patch(req: &Req, project: &Path, id: &str) -> Resp {
         let Some(item) = items.iter_mut().find(|i| i.workid == id) else {
             return Err((404, "no such open work item".to_string()));
         };
-        if item.state != workitems::STATE_TODO && item.state != workitems::STATE_PAUSED {
-            return Err((409, format!("only todo/paused items are editable (state: {})", item.state)));
+        if item.state != workitems::STATE_TODO
+            && item.state != workitems::STATE_PAUSED
+            && item.state != workitems::STATE_SCHEDULED
+        {
+            return Err((409, format!("only todo/paused/scheduled items are editable (state: {})", item.state)));
         }
         let mut v = serde_json::to_value(&*item).expect("serializes");
         for (key, val) in &patch {
@@ -517,6 +538,21 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
     let action = body.get("action").and_then(|a| a.as_str()).unwrap_or("");
     let queue = queue_for(project);
 
+    // Engine-owned semantics (not a UI convention): "queueing" a SCHEDULED item
+    // means clone-and-queue a run of it — the template itself never queues.
+    // itersched::fire dedups under the record lock, so this happens before (not
+    // inside) the with_lock below.
+    if matches!(action, "queue" | "requeue")
+        && queue.load().iter().any(|i| i.workid == id && i.state == workitems::STATE_SCHEDULED)
+    {
+        let cfg = config::load(project);
+        return match crate::itersched::fire(project, &cfg, id, "manual queue") {
+            Ok(Some(clone)) => json_resp(200, json!({ "state": "scheduled", "workid": clone, "fired": true })),
+            Ok(None) => err_resp(409, "an earlier run of this schedule is still open — no duplicate created"),
+            Err(e) => err_resp(500, &e),
+        };
+    }
+
     let result = queue.with_lock(|items| {
         let Some(pos) = items.iter().position(|i| i.workid == id) else {
             return Err((404, "no such open work item".to_string()));
@@ -537,6 +573,14 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
             "pause" => {
                 items[pos].state = workitems::STATE_PAUSED.into();
                 Ok(json!({ "state": "paused" }))
+            }
+            "schedule" => {
+                // todo/paused → scheduled (needs a schedule spec on the item).
+                if items[pos].sched.is_none() {
+                    return Err((400, "item has no sched spec — set sched.kind (every|daily|weekly|stale) first".to_string()));
+                }
+                items[pos].state = workitems::STATE_SCHEDULED.into();
+                Ok(json!({ "state": "scheduled" }))
             }
             "complete" => {
                 items[pos].state = workitems::STATE_COMPLETE.into();
@@ -560,7 +604,7 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
                 items.push(copy);
                 Ok(json!({ "state": "todo", "workid": workid }))
             }
-            _ => Err((400, "action must be queue|todo|pause|complete|delete|clone".to_string())),
+            _ => Err((400, "action must be queue|todo|pause|schedule|complete|delete|clone".to_string())),
         }
     });
     match result {

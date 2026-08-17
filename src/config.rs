@@ -17,6 +17,12 @@ pub struct EngineConfig {
     /// Daily spend cap in USD, summed from each turn's total_cost_usd. 0 = off.
     /// At the cap the engine auto-drains (finishes in-flight, picks nothing new).
     pub max_cost_usd_per_day: f64,
+    /// Concurrent exec:"shell" work items (engine-run commands, no LLM). Separate
+    /// from agent slots: shell runs are cheap and must not starve behind them.
+    pub max_shell_workers: usize,
+    /// Wall-clock budget per shell command in an exec:"shell" item; overrun kills
+    /// the command and fails the item (normal attempt/backoff rules apply).
+    pub shell_timeout_sec: u64,
 }
 
 impl Default for EngineConfig {
@@ -33,6 +39,8 @@ impl Default for EngineConfig {
             retry_backoff_sec: 300,
             max_attempts: 3,
             max_cost_usd_per_day: 0.0,
+            max_shell_workers: 2,
+            shell_timeout_sec: 3600,
         }
     }
 }

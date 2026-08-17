@@ -767,3 +767,123 @@ fn runtests_claims_and_sweep_lifecycle() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn itersched_fires_and_shell_executor_runs() {
+    let (root, stub) = setup_project("sched", 3, 200);
+    // A queued exec:"shell" item: the engine runs the commands directly — no agent.
+    seed(&root, r#"{"workid":"e2e-shell-1","type":"chore","state":"queued","exec":"shell","title":"shell run","codepath":".","prework":["echo pre-step"],"mainwork":"echo hello-from-shell","postwork":["echo post-step"],"times":{"added":"2026-01-01T00:00:00Z"}}"#);
+    // A schedule template overdue on its interval: fires on the first itersched check.
+    seed(&root, r#"{"workid":"e2e-sched-1","type":"chore","state":"scheduled","exec":"shell","title":"minutely echo","codepath":".","mainwork":"echo scheduled-run","priority":8,"sched":{"kind":"every","every_min":1},"times":{"added":"2026-01-01T00:00:00Z"}}"#);
+
+    let stdout = run_engine(&root, &stub, Duration::from_secs(60));
+
+    // Only the template stays open — it is never picked, and its clone completed.
+    let open = open_items(&root);
+    assert_eq!(open.len(), 1, "open: {:?}", open);
+    assert_eq!(open[0]["workid"], "e2e-sched-1");
+    assert_eq!(open[0]["state"], "scheduled");
+    assert!(
+        !open[0]["sched"]["last_fired"].as_str().unwrap_or("").is_empty(),
+        "last_fired persists on the template: {:?}",
+        open[0]
+    );
+
+    let closed = closed_items(&root);
+    let shell = closed.iter().find(|i| i["workid"] == "e2e-shell-1").expect("shell item closes");
+    assert_eq!(shell["state"], "complete");
+    let out = shell["output"].as_str().unwrap();
+    assert!(out.contains("pre-step") && out.contains("hello-from-shell") && out.contains("post-step"), "{}", out);
+    assert!(!out.contains("fake agent output"), "no LLM turn may run for exec:shell: {}", out);
+
+    let clone = closed
+        .iter()
+        .find(|i| i["source_schedule"] == "e2e-sched-1")
+        .expect("the schedule fired exactly one clone");
+    assert_eq!(clone["state"], "complete");
+    assert_eq!(clone["source"], "scheduler");
+    assert_eq!(clone["priority"], 8, "clone inherits the template's priority");
+    assert!(clone["output"].as_str().unwrap().contains("scheduled-run"));
+
+    // Audit trail + engine log line.
+    let log = std::fs::read_to_string(root.join(".iter/.engine/sched_log.jsonl")).unwrap();
+    assert_eq!(log.lines().count(), 1, "{}", log);
+    assert!(log.contains("e2e-sched-1"));
+    assert!(stdout.contains("fired"), "{}", stdout);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn schedule_api_semantics() {
+    let dest = std::env::temp_dir().join(format!("iterloop-e2e-schedapi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(dest.join(".iter/.engine")).unwrap();
+    std::fs::write(
+        dest.join(".iter/.engine/config.json"),
+        r#"{"engine":{"tick_interval_sec":1},"globalsettings":{"log_default_path":""}}"#,
+    )
+    .unwrap();
+    let port = 12000 + (std::process::id() % 20000) as u16;
+    let mut child = Command::new(BIN)
+        .args(["start", "--project", dest.to_str().unwrap(), "--port", &port.to_string()])
+        .env("ITER_CLAUDE_BIN", "/usr/bin/false")
+        .env("HOME", &dest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "server never came up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Invalid schedule spec is refused.
+    let bad = http(port, "POST", "/api/workitems", Some(r#"{"type":"ghost","title":"bad","mainwork":"m","sched":{"kind":"cron"}}"#));
+    assert!(bad.contains("400"), "{}", bad);
+
+    // A schedule template (type "ghost" has no agent, so clones stay queued —
+    // that keeps the dedup observable below).
+    let created = http(
+        port,
+        "POST",
+        "/api/workitems",
+        Some(r#"{"type":"ghost","title":"weekly cleanup","mainwork":"clean things","priority":8,"sched":{"kind":"weekly","day":"sun","at":"22:00","tz":"America/Los_Angeles"}}"#),
+    );
+    assert!(created.contains("201"), "{}", created);
+    let id_at = created.find("\"workid\"").unwrap();
+    let id: String = created[id_at..].chars().skip_while(|c| *c != ':').skip(1).filter(|c| c.is_ascii_hexdigit() || *c == '-').take(36).collect();
+
+    // "queue" on a scheduled item MEANS clone-and-queue (engine-owned semantics).
+    let fired = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"queue"}"#));
+    assert!(fired.contains("200") && fired.contains("\"fired\""), "{}", fired);
+    // Dedup: the clone is still open, so a second queue refuses.
+    let dup = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"queue"}"#));
+    assert!(dup.contains("409"), "{}", dup);
+    let list = http(port, "GET", "/api/workitems", None);
+    assert!(list.contains("source_schedule"), "{}", list);
+    assert!(list.contains("\"scheduler\""), "clone source is scheduler: {}", list);
+
+    // pause ↔ schedule round-trip; complete retires the schedule.
+    let paused = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"pause"}"#));
+    assert!(paused.contains("paused"), "{}", paused);
+    let resched = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"schedule"}"#));
+    assert!(resched.contains("scheduled"), "{}", resched);
+    let done = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"complete"}"#));
+    assert!(done.contains("complete"), "{}", done);
+
+    // Agents cannot schedule: `iter add` refuses a schedule spec.
+    let f = dest.join("sched-item.json");
+    std::fs::write(&f, r#"{"type":"code","mainwork":"m","state":"scheduled","sched":{"kind":"every","every_min":5}}"#).unwrap();
+    let out = Command::new(BIN)
+        .args(["add", "--project", dest.to_str().unwrap(), "--file", f.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot schedule"), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dest);
+}

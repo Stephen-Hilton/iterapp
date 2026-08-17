@@ -16,6 +16,7 @@
     --s-complete-bg: #1a9a4a; --s-complete-fg: #ffffff;
     --s-progress-bg: #e8a71c; --s-progress-fg: #241a02;
     --s-queued-bg: #2f7fd6;  --s-queued-fg: #ffffff;
+    --s-scheduled-bg: #7c4dbc; --s-scheduled-fg: #ffffff;
     --s-todo-bg: #d4589e;    --s-todo-fg: #ffffff;
     --s-failed-bg: #d43a3a;  --s-failed-fg: #ffffff;
     --s-paused-bg: #e07020;  --s-paused-fg: #ffffff;
@@ -348,6 +349,8 @@
   .setrow.wide { grid-template-columns: 250px 1fr; }
   .setrow.wide textarea { font-family: var(--mono); font-size: 12px; }
   .setfoot { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+  .pill.shellstep { border-style: dashed; }
+  .pill.shellstep.on { background: var(--s-scheduled-bg); color: #fff; border-color: var(--s-scheduled-bg); }
   .setsearch { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 2px 0 10px; }
   .setsearch input {
     width: 100%; box-sizing: border-box; background: var(--surface); border: 1px solid var(--border);
@@ -567,7 +570,10 @@ async function api(path, opts = {}) {
   return data;
 }
 
-const PREPOST = ['deploy','git-commit','git-pr','git-pull','git-push','iterloop-stop','iterloop-wait-for-stop'];
+const PREPOST = ['deploy','git-commit','git-pr','git-pull','git-push','iterloop-stop','iterloop-wait-for-stop']
+  .map(n => ({ name: n, exec: 'agent' }));
+const prepostNames = () => PREPOST.map(p => p.name);
+const prepostExec = n => (PREPOST.find(p => p.name === n) || {}).exec || 'agent';
 const AGENTS = ['plan','code','testwriter','refactor','ingest'];
 let PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // replaced by /api/meta in LIVE mode
 let HOME = '/Users/stephen.hilton';                              // replaced by /api/meta in LIVE mode
@@ -634,6 +640,7 @@ const STATES = {
   'queued':      { label:'Queued',      icon:'◷', bg:'var(--s-queued-bg)',   fg:'var(--s-queued-fg)',   order:1 },
   'todo':        { label:'ToDo',        icon:'☐', bg:'var(--s-todo-bg)',     fg:'var(--s-todo-fg)',     order:2 },
   'paused':      { label:'Paused',      icon:'❙❙', bg:'var(--s-paused-bg)',  fg:'var(--s-paused-fg)',   order:3 },
+  'scheduled':   { label:'Scheduled',   icon:'⏱', bg:'var(--s-scheduled-bg)', fg:'var(--s-scheduled-fg)', order:3.5 },
   'failed':      { label:'Failed',      icon:'✕', bg:'var(--s-failed-bg)',   fg:'var(--s-failed-fg)',   order:4 },
   'complete':    { label:'Complete',    icon:'✓', bg:'var(--s-complete-bg)', fg:'var(--s-complete-fg)', order:5 },
 };
@@ -839,7 +846,7 @@ async function loadAll(){
     AGENTS.length = 0;
     meta.agents.forEach(a => AGENTS.push(a.type));
     PREPOST.length = 0;
-    meta.prepostwork.forEach(p => PREPOST.push(p));
+    meta.prepostwork.forEach(p => PREPOST.push(typeof p === 'string' ? { name: p, exec: 'agent' } : p));
     PROJECT_ROOT = meta.code_root || meta.project_root;
     if (meta.home) HOME = meta.home;
     if (meta.reqs_dir) REQS_DIR = meta.reqs_dir;
@@ -959,11 +966,24 @@ function visibleItems(){
   return list.sort(cmp);
 }
 
+function schedDesc(sc){
+  if (!sc || !sc.kind) return '';
+  if (sc.kind === 'every') return `every ${sc.every_min}m`;
+  if (sc.kind === 'stale') return `if idle ${sc.every_min}m`;
+  if (sc.kind === 'daily') return `daily ${sc.at}${sc.tz ? ' ' + sc.tz : ''}`;
+  return `${sc.day} ${sc.at}${sc.tz ? ' ' + sc.tz : ''}`;
+}
+
 function pillRow(assigned, editable, phase){
-  const inlineLits = assigned.filter(x => !PREPOST.includes(x));
-  const pool = PREPOST.map(name => {
+  const names = prepostNames();
+  const inlineLits = assigned.filter(x => !names.includes(x));
+  const pool = PREPOST.map(({ name, exec }) => {
     const on = assigned.includes(name);
-    return `<button class="pill ${on?'on':''} ${editable?'toggle':''}" ${editable?`data-toggle="${phase}" data-name="${esc(name)}"`:'disabled tabindex="-1" style="cursor:default"'}>${esc(name)}</button>`;
+    const shell = exec === 'shell';
+    const why = shell
+      ? `engine-run shell script (.iter/prepostwork/${name}.sh) — runs deterministically, no LLM; its output feeds the next step`
+      : `prompt step (.iter/prepostwork/${name}.md) — runs as an agent turn`;
+    return `<button class="pill ${on?'on':''} ${shell?'shellstep':''} ${editable?'toggle':''}" title="${esc(why)}" ${editable?`data-toggle="${phase}" data-name="${esc(name)}"`:'disabled tabindex="-1" style="cursor:default"'}>${shell?'⚙ ':''}${esc(name)}</button>`;
   });
   const lits = inlineLits.map(t =>
     `<span class="pill on inline-lit" title="Inline literal step: ${esc(t)}">“${esc(t)}”</span>`);
@@ -994,6 +1014,9 @@ function renderRows(){
             <span class="chip" style="background:var(--s-queued-bg);color:#fff" title="Requested by">${esc(sourceLabel(item.source))}</span>
             ${testChip(item)}
             ${item.source_testgroup ? `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="Born from this testgroup (sweep provenance)${(item.source_tests||[]).length ? ' — red at birth: ' + esc(item.source_tests.join(', ')) : ''}">TG: ${esc(item.source_testgroup)}</span>` : ''}
+            ${item.sched && item.sched.kind ? `<span class="chip mono" style="background:var(--s-scheduled-bg);color:#fff" title="Schedule — last fired: ${esc(item.sched.last_fired || 'never')}">⏱ ${esc(schedDesc(item.sched))}</span>` : ''}
+            ${item.source_schedule ? `<span class="chip" style="background:var(--s-scheduled-bg);color:#fff" title="Born from schedule ${esc(item.source_schedule)}">SCHED RUN</span>` : ''}
+            ${item.exec === 'shell' ? `<span class="chip mono" style="background:var(--s-paused-bg);color:#fff" title="exec: shell — the engine runs the steps as shell commands; no LLM">⚙ shell</span>` : ''}
             <span class="chip kv mono" title="Attempts">A:${item.attempts}</span>
             <span class="chip meta mono" title="Stored UTC: ${esc(item.times.added)}">Requested: <b>${esc(fmtTs(item.times.added))}</b></span>
             <span class="chip meta mono">ID: <b>${esc(shortId(item))}</b></span>
@@ -1034,8 +1057,21 @@ function actionButtons(item){
       <div class="sep"></div>
       <span class="note">Agent is running — the engine owns this item until it finishes.</span>`;
   }
+  if (s === 'scheduled') {
+    // Engine-owned semantics: queueing a schedule clones a run into the queue;
+    // the template itself never queues. Complete retires the schedule.
+    return `<button data-act="queue" data-id="${item.workid}" role="menuitem">Run Now</button>
+      <button data-act="pause" data-id="${item.workid}" role="menuitem">Pause Schedule</button>
+      <button data-act="pauseedit" data-id="${item.workid}" role="menuitem">Pause &amp; Edit</button>
+      <button data-act="complete" data-id="${item.workid}" role="menuitem">Complete (retire schedule)</button>
+      <button data-act="clone" data-id="${item.workid}" role="menuitem">Clone</button>
+      <div class="sep"></div>
+      <span class="note">Run Now clones this schedule into a queued run (skipped if one is still open).</span>
+      <button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete</button>`;
+  }
   const b = [];
   if (s === 'todo' || s === 'paused') b.push(['queue','Queue']);
+  if ((s === 'todo' || s === 'paused') && item.sched && item.sched.kind) b.push(['schedule','Resume Schedule']);
   if (s === 'failed') b.push(['queue','Requeue (Retry)']);
   if (s !== 'complete') { b.push(['complete','Complete']); b.push(['pauseedit','Pause &amp; Edit']); }
   if (s === 'complete') b.push(['followup','Create Follow-up Request']);
@@ -1154,9 +1190,9 @@ function lbContext(item){
     <h4 style="margin:16px 0 6px">Composed turn sequence</h4>
     <table class="t"><thead><tr><th>#</th><th>Turn</th><th>Prompt source</th></tr></thead><tbody>
       ${[
-        ...item.prework.map((p,i)=>[`${i+1}`, PREPOST.includes(p)?`prework:${p}`:'prework:inline', PREPOST.includes(p)?`.iter/prepostwork/${p}.md`:'inline literal from work item']),
+        ...item.prework.map((p,i)=>[`${i+1}`, prepostNames().includes(p)?`prework:${p}`:'prework:inline', prepostNames().includes(p)?`.iter/prepostwork/${p}.${prepostExec(p)==='shell'?'sh':'md'}`:'inline literal from work item']),
         [`${item.prework.length+1}`, 'mainwork (+ spin-up on first turn)', 'work item request + agent definition + source instructions + context list'],
-        ...item.postwork.map((p,i)=>[`${item.prework.length+2+i}`, `postwork:${p}`, `.iter/prepostwork/${p}.md`]),
+        ...item.postwork.map((p,i)=>[`${item.prework.length+2+i}`, `postwork:${p}`, `.iter/prepostwork/${p}.${prepostExec(p)==='shell'?'sh':'md'}`]),
         [`${item.prework.length+item.postwork.length+2}`, 'selfcheck', 'engine-composed: re-read agent definition, confirm completion'],
       ].map(([n,t2,s]) => `<tr><td class="mono">${n}</td><td><b>${esc(t2)}</b></td><td style="color:var(--text-dim)">${esc(s)}</td></tr>`).join('')}
     </tbody></table>`);
@@ -1178,7 +1214,7 @@ function lbLogs(item){
   const push = (ts, lvl, msg) => ts && lines.push(`${fmtTimeOnly(ts)} ${lvl}  [${tag}]  ${msg}`);
   push(item.times.start, 'INFO ', `picked ${shortId(item)} "${item.title.slice(0,44)}…" (prio ${item.priority}, source ${item.source}, attempt ${item.attempts||1})`);
   push(item.times.start, 'INFO ', `codepath lock acquired: ${item.codepath}`);
-  item.prework.forEach(p => push(item.times.preworkdone, 'INFO ', `prework:${PREPOST.includes(p)?p:'inline(…)'} done`));
+  item.prework.forEach(p => push(item.times.preworkdone, 'INFO ', `prework:${prepostNames().includes(p)?p:'inline(…)'} done`));
   push(item.times.mainworkdone, 'INFO ', 'mainwork done');
   item.postwork.forEach(p => push(item.times.postworkdone, 'INFO ', `postwork:${p} done`));
   if (item.state === 'failed') push(item.times.start, 'ERROR', item.lasterror || 'mainwork failed');
@@ -1209,7 +1245,7 @@ function openForm(mode, source, priorState){
   const titleMap = { create:'New WorkItem', edit:'Edit WorkItem — ' + shortId(d), clone:'Clone WorkItem', followup:'Create Follow-up Request' };
 
   const agentOpts = AGENTS.map(a => `<option value="${a}" ${d.type===a?'selected':''}>${a}</option>`).join('');
-  const srcOpts = ['user','error',...AGENTS.map(a=>'agent: '+a)]
+  const srcOpts = ['user','error','scheduler',...AGENTS.map(a=>'agent: '+a)]
     .map(s => `<option value="${esc(s)}" ${d.source===s?'selected':''}>${esc(s)}</option>`).join('');
 
   openLb(titleMap[mode], `
@@ -1219,6 +1255,10 @@ function openForm(mode, source, priorState){
       <span class="flabel">Agent</span>
       <div class="inline">
         <select id="f_type">${agentOpts}</select>
+        <select id="f_exec" title="Executor — agent: a claude session does the work (LLM). shell: the engine runs prework/mainwork/postwork as shell commands directly, no LLM.">
+          <option value="agent" ${(d.exec||'agent')!=='shell'?'selected':''}>exec: agent (LLM)</option>
+          <option value="shell" ${d.exec==='shell'?'selected':''}>exec: shell (engine-run)</option>
+        </select>
         <label>Priority <input type="range" id="f_priority" min="0" max="10" value="${d.priority}"
           oninput="document.getElementById('pv').textContent=this.value"><span class="rangeval" id="pv">${d.priority}</span></label>
         <label>Risk <input type="range" id="f_risk" min="0" max="10" value="${d.risk}"
@@ -1226,7 +1266,23 @@ function openForm(mode, source, priorState){
       </div>
       <span class="flabel">Source</span>
       <div class="inline"><select id="f_source">${srcOpts}</select>
-        <span style="color:var(--text-dim);font-size:12px">who requested this work</span></div>
+        <span style="color:var(--text-dim);font-size:12px">who requested this work — <b>scheduler</b> makes this a schedule template</span></div>
+      <span class="flabel" id="f_schedlabel" style="display:none">Schedule</span>
+      <div id="f_schedrow" style="display:none">
+        <div class="inline">
+          <select id="f_sk">
+            <option value="every" ${(d.sched&&d.sched.kind)==='every'?'selected':''}>every NN minutes</option>
+            <option value="daily" ${(d.sched&&d.sched.kind)==='daily'?'selected':''}>every day at HH:MM</option>
+            <option value="weekly" ${(d.sched&&d.sched.kind)==='weekly'?'selected':''}>weekly on a day at HH:MM</option>
+            <option value="stale" ${(d.sched&&d.sched.kind)==='stale'?'selected':''}>when not run in NN minutes</option>
+          </select>
+          <label id="f_sk_every">NN <input type="number" id="f_severy" min="1" style="width:80px" value="${(d.sched&&d.sched.every_min)||60}"> min</label>
+          <label id="f_sk_day" style="display:none">on <select id="f_sday">${['mon','tue','wed','thu','fri','sat','sun'].map(x=>`<option ${(d.sched&&d.sched.day)===x?'selected':''}>${x}</option>`).join('')}</select></label>
+          <label id="f_sk_at" style="display:none">at <input type="text" id="f_sat" class="mono" style="width:70px" placeholder="HH:MM" value="${esc((d.sched&&d.sched.at)||'02:00')}"></label>
+          <label id="f_sk_tz" style="display:none">tz <input type="text" id="f_stz" class="mono" style="width:180px" placeholder="${esc(USER_TZ)} (preferences)" value="${esc((d.sched&&d.sched.tz)||'')}"></label>
+        </div>
+        <div class="pathhint" style="opacity:.75">minute granularity (itersched checks every 59s) · daily/weekly occurrences missed while the server was down are skipped, never backfilled · each run is a CLONE queued at this item’s priority · one open run at a time — a still-open run suppresses the next fire</div>
+      </div>
       <span class="flabel">CodePath</span>
       <div>
         <input type="text" id="f_codepath" class="mono" value="${esc(d.codepath)}"
@@ -1263,7 +1319,8 @@ function openForm(mode, source, priorState){
     </div>`,
     (() => {
       // Default target state: new items default to queued; pause & edit defaults to the
-      // item's state before pausing. The selector lets either land anywhere pre-processing.
+      // item's state before pausing. Scheduler-sourced items can only land in
+      // scheduled|paused (syncSched below rewrites the options live).
       const SAVE_STATES = [['queued','Queued'],['todo','ToDo'],['paused','Paused']];
       const def = mode === 'edit'
         ? (SAVE_STATES.some(([v]) => v === priorState) ? priorState : 'queued')
@@ -1280,6 +1337,30 @@ function openForm(mode, source, priorState){
   $('f_prelit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('prework', e.target); }});
   $('f_postlit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('postwork', e.target); }});
   $('f_codepath').addEventListener('input', e => { $('f_pathhint').textContent = '→ ' + absCodepath(e.target.value); });
+  // Scheduler source: reveal the schedule fields, restrict the save-state options
+  // to scheduled|paused, and nudge default priority to 8 ("run soon after the
+  // scheduled time"). All reversible by switching Source back.
+  const syncSched = () => {
+    const isSched = $('f_source').value === 'scheduler';
+    $('f_schedlabel').style.display = isSched ? '' : 'none';
+    $('f_schedrow').style.display = isSched ? '' : 'none';
+    const kind = $('f_sk').value;
+    $('f_sk_every').style.display = (kind === 'every' || kind === 'stale') ? '' : 'none';
+    $('f_sk_day').style.display = kind === 'weekly' ? '' : 'none';
+    $('f_sk_at').style.display = (kind === 'daily' || kind === 'weekly') ? '' : 'none';
+    $('f_sk_tz').style.display = (kind === 'daily' || kind === 'weekly') ? '' : 'none';
+    const cur = $('f_savestate').value;
+    const opts = isSched ? [['scheduled','Scheduled'],['paused','Paused']]
+                         : [['queued','Queued'],['todo','ToDo'],['paused','Paused']];
+    const def = opts.some(([v]) => v === cur) ? cur
+      : isSched ? (priorState === 'paused' ? 'paused' : 'scheduled')
+      : (mode === 'edit' && opts.some(([v]) => v === priorState) ? priorState : 'queued');
+    $('f_savestate').innerHTML = opts.map(([v,l]) => `<option value="${v}" ${v===def?'selected':''}>${l}</option>`).join('');
+    if (isSched && +$('f_priority').value === 5) { $('f_priority').value = 8; document.getElementById('pv').textContent = '8'; }
+  };
+  $('f_source').addEventListener('change', syncSched);
+  $('f_sk').addEventListener('change', syncSched);
+  syncSched();
   wirePathHints('f_context', 'f_ctxhint', 'f_codepath');
   wirePathHints('f_testfiles', 'f_tfhint', 'f_codepath');
   $('saveGo').addEventListener('click', () => saveDraft($('f_savestate').value));
@@ -1306,6 +1387,14 @@ function saveDraft(targetState){
   d.context = $('f_context').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.testfiles = $('f_testfiles').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.mainwork = $('f_mainwork').value;
+  d.exec = $('f_exec').value;
+  if ($('f_source').value === 'scheduler') {
+    d.sched = { kind: $('f_sk').value, every_min: +$('f_severy').value || 0,
+      at: $('f_sat').value.trim(), day: $('f_sday').value, tz: $('f_stz').value.trim(),
+      last_fired: (d.sched && d.sched.last_fired) || '' };
+  } else {
+    d.sched = { kind:'', every_min:0, at:'', day:'', tz:'', last_fired:'' };
+  }
 
   if (LIVE) {
     const mode = draft.mode;
@@ -1314,8 +1403,10 @@ function saveDraft(targetState){
       const fields = { title: d.title, type: d.type, priority: d.priority, risk: d.risk,
         source: d.source, codepath: d.codepath, codepath_ignore: d.codepath_ignore,
         context: d.context, testfiles: d.testfiles,
-        prework: d.prework, postwork: d.postwork, mainwork: d.mainwork };
-      const stateAction = targetState === 'queued' ? 'queue' : targetState === 'todo' ? 'todo' : 'pause';
+        prework: d.prework, postwork: d.postwork, mainwork: d.mainwork,
+        exec: d.exec, sched: d.sched };
+      const stateAction = targetState === 'queued' ? 'queue' : targetState === 'todo' ? 'todo'
+        : targetState === 'scheduled' ? 'schedule' : 'pause';
       api(`/api/workitems/${draft.base}`, { method: 'PATCH', body: JSON.stringify(fields) })
         .then(() => postAction(draft.base, stateAction))
         .then(() => { toast(`Saved as ${targetState}`); return done(); })
@@ -1387,14 +1478,30 @@ function doAction(act, id){
     }
     const serverAction = act === 'queue' ? 'queue' : act === 'complete' ? 'complete' : act;
     postAction(id, serverAction)
-      .then(r => { toast(`${shortId(item)} → ${r.state}`); return loadAll(); })
+      .then(r => { toast(r.fired ? `Run queued (${String(r.workid).slice(0,8)}) — schedule unchanged` : `${shortId(item)} → ${r.state}`); return loadAll(); })
       .catch(e => toast('Action failed: ' + e.message));
     return;
   }
   switch (act) {
     case 'queue':
+      if (item.state === 'scheduled') {
+        // mock of the engine's clone-and-queue semantics
+        const c = JSON.parse(JSON.stringify(item));
+        c.workid = uuid(); c.state = 'queued'; c.source = 'scheduler';
+        c.source_schedule = item.workid; c.sched = null; c.attempts = 0; c.output = '';
+        c.times = { added: nowIso(), start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'' };
+        item.sched.last_fired = nowIso();
+        items.unshift(c);
+        toast(`Run queued (${shortId(c)}) — schedule unchanged`); break;
+      }
       item.state = 'queued'; item.lasterror = '';
       toast(`Queued ${shortId(item)}`); break;
+    case 'pause':
+      item.state = 'paused';
+      toast(`Paused ${shortId(item)}`); break;
+    case 'schedule':
+      item.state = 'scheduled';
+      toast(`Schedule resumed for ${shortId(item)}`); break;
     case 'complete':
       item.state = 'complete'; item.times.closed = nowIso();
       toast(`Marked ${shortId(item)} complete`); break;
@@ -1669,6 +1776,8 @@ const CONFIG = {
     retry_backoff_sec: [300, 'wait before a failed item retries'],
     max_attempts: [3, 'attempts before terminal failure'],
     max_cost_usd_per_day: [0, 'daily spend cap in USD (from each turn’s total_cost_usd); 0 = off — engine auto-drains at the cap, raise it to resume'],
+    max_shell_workers: [2, 'concurrent exec:shell work items (engine-run commands, no LLM) — separate from agent slots'],
+    shell_timeout_sec: [3600, 'wall-clock budget per shell command in an exec:shell item; overrun kills it and fails the item'],
   },
   globalsettings: {
     user_timezone: ['UTC', 'timezone for displaying timestamps — data stays UTC on disk; DST handled automatically'],

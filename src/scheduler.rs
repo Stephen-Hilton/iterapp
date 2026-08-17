@@ -25,6 +25,10 @@ enum Phase {
 struct StepTurn {
     phase: Phase,
     turn: Turn,
+    /// Set when this step is an engine-run shell command (a `.sh` prepostwork
+    /// entry inside an agent item): run deterministically, no LLM turn; its
+    /// output feeds the next LLM turn's prompt.
+    shell: Option<String>,
 }
 
 pub struct RunMode {
@@ -174,6 +178,13 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
         .checked_sub(sweep_interval(&shared.cfg()).saturating_sub(std::time::Duration::from_secs(90)))
         .unwrap_or_else(Instant::now);
     let sweep_in_flight = Arc::new(AtomicBool::new(false));
+    // itersched (itersched.rs): fires due `scheduled` templates into the queue.
+    // First check on the first tick — restart memory is sched.last_fired on the
+    // templates themselves, and daily/weekly occurrences missed while down are
+    // skipped by the occurrence window, so an early check can never backfill.
+    let mut sched_last = Instant::now()
+        .checked_sub(std::time::Duration::from_secs(crate::itersched::CHECK_INTERVAL_SEC))
+        .unwrap_or_else(Instant::now);
 
     loop {
         tick += 1;
@@ -255,6 +266,17 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
             }
         }
 
+        // itersched: fire due schedules BEFORE picking, so a clone born this
+        // tick can start this tick. Minute granularity — 59s cadence.
+        if !stop_picking && !holding && sched_last.elapsed().as_secs() >= crate::itersched::CHECK_INTERVAL_SEC {
+            sched_last = Instant::now();
+            let _q = shared.queue_mutex.lock().unwrap();
+            let fired = crate::itersched::check(&project_root, &cfg);
+            if !fired.is_empty() {
+                logging::info("sched", &format!("{} schedule(s) fired this pass", fired.len()));
+            }
+        }
+
         if !stop_picking && !holding {
             let agent_defs = agents::discover(&project_root);
             // Fill slots in global priority order: every pass offers the types that
@@ -270,17 +292,18 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
                     })
                     .map(|a| a.type_name.as_str())
                     .collect();
-                if open_types.is_empty() {
+                // exec:"shell" items run engine-side (no agent, no LLM) under
+                // their own concurrency cap, independent of agent-type slots.
+                let allow_shell = running.iter().filter(|(t, _)| t == "shell").count()
+                    < cfg.engine.max_shell_workers;
+                if open_types.is_empty() && !allow_shell {
                     break;
                 }
-                let Some(item) = pick_next(&shared, &open_types) else { break };
-                let agent = agent_defs
-                    .iter()
-                    .find(|a| a.type_name == item.item_type)
-                    .expect("picked item's type comes from agent_defs")
-                    .clone();
+                let Some(item) = pick_next(&shared, &open_types, allow_shell) else { break };
                 worker_seq += 1;
-                let tag = format!("{}#{}", agent.type_name, worker_seq);
+                let is_shell = item.exec == workitems::EXEC_SHELL;
+                let type_name = if is_shell { "shell".to_string() } else { item.item_type.clone() };
+                let tag = format!("{}#{}", type_name, worker_seq);
                 logging::info(
                     &tag,
                     &format!(
@@ -302,11 +325,22 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
                     .unwrap()
                     .insert(item.workid.clone(), (resolved, item.codepath_ignore.clone()));
                 let claim = PathClaim { shared: Arc::clone(&shared), workid: item.workid.clone() };
-                let type_name = agent.type_name.clone();
-                let handle = std::thread::spawn(move || {
-                    let _claim = claim;
-                    run_workitem(shared2, agent, item, tag);
-                });
+                let handle = if is_shell {
+                    std::thread::spawn(move || {
+                        let _claim = claim;
+                        run_shell_workitem(shared2, item, tag);
+                    })
+                } else {
+                    let agent = agent_defs
+                        .iter()
+                        .find(|a| a.type_name == item.item_type)
+                        .expect("picked agent item's type comes from agent_defs")
+                        .clone();
+                    std::thread::spawn(move || {
+                        let _claim = claim;
+                        run_workitem(shared2, agent, item, tag);
+                    })
+                };
                 running.push((type_name, handle));
                 std::thread::sleep(std::time::Duration::from_millis(cfg.engine.agent_stagger_ms));
             }
@@ -431,7 +465,7 @@ fn summarize(items: &[WorkItem], running: usize) -> String {
 /// so no other pick can race it. Candidates compete on effective_priority across
 /// all allowed types, so the caller gets the globally best item, not the best of
 /// one type.
-fn pick_next(shared: &Shared, allowed_types: &[&str]) -> Option<WorkItem> {
+fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Option<WorkItem> {
     let cfg = shared.cfg();
     let _q = shared.queue_mutex.lock().unwrap();
     let deferred = {
@@ -448,10 +482,13 @@ fn pick_next(shared: &Shared, allowed_types: &[&str]) -> Option<WorkItem> {
     let mut best: Option<usize> = None;
     let mut best_repairs: Vec<String> = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        if !allowed_types.contains(&item.item_type.as_str())
-            || !item.eligible(&cfg, now)
-            || deferred.contains(&item.workid)
-        {
+        // shell items need no agent slot — their own cap gates them instead.
+        let slot_ok = if item.exec == workitems::EXEC_SHELL {
+            allow_shell
+        } else {
+            allowed_types.contains(&item.item_type.as_str())
+        };
+        if !slot_ok || !item.eligible(&cfg, now) || deferred.contains(&item.workid) {
             continue;
         }
         // Keep moving down the queue: a candidate that cannot run right now — its
@@ -611,6 +648,8 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
     let _ = std::fs::remove_file(critfail_path(&shared.project_root, &item.workid)); // stale flag from a killed prior attempt
     let mut outputs: Vec<String> = Vec::new();
 
+    // Output of engine-run shell steps, carried into the NEXT LLM turn's prompt.
+    let mut pending_shell = String::new();
     for (i, step) in turns.iter().enumerate() {
         if shared.stop_now.load(Ordering::SeqCst) {
             logging::warn(&tag, "engine stopping: requeueing after current turn");
@@ -618,7 +657,37 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
             drop(lock);
             return;
         }
-        let mut turn_result = session.run(&step.turn);
+        // A `.sh` prepostwork step: the engine runs it directly (no LLM); its
+        // output lands in the item output and prefaces the next LLM turn.
+        if let Some(cmd) = &step.shell {
+            match run_shell_command(cmd, &codepath, &session.envs, cfg.engine.shell_timeout_sec) {
+                Ok(out) => {
+                    logging::info(&tag, &format!("{} done (engine-run)", step.turn.label));
+                    outputs.push(format!("[{}] $ {}\n{}", step.turn.label, cmd, out));
+                    pending_shell.push_str(&format!("\n\n# Output of {} (engine-run shell step)\n{}", step.turn.label, out));
+                    stamp_boundaries(&shared, &item.workid, &turns, i);
+                    continue;
+                }
+                Err(e) => {
+                    let msg = format!("{} failed: {}", step.turn.label, e);
+                    logging::error(&tag, &msg);
+                    fail_item(&shared, &item, &msg, outputs.join("\n"), &tag);
+                    drop(lock);
+                    return;
+                }
+            }
+        }
+        let turn = if pending_shell.is_empty() {
+            step.turn.clone()
+        } else {
+            let t = Turn {
+                label: step.turn.label.clone(),
+                prompt: format!("{}\n\n---\n{}", pending_shell.trim_start(), step.turn.prompt),
+            };
+            pending_shell.clear();
+            t
+        };
+        let mut turn_result = session.run(&turn);
         if let Ok(outcome) = &turn_result {
             crate::spend::record(&shared.project_root, &crate::spend::SpendEntry {
                 ts: workitems::now_iso(),
@@ -681,26 +750,190 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
         }
     }
 
-    // Close-out: complete → move to workitems_closed.jsonl.
-    let output = outputs.join("\n");
-    {
-        let _q = shared.queue_mutex.lock().unwrap();
-        let queue = shared.queue();
-        let mut done = item.clone();
-        let items = queue.load();
-        if let Some(cur) = items.iter().find(|i| i.workid == item.workid) {
-            done = cur.clone();
+    close_complete(&shared, &item, outputs.join("\n"), &tag);
+    drop(lock);
+}
+
+/// Close an item out as complete (shared by agent and shell runs):
+/// remove from the open queue, append to workitems_closed.jsonl.
+fn close_complete(shared: &Shared, item: &WorkItem, output: String, tag: &str) {
+    let _q = shared.queue_mutex.lock().unwrap();
+    let queue = shared.queue();
+    let mut done = item.clone();
+    let items = queue.load();
+    if let Some(cur) = items.iter().find(|i| i.workid == item.workid) {
+        done = cur.clone();
+    }
+    done.state = workitems::STATE_COMPLETE.into();
+    done.output = output;
+    done.times.closed = workitems::now_iso();
+    fill_empty_stamps(&mut done.times);
+    if let Err(e) = queue.close(&done) {
+        logging::error(tag, &format!("close-out failed: {}", e));
+    }
+    logging::info(tag, &format!("complete → workitems_closed.jsonl; lock released ({})", short(&item.workid)));
+}
+
+/// exec:"shell" items: the engine runs prework lines, mainwork, then postwork
+/// lines as `sh -c` commands in the item's codepath — no agent, no LLM, no
+/// spend. Same lifecycle as agent runs otherwise: codepath lock, attempts and
+/// backoff on failure, close-out on success; each command's stdout+stderr is
+/// captured into the item's output.
+fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
+    let cfg = shared.cfg();
+    let code_root = config::code_root(&shared.project_root, &cfg);
+    let codepath = resolve_codepath(&code_root, &item.codepath);
+    if !codepath.is_dir() {
+        let msg = format!(
+            "codepath does not exist: {} (stored \"{}\", resolved against code_root {})",
+            codepath.display(),
+            item.codepath,
+            code_root.display()
+        );
+        logging::error(&tag, &msg);
+        fail_item(&shared, &item, &msg, String::new(), &tag);
+        return;
+    }
+    let lock = match locks::acquire_codepath_lock(
+        &codepath,
+        &item.workid,
+        "shell",
+        cfg.engine.codepath_lock_timeout_sec,
+        &item.codepath_ignore,
+    ) {
+        Ok(lock) => lock,
+        Err(conflict) => {
+            let backoff = cfg.engine.codepath_conflict_backoff_sec;
+            logging::info(
+                &tag,
+                &format!("codepath busy ({}); requeued {} (retry in {}s)", conflict.display(), short(&item.workid), backoff),
+            );
+            shared
+                .deferred
+                .lock()
+                .unwrap()
+                .insert(item.workid.clone(), Instant::now() + std::time::Duration::from_secs(backoff));
+            requeue(&shared, &item.workid, "codepath lock conflict", true);
+            return;
         }
-        done.state = workitems::STATE_COMPLETE.into();
-        done.output = output;
-        done.times.closed = workitems::now_iso();
-        fill_empty_stamps(&mut done.times);
-        if let Err(e) = queue.close(&done) {
-            logging::error(&tag, &format!("close-out failed: {}", e));
+    };
+
+    // Same env contract agents get, so `"$ITER_BIN" runtests …` etc. just work.
+    let iter_bin = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "iter".to_string());
+    let reqs_dir = crate::context::reqs_dir(&shared.project_root, &code_root);
+    let envs: Vec<(String, String)> = vec![
+        ("ITER_BIN".into(), iter_bin),
+        ("ITER_PROJECT".into(), shared.project_root.to_string_lossy().into_owned()),
+        ("ITER_REQS".into(), reqs_dir.to_string_lossy().into_owned()),
+        ("ITER_TEST_DIR".into(), cfg.globalsettings.test_dir.clone()),
+        ("ITER_INTERFACE_DIR".into(), config::interface_dir(&shared.project_root, &cfg).to_string_lossy().into_owned()),
+        ("ITER_WORKID".into(), item.workid.clone()),
+    ];
+
+    let mut steps: Vec<(String, String)> = Vec::new();
+    for (i, p) in item.prework.iter().enumerate() {
+        steps.push((format!("prework[{}]", i + 1), p.clone()));
+    }
+    steps.push(("mainwork".into(), item.mainwork.clone()));
+    for (i, p) in item.postwork.iter().enumerate() {
+        steps.push((format!("postwork[{}]", i + 1), p.clone()));
+    }
+    let mut outputs: Vec<String> = Vec::new();
+    for (label, cmd) in &steps {
+        if shared.stop_now.load(Ordering::SeqCst) {
+            logging::warn(&tag, "engine stopping: requeueing shell item");
+            requeue_with_output(&shared, &item.workid, "engine stopped mid-run; requeued", false, Some(outputs.join("\n")));
+            drop(lock);
+            return;
+        }
+        match run_shell_command(cmd, &codepath, &envs, cfg.engine.shell_timeout_sec) {
+            Ok(out) => {
+                logging::info(&tag, &format!("{} done", label));
+                outputs.push(format!("[{}] $ {}\n{}", label, cmd, out));
+                if label == "mainwork" {
+                    let _q = shared.queue_mutex.lock().unwrap();
+                    let now = workitems::now_iso();
+                    let _ = shared.queue().mutate(&item.workid, |it| it.times.mainworkdone = now.clone());
+                }
+            }
+            Err(e) => {
+                let msg = format!("{} failed: {}", label, e);
+                logging::error(&tag, &msg);
+                fail_item(&shared, &item, &msg, outputs.join("\n"), &tag);
+                drop(lock);
+                return;
+            }
         }
     }
-    logging::info(&tag, &format!("complete → workitems_closed.jsonl; lock released ({})", short(&item.workid)));
+    close_complete(&shared, &item, outputs.join("\n"), &tag);
     drop(lock);
+}
+
+/// Longest stdout+stderr tail a shell step keeps; protects workitems.jsonl
+/// from a chatty command.
+const SHELL_OUTPUT_TAIL_CHARS: usize = 65536;
+
+fn run_shell_command(cmd: &str, cwd: &Path, envs: &[(String, String)], timeout_sec: u64) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .envs(envs.iter().cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {}", e))?;
+    // Drain pipes on threads so a chatty command can't deadlock on a full pipe
+    // while we poll for exit.
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let out_h = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + std::time::Duration::from_secs(timeout_sec.max(1));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("timed out after {}s (shell_timeout_sec)", timeout_sec));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Err(format!("wait failed: {}", e)),
+        }
+    };
+    let mut text = out_h.join().unwrap_or_default();
+    let err_text = err_h.join().unwrap_or_default();
+    if !err_text.trim().is_empty() {
+        text.push_str("\n[stderr]\n");
+        text.push_str(&err_text);
+    }
+    if text.len() > SHELL_OUTPUT_TAIL_CHARS {
+        let cut = text.len() - SHELL_OUTPUT_TAIL_CHARS;
+        let safe = (cut..text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(text.len());
+        text = format!("… ({} chars trimmed)\n{}", safe, &text[safe..]);
+    }
+    if status.success() {
+        Ok(text)
+    } else {
+        let tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
+        Err(format!("exit {}\n{}", status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()), tail))
+    }
 }
 
 /// After turn `i` succeeds, stamp any phase boundary it completes.
@@ -842,16 +1075,17 @@ fn resolve_codepath(base: &Path, codepath: &str) -> PathBuf {
 fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Path, tag: &str) -> Vec<StepTurn> {
     let mut steps: Vec<StepTurn> = Vec::new();
     for entry in &item.prework {
-        let (label, prompt) = resolve_prepost(&shared.project_root, entry, "prework");
-        steps.push(StepTurn { phase: Phase::Prework, turn: Turn { label, prompt } });
+        let (label, prompt, shell) = resolve_prepost(&shared.project_root, entry, "prework");
+        steps.push(StepTurn { phase: Phase::Prework, turn: Turn { label, prompt }, shell });
     }
     steps.push(StepTurn {
         phase: Phase::Mainwork,
         turn: Turn { label: "mainwork".into(), prompt: item.mainwork.clone() },
+        shell: None,
     });
     for entry in &item.postwork {
-        let (label, prompt) = resolve_prepost(&shared.project_root, entry, "postwork");
-        steps.push(StepTurn { phase: Phase::Postwork, turn: Turn { label, prompt } });
+        let (label, prompt, shell) = resolve_prepost(&shared.project_root, entry, "postwork");
+        steps.push(StepTurn { phase: Phase::Postwork, turn: Turn { label, prompt }, shell });
     }
     let shared_text = agents::shared_instructions(&shared.project_root);
     let shared_section = shared_text
@@ -869,6 +1103,7 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
                 agent.body, shared_section
             ),
         },
+        shell: None,
     });
 
     // Spin-up context is prepended to the FIRST turn so the whole run is one session.
@@ -923,21 +1158,33 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
             spinup.push_str(&format!("- {}\n", f.display()));
         }
     }
-    let first = &mut steps[0].turn;
-    first.prompt = format!("{}\n\n# Step: {}\n{}", spinup, first.label, first.prompt);
+    // Spin-up goes on the first LLM turn — never into a shell step's command.
+    if let Some(first) = steps.iter_mut().find(|s| s.shell.is_none()) {
+        first.turn.prompt = format!("{}\n\n# Step: {}\n{}", spinup, first.turn.label, first.turn.prompt);
+    }
     steps
 }
 
-/// Prepostwork resolution rule: the entry is a filename minus extension; if
-/// `.iter/prepostwork/<entry>.md` exists its content is the prompt, otherwise the
-/// entry itself is a literal inline prompt.
-fn resolve_prepost(project_root: &Path, entry: &str, phase: &str) -> (String, String) {
-    let file = project_root.join(".iter").join("prepostwork").join(format!("{}.md", entry));
+/// Prepostwork resolution rule: the entry is a filename minus extension. If
+/// `.iter/prepostwork/<entry>.sh` exists this step is an engine-run SHELL
+/// command (third element); if `.iter/prepostwork/<entry>.md` exists its
+/// content is the prompt; otherwise the entry itself is a literal inline prompt.
+fn resolve_prepost(project_root: &Path, entry: &str, phase: &str) -> (String, String, Option<String>) {
+    let dir = project_root.join(".iter").join("prepostwork");
+    let sh = dir.join(format!("{}.sh", entry));
+    if sh.is_file() {
+        return (
+            format!("{}:{} (shell)", phase, entry),
+            String::new(),
+            Some(format!("sh '{}'", sh.display())),
+        );
+    }
+    let file = dir.join(format!("{}.md", entry));
     match std::fs::read_to_string(&file) {
-        Ok(content) => (format!("{}:{}", phase, entry), content),
+        Ok(content) => (format!("{}:{}", phase, entry), content, None),
         Err(_) => {
             let short: String = entry.chars().take(30).collect();
-            (format!("{}:inline({}…)", phase, short.trim_end()), entry.to_string())
+            (format!("{}:inline({}…)", phase, short.trim_end()), entry.to_string(), None)
         }
     }
 }
@@ -1010,11 +1257,11 @@ mod tests {
 
         // Deferred item is skipped...
         shared.deferred.lock().unwrap().insert("w1".into(), Instant::now() + std::time::Duration::from_secs(60));
-        assert!(pick_next(&shared, &["code"]).is_none(), "deferred item must not be re-picked");
+        assert!(pick_next(&shared, &["code"], false).is_none(), "deferred item must not be re-picked");
 
         // ...and picked again once the backoff expires.
         shared.deferred.lock().unwrap().insert("w1".into(), Instant::now() - std::time::Duration::from_secs(1));
-        let picked = pick_next(&shared, &["code"]).expect("expired deferral must be pickable");
+        let picked = pick_next(&shared, &["code"], false).expect("expired deferral must be pickable");
         assert_eq!(picked.workid, "w1");
         assert_eq!(picked.state, workitems::STATE_IN_PROGRESS);
         assert!(shared.deferred.lock().unwrap().is_empty(), "expired entries are pruned");
@@ -1060,10 +1307,10 @@ mod tests {
             .unwrap()
             .insert("running".into(), (root.join("a").canonicalize().unwrap(), Vec::new()));
         let _lock = locks::acquire_codepath_lock(&root.join("b"), "other-engine", "code", 600, &[]).unwrap();
-        let picked = pick_next(&shared, &["code"]).expect("must keep moving down the queue");
+        let picked = pick_next(&shared, &["code"], false).expect("must keep moving down the queue");
         assert_eq!(picked.workid, "w-free");
         // Nothing else runnable now.
-        assert!(pick_next(&shared, &["code"]).is_none());
+        assert!(pick_next(&shared, &["code"], false).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1098,9 +1345,9 @@ mod tests {
         };
         shared.queue().append(&clash).unwrap();
         shared.queue().append(&tw).unwrap();
-        let picked = pick_next(&shared, &["testwriter"]).expect("ignored subtree must be pickable");
+        let picked = pick_next(&shared, &["testwriter"], false).expect("ignored subtree must be pickable");
         assert_eq!(picked.workid, "w-tw");
-        assert!(pick_next(&shared, &["testwriter"]).is_none(), "non-ignored sibling stays blocked");
+        assert!(pick_next(&shared, &["testwriter"], false).is_none(), "non-ignored sibling stays blocked");
 
         // Mirror image: testwriter running on obj/test; a code item on obj/ that
         // ignores test/ is pickable. One that doesn't gets REPAIRED by the
@@ -1129,7 +1376,7 @@ mod tests {
         };
         shared.queue().append(&code_full).unwrap();
         shared.queue().append(&code_ign).unwrap();
-        let picked = pick_next(&shared, &["code"]).expect("guard-repaired item must be pickable");
+        let picked = pick_next(&shared, &["code"], false).expect("guard-repaired item must be pickable");
         assert_eq!(picked.workid, "w-code-full", "higher priority wins once the guard repairs its scope");
         assert!(
             picked.codepath_ignore.contains(&"test/".to_string()),
@@ -1180,11 +1427,11 @@ mod tests {
         shared.queue().append(&mk("w-ingest", "ingest", 6, "c")).unwrap();
         // Priority 60 wins even though "code" sorts first alphabetically.
         let types = ["code", "ingest", "refactor"];
-        assert_eq!(pick_next(&shared, &types).unwrap().workid, "w-refactor");
-        assert_eq!(pick_next(&shared, &types).unwrap().workid, "w-ingest");
+        assert_eq!(pick_next(&shared, &types, false).unwrap().workid, "w-refactor");
+        assert_eq!(pick_next(&shared, &types, false).unwrap().workid, "w-ingest");
         // With refactor's slot no longer offered, only code remains.
-        assert_eq!(pick_next(&shared, &["code", "ingest"]).unwrap().workid, "w-code");
-        assert!(pick_next(&shared, &types).is_none());
+        assert_eq!(pick_next(&shared, &["code", "ingest"], false).unwrap().workid, "w-code");
+        assert!(pick_next(&shared, &types, false).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1238,11 +1485,12 @@ mod tests {
     #[test]
     fn prepost_resolution_file_vs_inline() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let (label, prompt) = resolve_prepost(&root, "git-pull", "prework");
+        let (label, prompt, shell) = resolve_prepost(&root, "git-pull", "prework");
+        assert!(shell.is_none());
         assert_eq!(label, "prework:git-pull");
         assert!(prompt.contains("git pull --rebase"));
 
-        let (label, prompt) = resolve_prepost(&root, "Just do this literal thing", "prework");
+        let (label, prompt, _) = resolve_prepost(&root, "Just do this literal thing", "prework");
         assert!(label.starts_with("prework:inline("));
         assert_eq!(prompt, "Just do this literal thing");
     }

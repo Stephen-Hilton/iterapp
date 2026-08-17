@@ -1,6 +1,7 @@
 mod agents;
 mod config;
 mod context;
+mod itersched;
 mod limits;
 mod locks;
 mod logging;
@@ -315,6 +316,12 @@ fn cmd_add(
 
     if item.item_type.is_empty() || item.mainwork.is_empty() {
         eprintln!("error: a work item needs at least --type and --mainwork (or a --file providing them)");
+        return 1;
+    }
+    // Only users schedule (webapp API). Agents create work through this path,
+    // so a scheduled state or a schedule spec is refused here.
+    if item.state == workitems::STATE_SCHEDULED || !item.sched.is_none() {
+        eprintln!("error: scheduled work items are user-created in the webapp; `iter add` (the agents' path) cannot schedule work");
         return 1;
     }
     if item.workid.is_empty() {
