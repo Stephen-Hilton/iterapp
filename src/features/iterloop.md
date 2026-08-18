@@ -197,9 +197,8 @@ and be skeptical of the description).
     "max_attempts": 3
   },
   "globalsettings": {
-    "test_min": 20,
-    "test_max": 100,
-    "test_default_path": "./test*/",
+    "testwriter_min_tests_per_group": 20,
+    "testwriter_max_tests_per_group": 100,
     "test_dir": "test",
     "log_default_path": "./logs/{YYYYMMDD-hh}.log",
     "log_level": "info",
@@ -579,7 +578,7 @@ Deliberately excluded from v1, but the file formats above leave room:
 - `llm_run_mode: terminal | tmux` for watch-live agent sessions.
 - `todo` state semantics: dependencies between work items, human approval gates.
 - Finer-grained locking (glob-scoped locks instead of whole-codepath).
-- Test generation loops driven by `testgroup.iter.md` group prompts; `test_min`/`test_max`
+- Test generation loops driven by `testgroup.iter.md` group prompts; `testwriter_min_tests_per_group`/`testwriter_max_tests_per_group`
   enforcement from config.
 - `risk`-aware scheduling and approval policies.
 
@@ -630,7 +629,7 @@ complete, usable prompts.
       precisely. No tests found → create a `testwriter` work item; failures → fix
       small/syntax issues directly, create a `plan` work item for larger problems.
 - [x] `testwriter.md` — generate new deterministic tests within an existing group per the
-      group's generation prompt; respect `test_min`/`test_max`.
+      group's generation prompt; respect `testwriter_min_tests_per_group`/`testwriter_max_tests_per_group`.
 - [x] `refactor.md` — behavior-preserving changes only; tests must pass before and after.
 - [x] `ingest.md` — read external requirements (e.g. `sample/bizreq.md`, `techreq.md`)
       and normalize them into context markdown the other agents consume; when migrating

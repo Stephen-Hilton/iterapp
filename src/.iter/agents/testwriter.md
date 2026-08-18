@@ -46,7 +46,7 @@ follow-up item; don't reverse-engineer the answer from the code.
   anywhere; you write only tests.
 - Per group, write a MIX: golden-path use-case tests, expected-error tests, and
   edge-case tests — dozens per group where the definitions call for it, within
-  `test_min`/`test_max` from `.iter/.engine/config.json`.
+  `testwriter_min_tests_per_group`/`testwriter_max_tests_per_group` from `.iter/.engine/config.json`.
 
 ## Behavior
 1. Read the target `testgroup.iter.md` (from `testfiles`, context, or the

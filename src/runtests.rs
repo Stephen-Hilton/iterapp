@@ -3,9 +3,14 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
 use crate::testgroups::{self, TestGroup};
 use crate::workitems;
+
+/// Default wall-clock budget for one testgroup's scripts (shared across the
+/// group). Compiled-in default — override per invocation with
+/// `iter runtests --timeout-min` / `iter testsweep --group-timeout-min` (the
+/// "Test Loop" scheduled workitem carries the flag visibly in its command).
+pub const DEFAULT_GROUP_TIMEOUT_MIN: u64 = 20;
 
 /// The whole engine⇄script contract, from the exit code alone (features/TDD.md
 /// "Test Contract"): 0 = ran, all as expected; 1 = ran, something unexpected;
@@ -87,13 +92,14 @@ pub fn locate_group(code_root: &Path, label: &str) -> Result<(PathBuf, TestGroup
 /// Run a testgroup's shell scripts (optionally narrowed to one test id/script by
 /// `filter`), capture each run to `<test_dir>/runs/<timestamp>-<id>.log`, and on a
 /// full run update the group's JSONL block (lastrun/result/counts) in place.
-/// The group shares one wall-clock budget (`testing.test_sweep_timeout_minutes`);
-/// scripts that would start past the deadline are recorded as `error` without running.
+/// The group shares one wall-clock budget of `timeout_min` minutes
+/// (`DEFAULT_GROUP_TIMEOUT_MIN` unless a flag overrides it); scripts that would
+/// start past the deadline are recorded as `error` without running.
 pub fn run_group(
-    cfg: &Config,
     tg_file: &Path,
     label: &str,
     filter: Option<&str>,
+    timeout_min: u64,
 ) -> Result<GroupRunResult, String> {
     let content =
         std::fs::read_to_string(tg_file).map_err(|e| format!("cannot read {}: {}", tg_file.display(), e))?;
@@ -122,7 +128,7 @@ pub fn run_group(
     let runs_dir = test_dir.join("runs");
     std::fs::create_dir_all(&runs_dir).map_err(|e| format!("cannot create {}: {}", runs_dir.display(), e))?;
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let budget = Duration::from_secs(cfg.testing.test_sweep_timeout_minutes.max(1) * 60);
+    let budget = Duration::from_secs(timeout_min.max(1) * 60);
     let started = Instant::now();
 
     let mut runs = Vec::new();
@@ -131,7 +137,7 @@ pub fn run_group(
         let remaining = budget.saturating_sub(started.elapsed());
         let script = test_dir.join(&entry.shell);
         let run = if remaining.is_zero() {
-            let detail = format!("not run: group budget ({} min) exhausted", cfg.testing.test_sweep_timeout_minutes);
+            let detail = format!("not run: group budget ({} min) exhausted", timeout_min);
             write_log(&log_path, &entry.shell, -1, "", "", &detail);
             TestRunResult {
                 id: entry.id,
@@ -161,7 +167,7 @@ pub fn run_group(
         } else {
             let (exit_code, stdout, stderr, timed_out) = run_script(&script, &test_dir, remaining);
             let detail = if timed_out {
-                format!("timed out (group budget {} min); killed", cfg.testing.test_sweep_timeout_minutes)
+                format!("timed out (group budget {} min); killed", timeout_min)
             } else {
                 String::new()
             };
@@ -339,8 +345,7 @@ mod tests {
                 ("t3.sh", "exit 7\n"),
             ],
         );
-        let cfg = Config::default();
-        let run = run_group(&cfg, &tg, "g1", None).unwrap();
+                let run = run_group(&tg, "g1", None, DEFAULT_GROUP_TIMEOUT_MIN).unwrap();
         assert_eq!(run.outcome, Outcome::Error, "error trumps red");
         assert_eq!(run.runs[0].outcome, Outcome::Green);
         assert_eq!(run.runs[1].outcome, Outcome::Red);
@@ -361,8 +366,7 @@ mod tests {
     #[test]
     fn all_green_marks_group_passed() {
         let (root, tg) = setup("green", &[("t1.sh", "exit 0\n"), ("t2.sh", "echo ok\nexit 0\n")]);
-        let cfg = Config::default();
-        let run = run_group(&cfg, &tg, "g1", None).unwrap();
+                let run = run_group(&tg, "g1", None, DEFAULT_GROUP_TIMEOUT_MIN).unwrap();
         assert_eq!(run.outcome, Outcome::Green);
         assert_eq!((run.pass, run.total), (2, 2), "no ITER_RESULT → 1 test per script");
         let groups = testgroups::parse(&std::fs::read_to_string(&tg).unwrap());
@@ -373,8 +377,7 @@ mod tests {
     #[test]
     fn filtered_run_does_not_update_group() {
         let (root, tg) = setup("filter", &[("t1.sh", "exit 0\n"), ("t2.sh", "exit 1\n")]);
-        let cfg = Config::default();
-        let run = run_group(&cfg, &tg, "g1", Some("t1")).unwrap();
+                let run = run_group(&tg, "g1", Some("t1"), DEFAULT_GROUP_TIMEOUT_MIN).unwrap();
         assert!(!run.full_run);
         assert_eq!(run.outcome, Outcome::Green);
         assert_eq!(run.runs.len(), 1);
@@ -391,8 +394,7 @@ mod tests {
         let mut groups = testgroups::parse(&content);
         groups[0].testlist.push(TestEntry { id: "ghost".into(), name: "ghost".into(), desc: String::new(), shell: "ghost.sh".into() });
         std::fs::write(&tg, testgroups::update(&content, &groups)).unwrap();
-        let cfg = Config::default();
-        let run = run_group(&cfg, &tg, "g1", None).unwrap();
+                let run = run_group(&tg, "g1", None, DEFAULT_GROUP_TIMEOUT_MIN).unwrap();
         assert_eq!(run.outcome, Outcome::Error);
         assert!(run.runs[1].detail.contains("script not found"));
         let _ = std::fs::remove_dir_all(&root);

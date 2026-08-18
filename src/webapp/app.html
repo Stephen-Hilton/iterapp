@@ -748,7 +748,7 @@ let items = [
     type:'testwriter', state:'complete', source:'agent: code', priority:5, risk:1, codepath:'./test',
     prework:[], postwork:['git-commit'],
     mainwork:'Extend the contract test group per its generation prompt: --shout uppercases the greeting; invalid flag -x exits non-zero with exactly one line on stderr. Add cases as testscript04.sh, register in the contract group testlist, keep all scripts deterministic.',
-    output:'[mainwork] Wrote testscript04.sh (20 assertions: shout casing, multi-word names, flag ordering, stderr discipline) and testscript05.sh (18 contract edge cases). Registered both in testgroups.iter.md; created a new "shout" group. Handed off a test item to execute the groups.\n[postwork:git-commit] Committed 3 files (4c210aa).\n[selfcheck] Complete; test counts within test_min/test_max bounds.',
+    output:'[mainwork] Wrote testscript04.sh (20 assertions: shout casing, multi-word names, flag ordering, stderr discipline) and testscript05.sh (18 contract edge cases). Registered both in testgroups.iter.md; created a new "shout" group. Handed off a test item to execute the groups.\n[postwork:git-commit] Committed 3 files (4c210aa).\n[selfcheck] Complete; test counts within testwriter_min/max_tests_per_group bounds.',
     attempts:1, tests:{passed:38,total:38},
     times:{ added:'2026-08-11T14:36:20Z', start:'2026-08-11T14:36:25Z', preworkdone:'2026-08-11T14:36:25Z', mainworkdone:'2026-08-11T15:38:00Z', postworkdone:'2026-08-11T15:40:12Z', closed:'2026-08-11T15:40:54Z' } }),
   mk({ title:'Execute shout and contract test groups; record results in testgroups block',
@@ -1782,9 +1782,8 @@ const CONFIG = {
   globalsettings: {
     user_timezone: ['UTC', 'timezone for displaying timestamps — data stays UTC on disk; DST handled automatically'],
     code_root: ['.', 'base dir for relative codepaths/context/testfiles — set e.g. .. or ~/dev/myproject when .iter lives in a subdir of the codebase; default . = where .iter lives'],
-    test_min: [20, 'minimum tests per group (testwriter floor)'],
-    test_max: [100, 'maximum tests per group'],
-    test_default_path: ['./test*/', 'where test groups live by default'],
+    testwriter_min_tests_per_group: [20, 'minimum tests a testwriter agent produces per testgroup (floor)'],
+    testwriter_max_tests_per_group: [100, 'maximum tests a testwriter agent produces per testgroup'],
     test_dir: ['test', 'the per-component test directory name — testwriter items lock <component>/<test_dir>, code items list it in codepath_ignore; exported to agents as ITER_TEST_DIR'],
     usecase_default_path: ['{codepath}/usecases/', 'where NEW use-case files are created ({codepath} = the resolved code root) — creation only; the scanner finds *usecase.iter.md anywhere'],
     interface_default_path: ['{codepath}/interfaces/', 'where NEW interface files are created (<id>.interface.iter.md, one file per id — shared contracts, 1:M with C4 objects) — creation only; the scanner finds *interface.iter.md anywhere; exported to agents as ITER_INTERFACE_DIR'],
@@ -1792,15 +1791,6 @@ const CONFIG = {
     log_level: ['info', 'debug | info | warn | error'],
     log_max_size_mb: [10, 'rotate log at this size'],
     log_max_files: [50, 'rotated files kept'],
-  },
-  testing: {
-    test_sweep_active: [true, 'run the periodic deterministic test sweep (re-runs testgroups that aren’t provably green)'],
-    minutes_between_test_sweeps: [120, 'sweep cadence; first pass ~90s after engine start'],
-    test_green_stale_hours: [24, 'a group with a green run newer than this is left alone'],
-    test_sweep_timeout_minutes: [10, 'wall-clock budget per testgroup run; overrun = killed → error (never counts as red)'],
-    parallel_test_concurrency: [3, 'testgroups run concurrently during a sweep'],
-    workitem_priority_lastrun_not_green: [4, 'priority of fix items for never/no-longer-green groups — higher = sooner; default work is 5, so sweep items fill idle capacity'],
-    workitem_priority_lastrun_green: [2, 'priority of fix items for was-green-now-stale groups'],
   },
   limits: {
     probe_enabled: [false, 'run the background probe (tmux/screen + claude) that keeps account usage fresh while the engine works'],
@@ -1876,10 +1866,8 @@ function settingsLayout(){
     ['Iterloop', 'the loop runner: scheduler, agents, the test loop, spend and usage guards', [
       ['Engine', 'Scheduler, locking, and retry behavior — .iter/.engine/config.json',
         Object.keys(CONFIG.engine).map(k => cfg('engine', k))],
-      ['Test loop', 'The deterministic test engine: sweep cadence, timeouts, concurrency, and fix-item priorities (higher = sooner) — see features/TDD.md',
-        Object.keys(CONFIG.testing).map(k => cfg('testing', k))],
-      ['Testing defaults', 'What testwriter agents produce, and where the loop locks test work',
-        ['test_min','test_max','test_default_path','test_dir'].map(k => cfg('globalsettings', k))],
+      ['Test', 'Testwriter output bounds and the test-directory layout. The deterministic test loop itself runs as a "Test Loop" scheduled workitem whose command carries every knob as a visible flag — create it below, tune/pause it in WorkItems — see features/TDD.md',
+        ['testwriter_min_tests_per_group','testwriter_max_tests_per_group','test_dir'].map(k => cfg('globalsettings', k))],
       ['Usage limits', 'Account-usage throttle: tiered agent caps from Claude Code’s server-reported 5h/7d utilization, kept fresh by the probe session',
         Object.keys(CONFIG.limits).map(k => cfg('limits', k))],
       ['Logging', 'Engine log output and rotation',
@@ -1951,8 +1939,19 @@ async function renderSettings(){
       <span class="mono">{reqs}</span> = the project-wide reqs dir — global bizreq/techreq home (default <span class="mono">.iter/reqs/</span>,
       relocated by a <span class="mono">reqs:</span> key on the project-level marker; its files are auto-surfaced to every agent).
     </div>`;
+  // The Test group's one-click setup: a "Test Loop" scheduled workitem replaces
+  // the old in-engine sweep loop and its config.json section. The knobs travel as
+  // flags on the workitem's own command line, so editing the workitem IS the config.
+  const testLoopSetup = `<div class="setrow wide"><label></label><div>
+      <button class="btn primary" id="mkTestLoop">Create TestLoop Schedule</button>
+      <div class="why" style="margin-top:6px">Creates the "Test Loop" scheduled workitem (exec: shell, every 120 min) whose
+        command runs <span class="mono">iter testsweep</span> with concurrency, fix-item priorities, staleness, and
+        timeout as visible flags. Tune it by editing the workitem's command; stop sweeping by pausing the schedule.
+        One per project — the button refuses a duplicate.</div>
+    </div></div>`;
   const groupHtml = ([name, sub, items]) => `<div class="setgroup"><h3>${name}</h3><div class="sub">${sub}</div>
     ${name === 'Marker discovery' ? legend : ''}
+    ${name === 'Test' ? testLoopSetup : ''}
     ${items.map(row).join('')}</div>`;
   const agentOptions = agents.map((a, i) =>
     `<option value="${esc(a.type)}"${i === 0 ? ' selected' : ''}>${esc(a.type)}</option>`).join('');
@@ -2006,6 +2005,35 @@ async function renderSettings(){
       const any = [...sec.querySelectorAll('.setgroup')].some(g => g.style.display !== 'none');
       sec.style.display = any ? '' : 'none';
     });
+  });
+  $('mkTestLoop').addEventListener('click', async () => {
+    // Everything configurable about the loop lives HERE, on the command line —
+    // by design there is no config.json section for it anymore.
+    const template = {
+      title: 'Test Loop',
+      type: 'shell',
+      exec: 'shell',
+      state: 'scheduled',
+      source: 'scheduler',
+      priority: 8,
+      codepath: '.',
+      codepath_ignore: ['**'],   // carve everything out: the sweep needs no lock (it skips busy C4 objects itself)
+      sched: { kind: 'every', every_min: 120 },
+      mainwork: '"$ITER_BIN" testsweep --project "$ITER_PROJECT" \\\n'
+        + '  --concurrency 3 \\\n'
+        + '  --priority-red 4 \\\n'
+        + '  --priority-green 2 \\\n'
+        + '  --green-stale-hours 24 \\\n'
+        + '  --group-timeout-min 20',
+    };
+    if (!LIVE) { toast('Created the "Test Loop" scheduled workitem (mock)'); return; }
+    try {
+      const items = await api('/api/workitems');
+      const existing = (items.open || []).find(i => i.title === 'Test Loop' && i.sched && i.sched.kind);
+      if (existing) { toast(`A "Test Loop" schedule already exists (state: ${existing.state})`); return; }
+      await api('/api/workitems', { method: 'POST', body: JSON.stringify(template) });
+      toast('Created the "Test Loop" scheduled workitem — edit or pause it in WorkItems');
+    } catch (e) { toast('Create failed: ' + e.message); }
   });
   $('cfgSave').addEventListener('click', () => {
     const cfgOut = {};

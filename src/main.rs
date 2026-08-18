@@ -113,11 +113,31 @@ enum Command {
         /// the claim is false — fail-flag written, the item cannot close as done
         #[arg(long)]
         fixed: bool,
+        /// Wall-clock budget (minutes) for the group's scripts; overrun = killed → error
+        #[arg(long, default_value_t = runtests::DEFAULT_GROUP_TIMEOUT_MIN)]
+        timeout_min: u64,
     },
-    /// Run one deterministic test sweep now (the engine also sweeps on a schedule)
+    /// Run one deterministic test sweep now. The standing loop is a "Test Loop"
+    /// scheduled workitem (created from webapp Settings → Test) whose command
+    /// invokes this with the flags below — edit the workitem to tune the loop.
     Testsweep {
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        /// Testgroups run concurrently
+        #[arg(long, default_value_t = 3)]
+        concurrency: usize,
+        /// Priority of fix items for never/no-longer-green groups (higher = sooner; default work is 5)
+        #[arg(long, default_value_t = 4)]
+        priority_red: i64,
+        /// Priority of fix items for was-green-now-stale groups
+        #[arg(long, default_value_t = 2)]
+        priority_green: i64,
+        /// A group with a green run newer than this many hours is left alone
+        #[arg(long, default_value_t = 24)]
+        green_stale_hours: u64,
+        /// Wall-clock budget (minutes) per testgroup run; overrun = killed → error
+        #[arg(long, default_value_t = runtests::DEFAULT_GROUP_TIMEOUT_MIN)]
+        group_timeout_min: u64,
     },
     /// One-time maintenance sweep: stub "# Long Description / TBD" into every
     /// structure-node marker missing the section, so a plan item can fill them in
@@ -177,10 +197,15 @@ fn main() {
         Command::Critreview { project, file, context, max_retry } => {
             cmd_critreview(project, file, context, max_retry)
         }
-        Command::Runtests { project, group, test, broken, fixed } => {
-            cmd_runtests(project, group, test, broken, fixed)
+        Command::Runtests { project, group, test, broken, fixed, timeout_min } => {
+            cmd_runtests(project, group, test, broken, fixed, timeout_min)
         }
-        Command::Testsweep { project } => cmd_testsweep(project),
+        Command::Testsweep { project, concurrency, priority_red, priority_green, green_stale_hours, group_timeout_min } => {
+            cmd_testsweep(
+                project,
+                testsweep::SweepOptions { concurrency, priority_red, priority_green, green_stale_hours, group_timeout_min },
+            )
+        }
         Command::Stubdesc { project } => cmd_stubdesc(project),
         Command::Validate { project, file, fix, template } => cmd_validate(project, file, fix, template),
         Command::Status { project } => cmd_status(project),
@@ -475,7 +500,7 @@ fn cmd_critreview(project: PathBuf, file: PathBuf, context: Vec<PathBuf>, max_re
 /// 2 error/bad invocation. Claim runs (--broken / --fixed): 0 claim upheld,
 /// 3 claim false (the critfail fail-flag is written; the scheduler fails the
 /// calling work item at the turn boundary regardless of what the agent does next).
-fn cmd_runtests(project: PathBuf, group: String, test: Option<String>, broken: bool, fixed: bool) -> i32 {
+fn cmd_runtests(project: PathBuf, group: String, test: Option<String>, broken: bool, fixed: bool, timeout_min: u64) -> i32 {
     if broken && fixed {
         eprintln!("error: --broken and --fixed are mutually exclusive claims");
         return 2;
@@ -494,7 +519,7 @@ fn cmd_runtests(project: PathBuf, group: String, test: Option<String>, broken: b
             return 2;
         }
     };
-    let run = match runtests::run_group(&cfg, &tg_file, &group, test.as_deref()) {
+    let run = match runtests::run_group(&tg_file, &group, test.as_deref(), timeout_min) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -661,12 +686,12 @@ fn cmd_validate(project: PathBuf, file: Option<PathBuf>, fix: bool, template: bo
     }
 }
 
-fn cmd_testsweep(project: PathBuf) -> i32 {
+fn cmd_testsweep(project: PathBuf, opts: testsweep::SweepOptions) -> i32 {
     if !boot(&project) {
         return 1;
     }
     let cfg = config::load(&project);
-    let report = testsweep::sweep(&project, &cfg);
+    let report = testsweep::sweep(&project, &cfg, &opts);
     println!("{}", report.summary());
     for note in &report.notes {
         println!("  note: {}", note);

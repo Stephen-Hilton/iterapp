@@ -169,16 +169,10 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
     let mut probe_last = Instant::now() - std::time::Duration::from_secs(24 * 3600);
     let mut probe_count: u64 = 0;
     let probe_in_flight = Arc::new(AtomicBool::new(false));
-    // Deterministic test sweep (testsweep.rs): first pass ~90s after start (a
-    // restart shouldn't immediately re-run every stale group), then on cadence.
-    let sweep_interval = |cfg: &Config| {
-        std::time::Duration::from_secs(cfg.testing.minutes_between_test_sweeps.max(1) * 60)
-    };
-    let mut sweep_last = Instant::now()
-        .checked_sub(sweep_interval(&shared.cfg()).saturating_sub(std::time::Duration::from_secs(90)))
-        .unwrap_or_else(Instant::now);
-    let sweep_in_flight = Arc::new(AtomicBool::new(false));
     // itersched (itersched.rs): fires due `scheduled` templates into the queue.
+    // The deterministic test sweep runs THROUGH this path — a "Test Loop"
+    // scheduled workitem whose mainwork invokes `iter testsweep` (created from
+    // the webapp's Test settings section); the engine has no sweep loop of its own.
     // First check on the first tick — restart memory is sched.last_fired on the
     // templates themselves, and daily/weekly occurrences missed while down are
     // skipped by the occurrence window, so an early check can never backfill.
@@ -344,31 +338,6 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
                 running.push((type_name, handle));
                 std::thread::sleep(std::time::Duration::from_millis(cfg.engine.agent_stagger_ms));
             }
-        }
-
-        // Deterministic test sweep, on cadence, in its own thread (a group's whole
-        // run budget can be minutes — the tick loop must not stall). Draining or
-        // holding engines don't sweep: results would only mint work nobody picks.
-        if cfg.testing.test_sweep_active
-            && !stop_picking
-            && !holding
-            && !sweep_in_flight.load(Ordering::SeqCst)
-            && sweep_last.elapsed() >= sweep_interval(&cfg)
-        {
-            sweep_last = Instant::now();
-            sweep_in_flight.store(true, Ordering::SeqCst);
-            let sweep_root = project_root.clone();
-            let sweep_cfg = cfg.clone();
-            let flag = Arc::clone(&sweep_in_flight);
-            std::thread::spawn(move || {
-                logging::info("sweep", "test sweep starting");
-                let report = crate::testsweep::sweep(&sweep_root, &sweep_cfg);
-                logging::info("sweep", &report.summary());
-                for note in &report.notes {
-                    logging::info("sweep", note);
-                }
-                flag.store(false, Ordering::SeqCst);
-            });
         }
 
         // Tick summary (only when it changes, to keep the stream readable).

@@ -56,9 +56,12 @@ pub struct GlobalSettings {
     /// engine home — the directory holding .iter/. Supports ~. Set this (e.g. "..")
     /// when iter lives in a subdirectory of the codebase it works on.
     pub code_root: String,
-    pub test_min: u32,
-    pub test_max: u32,
-    pub test_default_path: String,
+    /// Testwriter output bounds: how many tests a testwriter agent produces per
+    /// testgroup (floor / ceiling). Read by agents from config.json directly.
+    #[serde(alias = "test_min")]
+    pub testwriter_min_tests_per_group: u32,
+    #[serde(alias = "test_max")]
+    pub testwriter_max_tests_per_group: u32,
     /// The per-component test directory name (relative to a component's root).
     /// Definitive, not a guess: testwriter items scope their codepath/lock to
     /// `<component>/<test_dir>` and code items list `<test_dir>/` in codepath_ignore
@@ -86,9 +89,8 @@ impl Default for GlobalSettings {
         GlobalSettings {
             user_timezone: "UTC".into(),
             code_root: ".".into(),
-            test_min: 20,
-            test_max: 100,
-            test_default_path: "./test*/".into(),
+            testwriter_min_tests_per_group: 20,
+            testwriter_max_tests_per_group: 100,
             test_dir: "test".into(),
             usecase_default_path: "{codepath}/usecases/".into(),
             interface_default_path: "{codepath}/interfaces/".into(),
@@ -96,43 +98,6 @@ impl Default for GlobalSettings {
             log_level: "info".into(),
             log_max_size_mb: 10,
             log_max_files: 50,
-        }
-    }
-}
-
-/// The deterministic test engine (see runtests.rs / testsweep.rs): every test is a
-/// shell script; the sweep re-runs testgroups that aren't provably green and births
-/// fix work items from red runs. Priorities are higher-is-sooner (default work is 5,
-/// so sweep items fill idle capacity instead of starving user work).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct TestingConfig {
-    pub test_sweep_active: bool,
-    /// Sweep cadence: how often the engine wakes to interrogate all testgroups.
-    pub minutes_between_test_sweeps: u64,
-    /// A group with a green run newer than this is left alone by the sweep.
-    pub test_green_stale_hours: u64,
-    /// Wall-clock budget for one testgroup's scripts, shared across the group;
-    /// a script still running at the deadline is killed and recorded as `error`.
-    pub test_sweep_timeout_minutes: u64,
-    /// How many testgroups run concurrently during a sweep.
-    pub parallel_test_concurrency: usize,
-    /// Priority for fix items born from a group with no green run recorded.
-    pub workitem_priority_lastrun_not_green: i64,
-    /// Priority for fix items born from a group whose green run went stale.
-    pub workitem_priority_lastrun_green: i64,
-}
-
-impl Default for TestingConfig {
-    fn default() -> Self {
-        TestingConfig {
-            test_sweep_active: true,
-            minutes_between_test_sweeps: 120,
-            test_green_stale_hours: 24,
-            test_sweep_timeout_minutes: 10,
-            parallel_test_concurrency: 3,
-            workitem_priority_lastrun_not_green: 4,
-            workitem_priority_lastrun_green: 2,
         }
     }
 }
@@ -184,7 +149,6 @@ pub struct Config {
     pub engine: EngineConfig,
     pub globalsettings: GlobalSettings,
     pub limits: LimitsConfig,
-    pub testing: TestingConfig,
 }
 
 pub fn engine_dir(project_root: &Path) -> std::path::PathBuf {
@@ -254,7 +218,7 @@ mod tests {
         let cfg = load(&root);
         assert_eq!(cfg.engine.max_open_workitems, 200);
         assert_eq!(cfg.engine.queue_lock_retry_ms, 50);
-        assert_eq!(cfg.globalsettings.test_min, 20);
+        assert_eq!(cfg.globalsettings.testwriter_min_tests_per_group, 20);
     }
 
     #[test]

@@ -14,6 +14,35 @@ use crate::workitems::{self, Queue, WorkItem};
 /// the configured testing priorities (default below user work, filling idle time).
 pub const SOURCE: &str = "testsweep";
 
+/// One sweep's knobs. These deliberately live on the INVOCATION, not in
+/// config.json: the "Test Loop" scheduled workitem carries them as visible
+/// `iter testsweep` flags in its command, so editing the schedule's mainwork IS
+/// the configuration. A bare `iter testsweep` gets these defaults.
+pub struct SweepOptions {
+    /// How many testgroups run concurrently.
+    pub concurrency: usize,
+    /// Priority for fix items born from a group with no green run recorded.
+    pub priority_red: i64,
+    /// Priority for fix items born from a group whose green run went stale.
+    pub priority_green: i64,
+    /// A group with a green run newer than this is left alone.
+    pub green_stale_hours: u64,
+    /// Wall-clock budget per testgroup run (runtests::run_group).
+    pub group_timeout_min: u64,
+}
+
+impl Default for SweepOptions {
+    fn default() -> Self {
+        SweepOptions {
+            concurrency: 3,
+            priority_red: 4,
+            priority_green: 2,
+            green_stale_hours: 24,
+            group_timeout_min: runtests::DEFAULT_GROUP_TIMEOUT_MIN,
+        }
+    }
+}
+
 /// One sweepable unit: a testgroup DECLARED by a C4 object's marker file. The
 /// marker file defines the C4 object; test ownership flows from its `testgroup:`
 /// key, never from where a testgroup.iter.md happens to sit. No key = that C4
@@ -61,16 +90,16 @@ impl SweepReport {
 /// marker-driven: scan for marker files (same roots/glob as the Projects view),
 /// follow each `level:` marker's MANDATORY `testgroup:` key to its
 /// testgroup.iter.md, re-run groups not provably green-and-fresh (respecting
-/// `parallel_test_concurrency`), record every run, and translate results into work
+/// `SweepOptions::concurrency`), record every run, and translate results into work
 /// items — red → per-group fix item scoped to the C4 object's directory (queued/todo
 /// per the group's auto_fix), error → testwriter repair item in todo — with a dedup
 /// guard on `source_testgroup` and auto-close of unstarted sweep items whose group
 /// came back green. testgroup.iter.md files no marker claims are reported, never run.
-pub fn sweep(project_root: &Path, cfg: &Config) -> SweepReport {
+pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepReport {
     let mut report = SweepReport::default();
     let code_root = config::code_root(project_root, cfg);
     let now = chrono::Utc::now();
-    let stale_cutoff = now - chrono::Duration::hours(cfg.testing.test_green_stale_hours.max(1) as i64);
+    let stale_cutoff = now - chrono::Duration::hours(opts.green_stale_hours.max(1) as i64);
 
     // Same marker universe the Projects view sees (projects.json scan_roots + glob),
     // through the ONE shared resolver (~ expansion included).
@@ -125,9 +154,9 @@ pub fn sweep(project_root: &Path, cfg: &Config) -> SweepReport {
                 continue;
             }
             let priority = if group.is_green() {
-                cfg.testing.workitem_priority_lastrun_green // was green, went stale
+                opts.priority_green // was green, went stale
             } else {
-                cfg.testing.workitem_priority_lastrun_not_green // never/no-longer green
+                opts.priority_red // never/no-longer green
             };
             // An agent working anywhere in the C4 object makes results meaningless
             // (and a testwriter may be mid-edit on the scripts): skip until quiet.
@@ -160,7 +189,7 @@ pub fn sweep(project_root: &Path, cfg: &Config) -> SweepReport {
     // Run candidates through the deterministic runner, a few groups at a time.
     let work: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(candidates));
     let results: Arc<Mutex<Vec<(Candidate, Result<GroupRunResult, String>)>>> = Arc::new(Mutex::new(Vec::new()));
-    let workers = cfg.testing.parallel_test_concurrency.max(1);
+    let workers = opts.concurrency.max(1);
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let work = Arc::clone(&work);
@@ -168,7 +197,7 @@ pub fn sweep(project_root: &Path, cfg: &Config) -> SweepReport {
             scope.spawn(move || loop {
                 let next = work.lock().unwrap().pop();
                 let Some(cand) = next else { break };
-                let run = runtests::run_group(cfg, &cand.tg_file, &cand.group.label, None);
+                let run = runtests::run_group(&cand.tg_file, &cand.group.label, None, opts.group_timeout_min);
                 results.lock().unwrap().push((cand, run));
             });
         }
@@ -447,7 +476,7 @@ mod tests {
         write_group(&test_dir, "G", &[("t1.sh", "exit 0\n"), ("t2.sh", "exit 1\n")], false);
         let cfg = Config::default();
 
-        let report = sweep(&root, &cfg);
+        let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.ran, 1);
         assert_eq!(report.red, 1);
         assert_eq!(report.items_created, 1);
@@ -467,7 +496,7 @@ mod tests {
         assert!(item.context.iter().any(|c| c.ends_with("comp.marker.iter.md")), "marker rides along as context");
 
         // Second sweep: dedup, no duplicate item.
-        let report2 = sweep(&root, &cfg);
+        let report2 = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report2.items_created, 0);
         assert_eq!(Queue::new(&root, &cfg).load().len(), 1);
         let _ = std::fs::remove_dir_all(&root);
@@ -480,7 +509,7 @@ mod tests {
         std::fs::write(root.join("comp/comp.marker.iter.md"), "---\nname: \"Comp\"\nlevel: component\n---\nbody\n").unwrap();
         write_group(&test_dir, "G", &[("t1.sh", "exit 1\n")], false);
         let cfg = Config::default();
-        let report = sweep(&root, &cfg);
+        let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.ran, 0, "undeclared groups never run");
         assert_eq!(report.undeclared, 1);
         assert!(report.notes.iter().any(|n| n.contains("unowned testgroup.iter.md")), "{:?}", report.notes);
@@ -494,7 +523,7 @@ mod tests {
         write_marker(&root, "test/testgroup.iter.md", "test");
         // No testgroup.iter.md written.
         let cfg = Config::default();
-        let report = sweep(&root, &cfg);
+        let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.ran, 0);
         assert!(report.notes.iter().any(|n| n.contains("does not exist")), "{:?}", report.notes);
         let _ = std::fs::remove_dir_all(&root);
@@ -521,7 +550,7 @@ mod tests {
         };
         std::fs::write(root.join("repos/gateway/testgroup.iter.md"), testgroups::update("# tg\n", &[group])).unwrap();
         let cfg = Config::default();
-        let report = sweep(&root, &cfg);
+        let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.ran, 1, "{:?}", report.notes);
         assert_eq!(report.red, 1);
         let items = Queue::new(&root, &cfg).load();
@@ -536,7 +565,7 @@ mod tests {
         write_marker(&root, "test/testgroup.iter.md", "test");
         write_group(&test_dir, "G", &[("t1.sh", "exit 1\n")], true);
         let cfg = Config::default();
-        sweep(&root, &cfg);
+        sweep(&root, &cfg, &SweepOptions::default());
         let items = Queue::new(&root, &cfg).load();
         assert_eq!(items[0].state, workitems::STATE_QUEUED, "auto_fix on → queued");
         let _ = std::fs::remove_dir_all(&root);
@@ -548,7 +577,7 @@ mod tests {
         write_marker(&root, "test/testgroup.iter.md", "test");
         write_group(&test_dir, "G", &[("t1.sh", "exit 9\n")], true);
         let cfg = Config::default();
-        let report = sweep(&root, &cfg);
+        let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.error, 1);
         let items = Queue::new(&root, &cfg).load();
         assert_eq!(items[0].item_type, "testwriter");
@@ -563,10 +592,10 @@ mod tests {
         write_marker(&root, "test/testgroup.iter.md", "test");
         let tg = write_group(&test_dir, "G", &[("t1.sh", "exit 1\n")], false);
         let cfg = Config::default();
-        sweep(&root, &cfg); // creates the fix item
+        sweep(&root, &cfg, &SweepOptions::default()); // creates the fix item
         // The "bug" gets fixed by other means:
         std::fs::write(test_dir.join("t1.sh"), "exit 0\n").unwrap();
-        let report = sweep(&root, &cfg);
+        let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.green, 1);
         assert_eq!(report.stale_closed, 1);
         let queue = Queue::new(&root, &cfg);
@@ -586,8 +615,8 @@ mod tests {
         write_marker(&root, "test/testgroup.iter.md", "test");
         write_group(&test_dir, "G", &[("t1.sh", "exit 0\n")], false);
         let cfg = Config::default();
-        sweep(&root, &cfg); // records green
-        let report = sweep(&root, &cfg); // fresh green → no run
+        sweep(&root, &cfg, &SweepOptions::default()); // records green
+        let report = sweep(&root, &cfg, &SweepOptions::default()); // fresh green → no run
         assert_eq!(report.ran, 0, "fresh green group must not re-run");
 
         // A started item (attempts > 0) survives a green sweep.
@@ -601,7 +630,7 @@ mod tests {
         let mut groups = testgroups::parse(&content);
         groups[0].lastrun = "2020-01-01T00:00:00Z".into();
         std::fs::write(&tg, testgroups::update(&content, &groups)).unwrap();
-        let report = sweep(&root, &cfg);
+        let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.ran, 1);
         assert_eq!(report.stale_closed, 0, "started items are hands-off");
         assert_eq!(queue.load().len(), 1);
@@ -614,12 +643,12 @@ mod tests {
         write_marker(&root, "test/testgroup.iter.md", "test");
         write_group(&test_dir, "G", &[("t1.sh", "exit 1\n"), ("t2.sh", "exit 0\n")], false);
         let cfg = Config::default();
-        sweep(&root, &cfg);
+        sweep(&root, &cfg, &SweepOptions::default());
         let queue = Queue::new(&root, &cfg);
         assert_eq!(queue.load()[0].source_tests, vec!["t1"]);
         // t2 starts failing too before anyone picks the item up.
         std::fs::write(test_dir.join("t2.sh"), "exit 1\n").unwrap();
-        let report = sweep(&root, &cfg);
+        let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.items_created, 0);
         assert_eq!(report.items_refreshed, 1);
         assert_eq!(queue.load()[0].source_tests, vec!["t1", "t2"]);
@@ -634,7 +663,7 @@ mod tests {
         let cfg = Config::default();
         let comp = root.join("comp").canonicalize().unwrap();
         let lock = locks::acquire_codepath_lock(&comp, "w-busy", "code", 600, &[]).unwrap();
-        let report = sweep(&root, &cfg);
+        let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.ran, 0, "locked C4 object must be skipped");
         assert!(report.notes.iter().any(|n| n.contains("codepath busy")));
         drop(lock);

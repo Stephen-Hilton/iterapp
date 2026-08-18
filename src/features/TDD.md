@@ -120,16 +120,44 @@ when an agent claims completion, closing even "agent forgot to run the gate".
 
 ## Engine Test Sweep (deterministic — no agent)
 
-Settings (project settings, `testing` section; priorities higher-is-sooner,
-all configurable — BUILT 2026-08-15, see `config.rs::TestingConfig`):
+**Reworked 2026-08-17 (owner decision): the sweep is driven by itersched, not by
+an engine-internal loop, and its knobs are CLI flags, not config.json settings.**
+The old `testing` section of config.json (`test_sweep_active`,
+`minutes_between_test_sweeps`, `test_green_stale_hours`,
+`test_sweep_timeout_minutes`, `parallel_test_concurrency`,
+`workitem_priority_lastrun_not_green`, `workitem_priority_lastrun_green`) is
+GONE — `config.rs::TestingConfig` deleted, the sweep block removed from
+`scheduler.rs`. What replaced each piece:
 
-- `test_sweep_active`: true
-- `minutes_between_test_sweeps`: 120
-- `test_green_stale_hours`: 24           (green newer than this = left alone)
-- `test_sweep_timeout_minutes`: 10       (per testgroup run; overrun = killed → `error`)
-- `parallel_test_concurrency`: 3         (deterministic test processes at once)
-- `workitem_priority_lastrun_not_green`: 4
-- `workitem_priority_lastrun_green`: 2
+- **The loop**: a user-created "Test Loop" scheduled workitem (`state:
+  scheduled`, `exec: shell`, `sched: every 120 min`) whose mainwork runs
+  `"$ITER_BIN" testsweep --project "$ITER_PROJECT" --concurrency 3
+  --priority-red 4 --priority-green 2 --green-stale-hours 24
+  --group-timeout-min 20`. One click creates it: webapp Settings → Test →
+  "Create TestLoop Schedule" (refuses a duplicate by title). Editing the
+  workitem's command line IS the configuration; every knob is a visible flag.
+- **`test_sweep_active`** → pause/resume the schedule (paused templates never fire).
+- **`minutes_between_test_sweeps`** → the template's `sched.every_min`.
+- **Overlap protection** → itersched's open-clone dedup (one open run per
+  schedule) replaces the old `sweep_in_flight` flag.
+- **Lock scope**: the Test Loop item carries `codepath: "."` with
+  `codepath_ignore: ["**"]` — everything carved out, effectively lockless. The
+  sweep needs no lock of its own (it skips busy C4 objects per-object,
+  `testsweep.rs`), and a whole-code-root lock would serialize the engine.
+- **`test_sweep_timeout_minutes`** → `--group-timeout-min` on `iter testsweep`
+  and `--timeout-min` on `iter runtests` (`runtests::DEFAULT_GROUP_TIMEOUT_MIN`,
+  default 20 — raised from 10, owner call 2026-08-17). The compiled default
+  exists because the budget guards EVERY runtests invocation — agents' `--broken`
+  / `--fixed` gates and manual runs included, not just the sweep.
+- The remaining flags default in `testsweep.rs::SweepOptions` (3 / 4 / 2 / 24).
+
+Priorities stay higher-is-sooner; default work is 5, so sweep-born fix items
+fill idle capacity instead of starving user work.
+
+Behavior deltas from the old loop: no more first-pass-~90s-after-start (the
+schedule fires on its own anchor; skip-don't-backfill applies after downtime),
+and a draining/holding engine doesn't fire schedules — same effect as the old
+"draining engines don't sweep".
 
 **File roles are FILENAME-derived (decided 2026-08-16, second decision that day).**
 The word right before `.iter.md` declares what a file IS — `marker` / `bizreq` /
@@ -155,8 +183,8 @@ as "unowned" and never run. The testwriter's registration-chain duty: add the
 write outside its codepath), and create the declared file if missing — so
 "add tests to this C4 object" is a one-item ask.
 
-Sweep, each wake (`testsweep.rs`; engine cadence in `scheduler.rs`, first pass
-~90s after engine start; manual: `iter testsweep`):
+Sweep, each wake (`testsweep.rs`; fired by the "Test Loop" scheduled workitem
+described above; manual: `iter testsweep`):
 
 1. Scan marker files (projects.json scan_roots + marker_glob), follow each
    `testgroup:` key, and interrogate the declared groups:

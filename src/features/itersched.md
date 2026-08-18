@@ -50,12 +50,17 @@ agent items: resolved at their position, output captured and prefixed to the
 next LLM turn's prompt ("run the tests, hand the agent the results"). The UI
 flags them with a dashed ⚙ pill.
 
-## Testing-framework merge (follow-up)
+## Testing-framework merge — DONE 2026-08-17
 
-The path to superseding testsweep's internal timer: a seeded scheduled item —
-`exec: shell`, mainwork `"$ITER_BIN" testsweep --project "$ITER_PROJECT"`,
-`kind: every`, `every_min = minutes_between_test_sweeps` — makes the sweep a
-visible, pausable, audited schedule like any other repetitive work, and
-`testing.test_sweep_active` / `minutes_between_test_sweeps` collapse into that
-item. Not yet wired: the internal timer still runs; converting is a deliberate
-migration (seed once, don't surprise existing projects).
+The sweep's internal timer is gone (`scheduler.rs` sweep block and
+`config.rs::TestingConfig` deleted). The sweep now runs as a "Test Loop"
+scheduled workitem — `exec: shell`, `kind: every` / `every_min: 120`, mainwork
+`"$ITER_BIN" testsweep --project "$ITER_PROJECT" --concurrency 3 --priority-red
+4 --priority-green 2 --green-stale-hours 24 --group-timeout-min 20` — created
+on demand by the webapp's Settings → Test → "Create TestLoop Schedule" button
+(dedup by title; nothing is auto-seeded, so existing projects opt in with one
+click). Every former `testing.*` setting is now a visible flag on that command
+line; pausing the schedule replaces `test_sweep_active`. The item is
+deliberately lockless (`codepath: "."` + `codepath_ignore: ["**"]`): the sweep
+skips busy C4 objects itself, and a real whole-root lock would serialize the
+engine. Full rationale: features/TDD.md "Engine Test Sweep".
