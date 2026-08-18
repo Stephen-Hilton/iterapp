@@ -689,6 +689,65 @@ fn critfail_flag_fails_item_even_when_agent_reports_success() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn reject_flag_moves_item_to_todo_not_failed() {
+    // The stub plays an agent that ran `iter reject` mid-turn (flag written) and
+    // then returns a normal successful result. The engine must move the item to
+    // todo — the human re-evaluation bucket — never complete, never a retry.
+    let (root, _stub) = setup_project("reject", 3, 10);
+    let stub = root.join("rejecting-claude.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'out of scope: this project has no payment surface' > \"$ITER_PROJECT/.iter/.engine/reject-$ITER_WORKID.txt\"\necho '{\"type\":\"result\",\"session_id\":\"s1\",\"result\":\"rejected, see reason\"}'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    seed(&root, &workitem_json("e2e-reject-1", "code", "invalid ask", "./src", "order food for delivery", "", ""));
+
+    run_engine(&root, &stub, Duration::from_secs(60));
+
+    assert!(closed_items(&root).is_empty(), "a rejected item is never closed");
+    let open = open_items(&root);
+    assert_eq!(open.len(), 1, "{:?}", open);
+    assert_eq!(open[0]["state"], "todo", "rejection lands in the human-review bucket: {:?}", open[0]);
+    assert!(
+        open[0]["lasterror"].as_str().unwrap().contains("REJECTED by agent: out of scope"),
+        "reason recorded: {:?}",
+        open[0]["lasterror"]
+    );
+    assert!(!root.join(".iter/.engine/reject-e2e-reject-1.txt").exists(), "flag is consumed");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn invert_priorities_migrates_open_queue_once() {
+    let (root, _stub) = setup_project("prioinv", 3, 10);
+    seed(&root, &workitem_json("e2e-inv-1", "code", "urgent old-style", "./src", "w", "", ""));
+    // Old higher-is-sooner urgency 8 → new-scheme 2; default 5 stays 5.
+    let raw = std::fs::read_to_string(root.join(".iter/.engine/workitems.jsonl")).unwrap();
+    std::fs::write(
+        root.join(".iter/.engine/workitems.jsonl"),
+        raw.replace("\"priority\":5", "\"priority\":8"),
+    )
+    .unwrap();
+    seed(&root, &workitem_json("e2e-inv-2", "code", "default", "./src", "w", "", ""));
+
+    let out = Command::new(BIN)
+        .args(["invert-priorities", "--project", root.to_str().unwrap()])
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let open = open_items(&root);
+    let prio = |id: &str| open.iter().find(|i| i["workid"] == id).unwrap()["priority"].as_i64().unwrap();
+    assert_eq!(prio("e2e-inv-1"), 2, "8 → 2 under newP = 10 - P");
+    assert_eq!(prio("e2e-inv-2"), 5, "5 is the fixed point");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The TDD loop end-to-end, no engine required: `iter runtests` neutral/claim
 /// modes (exit codes, run logs, block updates, the critfail fail-flag) and
 /// `iter testsweep` (fix-item birth with provenance, dedup, stale auto-close).

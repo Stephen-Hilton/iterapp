@@ -87,6 +87,21 @@ item. Only for genuinely untestable claims (external infra state, credentials)
 may an item fall back to prose: state the claim, the check command, and
 "if this no longer holds, report stale and stop" in `mainwork`.
 
+## Rejecting invalid work (any agent)
+
+Failing an item means "I couldn't do the work" — the engine retries it. When the
+problem is the WORK ITSELF (out of scope for the project, goal unclear, premise
+no longer true, conflicts with a `*bizreq.iter.md` invariant), do not fail and
+do not quietly complete. Reject it:
+
+    "$ITER_BIN" reject --project "$ITER_PROJECT" --reason "<why, and what would make it acceptable>"
+
+The engine moves the item to `todo` at the turn boundary — the human-review
+bucket, where the user edits and requeues (or deletes) it. No retries are
+burned; nothing gets buried in the completed archive. Your reason and your
+output are what the re-evaluating human sees: name the blocking fact and the
+smallest change that would make the item valid, then end your work.
+
 ## iter files — the FILENAME declares the role
 
 Every `*.iter.md` file's NAME says what it IS: the word right before `.iter.md`

@@ -10,8 +10,9 @@ use crate::testgroups::{self, TestGroup};
 use crate::workitems::{self, Queue, WorkItem};
 
 /// Source tag on sweep-born work items. Deliberately NOT "error": error-sourced
-/// items get a hard-coded +2 effective-priority boost, while sweep items must obey
-/// the configured testing priorities (default below user work, filling idle time).
+/// items get a hard-coded -2 effective-priority boost (lower = sooner), while
+/// sweep items must obey the configured priorities (default below user work —
+/// numerically ABOVE the default 5 — filling idle time).
 pub const SOURCE: &str = "testsweep";
 
 /// One sweep's knobs. These deliberately live on the INVOCATION, not in
@@ -22,6 +23,8 @@ pub struct SweepOptions {
     /// How many testgroups run concurrently.
     pub concurrency: usize,
     /// Priority for fix items born from a group with no green run recorded.
+    /// Priorities are lower-is-sooner; sweep defaults sit BELOW the default-5
+    /// urgency (numerically above it) so they fill idle capacity.
     pub priority_red: i64,
     /// Priority for fix items born from a group whose green run went stale.
     pub priority_green: i64,
@@ -35,12 +38,24 @@ impl Default for SweepOptions {
     fn default() -> Self {
         SweepOptions {
             concurrency: 3,
-            priority_red: 4,
-            priority_green: 2,
+            priority_red: 6,
+            priority_green: 8,
             green_stale_hours: 24,
             group_timeout_min: runtests::DEFAULT_GROUP_TIMEOUT_MIN,
         }
     }
+}
+
+/// A missing-tests gap found during discovery: a declared testgroup file that
+/// doesn't exist, or a group with an empty testlist. Births a testwriter
+/// authoring item in `todo`; `key` is the `source_testgroup` dedup value (the
+/// group label, or the declared file path when there is no group yet).
+struct AuthoringGap {
+    key: String,
+    title: String,
+    codepath: String,
+    context: Vec<String>,
+    mainwork: String,
 }
 
 /// One sweepable unit: a testgroup DECLARED by a C4 object's marker file. The
@@ -108,8 +123,23 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
     let roots = crate::server::scan_roots(project_root);
     let scan = markers::scan(project_root, &roots, &glob);
 
+    let rel = |p: &Path| {
+        p.strip_prefix(&code_root)
+            .map(|r| {
+                let s = r.to_string_lossy().into_owned();
+                if s.is_empty() { ".".to_string() } else { s }
+            })
+            .unwrap_or_else(|_| p.to_string_lossy().into_owned())
+    };
     let mut claimed: Vec<PathBuf> = Vec::new();
     let mut candidates: Vec<Candidate> = Vec::new();
+    // Missing tests found during discovery (declared testgroup file absent, or a
+    // group with an empty testlist): each births ONE testwriter authoring item in
+    // `todo` (2026-08-17 flow — the minor-effort "missing tests only" branch;
+    // human gate before authoring starts). If the testwriter then finds no code
+    // to test (major effort), IT escalates to plan — the deterministic sweep
+    // never judges minor vs major.
+    let mut authoring: Vec<AuthoringGap> = Vec::new();
     for node in &scan.nodes {
         if node.testgroup.is_empty() {
             report.undeclared += 1;
@@ -121,9 +151,34 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
             Ok(p) => p,
             Err(_) => {
                 report.notes.push(format!(
-                    "\"{}\": marker declares testgroup: {} but the file does not exist — a testwriter item should create it",
+                    "\"{}\": marker declares testgroup: {} but the file does not exist — testwriter authoring item ensured",
                     node.name, node.testgroup
                 ));
+                // The declared test dir may not exist yet either, so the item is
+                // scoped to the C4 object's directory; the prompt confines writes.
+                let declared = rel(&object_dir.join(&node.testgroup));
+                authoring.push(AuthoringGap {
+                    key: declared.clone(),
+                    title: format!("author tests for \"{}\" (declared testgroup file missing)", node.name),
+                    codepath: rel(&object_dir),
+                    context: vec![node.path.clone()],
+                    mainwork: format!(
+                        "The marker file {marker} declares `testgroup: {tg}` but that file does not exist.\n\
+                         Create it, and author the tests it should register:\n\
+                         1. Read the marker, its local bizreq/techreq (and the global ones in $ITER_REQS), and the code.\n\
+                         2. If the C4 object's CODE is missing too, this is a plan-sized gap, not a testwriter task: \
+                         escalate — create a plan work item carrying what you found (\"$ITER_BIN\" add --project \"$ITER_PROJECT\" \
+                         --type plan --title \"plan: build out {name}\" --mainwork \"<gap analysis>\") and finish this item \
+                         reporting the escalation.\n\
+                         3. Otherwise create {declared} with testgroups, write the test scripts (shell-script contract: \
+                         exit 0 as-expected / 1 unexpected / other = script error; last line `ITER_RESULT pass=X fail=Y total=Z`), \
+                         and register every test in the testlist. Confine writes to the test directory.",
+                        marker = node.path,
+                        tg = node.testgroup,
+                        name = node.name,
+                        declared = declared,
+                    ),
+                });
                 continue;
             }
         };
@@ -144,8 +199,27 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
         for group in testgroups::parse(&content) {
             report.examined += 1;
             if group.testlist.is_empty() {
-                // Tests not written yet is a plan/testwriter concern, not a red run.
-                report.notes.push(format!("skip \"{}\": no tests registered", group.label));
+                // Tests not written yet is never a red run — it becomes a
+                // testwriter authoring item (todo) instead.
+                report.notes.push(format!("\"{}\": no tests registered — testwriter authoring item ensured", group.label));
+                authoring.push(AuthoringGap {
+                    key: group.label.clone(),
+                    title: format!("author tests for testgroup \"{}\" (empty testlist)", group.label),
+                    codepath: rel(tg_file.parent().unwrap_or(&object_dir)),
+                    context: vec![tg_file.to_string_lossy().into_owned(), node.path.clone()],
+                    mainwork: format!(
+                        "Testgroup \"{label}\" in {tg_file} has no tests registered.\n\
+                         Author them: read the marker file {marker}, its local bizreq/techreq (and the global ones in \
+                         $ITER_REQS), and the code; write test scripts honoring the shell-script contract (exit 0 \
+                         as-expected / 1 unexpected / other = script error; last line `ITER_RESULT pass=X fail=Y total=Z`) \
+                         and register each in the group's testlist. If the code this group should exercise does not \
+                         exist yet, escalate to a plan work item with your gap analysis instead of writing tests \
+                         against nothing, and finish this item reporting the escalation.",
+                        label = group.label,
+                        tg_file = tg_file.display(),
+                        marker = node.path,
+                    ),
+                });
                 continue;
             }
             let fresh_green = group.is_green()
@@ -206,6 +280,49 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
 
     // Translate results into queue actions.
     let queue = Queue::new(project_root, cfg);
+
+    // Authoring gaps first: one open testwriter item per gap (same
+    // source_testgroup dedup as fix items — an open item, whoever created it,
+    // suppresses a new one). Born `todo`: new-test authoring gets a human gate.
+    for gap in &authoring {
+        let open_count = queue.load().len();
+        let mut item = WorkItem {
+            workid: uuid::Uuid::new_v4().to_string(),
+            item_type: "testwriter".into(),
+            state: workitems::STATE_TODO.into(),
+            title: gap.title.clone(),
+            source: SOURCE.into(),
+            priority: opts.priority_red,
+            codepath: gap.codepath.clone(),
+            source_testgroup: gap.key.clone(),
+            context: gap.context.clone(),
+            mainwork: gap.mainwork.clone(),
+            ..Default::default()
+        };
+        item.times.added = workitems::now_iso();
+        let created = queue.with_lock(|items| {
+            if items.iter().any(|i| i.source_testgroup == gap.key) {
+                return false;
+            }
+            if open_count >= cfg.engine.max_open_workitems {
+                return false; // full queue: suppressed, next sweep retries
+            }
+            items.push(item.clone());
+            true
+        });
+        match created {
+            Ok(true) => {
+                report.items_created += 1;
+                logging::info(
+                    "sweep",
+                    &format!("created testwriter authoring item {} (\"{}\", todo)", item.workid, gap.key),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => report.notes.push(format!("\"{}\": {}", gap.key, e)),
+        }
+    }
+
     for (cand, run) in results {
         let run = match run {
             Ok(r) => r,
@@ -467,6 +584,41 @@ mod tests {
         let tg_file = test_dir.join("testgroup.iter.md");
         std::fs::write(&tg_file, testgroups::update("# tests\n", &[group])).unwrap();
         tg_file
+    }
+
+    #[test]
+    fn missing_tests_birth_testwriter_authoring_items_in_todo() {
+        // Declared testgroup file absent → authoring item keyed by the declared path.
+        let (root, _test_dir) = setup("authoring");
+        write_marker(&root, "test/testgroup.iter.md", "test");
+        std::fs::remove_dir_all(root.join("comp/test")).unwrap();
+        let cfg = Config::default();
+        let report = sweep(&root, &cfg, &SweepOptions::default());
+        assert_eq!(report.items_created, 1);
+        let queue = Queue::new(&root, &cfg);
+        let items = queue.load();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, "testwriter");
+        assert_eq!(items[0].state, workitems::STATE_TODO, "authoring gets a human gate");
+        assert_eq!(items[0].source, SOURCE);
+        assert!(items[0].mainwork.contains("escalate"), "major-effort branch delegated to the agent");
+        // Dedup: a second sweep creates nothing new.
+        let report2 = sweep(&root, &cfg, &SweepOptions::default());
+        assert_eq!(report2.items_created, 0);
+        assert_eq!(queue.load().len(), 1);
+
+        // Empty testlist → authoring item keyed by the group label.
+        let (root2, test_dir2) = setup("authoring-empty");
+        write_marker(&root2, "test/testgroup.iter.md", "test");
+        let group = TestGroup { label: "Empty".into(), ..Default::default() };
+        std::fs::write(test_dir2.join("testgroup.iter.md"), testgroups::update("# tests\n", &[group])).unwrap();
+        let report3 = sweep(&root2, &cfg, &SweepOptions::default());
+        assert_eq!(report3.items_created, 1);
+        let items2 = Queue::new(&root2, &cfg).load();
+        assert_eq!(items2[0].source_testgroup, "Empty");
+        assert_eq!(items2[0].state, workitems::STATE_TODO);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
     }
 
     #[test]

@@ -314,7 +314,7 @@ serialization is plain JSON):
 | `type` | string | producer | must match a basename in `.iter/agents/` (`plan`, `code`, `test`, `testwriter`, `refactor`, `ingest`, …) |
 | `state` | enum | engine | `todo \| queued \| in-progress \| paused \| failed \| complete` |
 | `source` | string | producer | `user` \| `agent: {type}` \| `error` |
-| `priority` | int 0–10 | producer | 10 = most urgent |
+| `priority` | int 0–10 | producer | LOWER = sooner; 0 = most urgent, default 5 (inverted 2026-08-17) |
 | `risk` | int 0–10 | producer | 10 = highest risk; informational in v1 |
 | `codepath` | path | producer | working directory for the agent; the lock scope |
 | `codepath_ignore` | [string] | producer | gitignore-like patterns (relative to codepath) carved OUT of the lock scope (added 2026-08-15): the item must not touch those subtrees, so a parallel item can own them — e.g. code locks `pth/object/` ignoring `test/` while a testwriter locks `pth/object/test/`. A pattern with `/` is anchored to the codepath, one without matches at any depth; a matched directory excludes everything beneath it; glob wildcards ok. Stored in `.iter.lock` (`ignore`) so other acquirers see the carve-out |
@@ -440,7 +440,7 @@ On `iter run`, per tick (`tick_interval_sec`):
    **Find Work**
    - Select the best eligible item of this agent's type:
      - eligible: `state == queued`, or `state == failed` past backoff with attempts left
-     - order by: `source == error` first (+2 effective priority), then `priority` desc,
+     - order by: `source == error` first (-2 effective priority), then `priority` asc (lower = sooner),
        then oldest `times.added` first
    - Take the record lock; set `state = in-progress`, `times.start`, `attempts += 1`;
      save; release the lock.

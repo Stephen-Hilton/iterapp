@@ -56,7 +56,7 @@ The sweep's internal timer is gone (`scheduler.rs` sweep block and
 `config.rs::TestingConfig` deleted). The sweep now runs as a "Test Loop"
 scheduled workitem — `exec: shell`, `kind: every` / `every_min: 120`, mainwork
 `"$ITER_BIN" testsweep --project "$ITER_PROJECT" --concurrency 3 --priority-red
-4 --priority-green 2 --green-stale-hours 24 --group-timeout-min 20` — created
+6 --priority-green 8 --green-stale-hours 24 --group-timeout-min 20` — created
 on demand by the webapp's Settings → Test → "Create TestLoop Schedule" button
 (dedup by title; nothing is auto-seeded, so existing projects opt in with one
 click). Every former `testing.*` setting is now a visible flag on that command

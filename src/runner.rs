@@ -64,6 +64,12 @@ impl Session {
                 "ITER_INTERFACE_DIR".to_string(),
                 crate::config::interface_dir(&project_root, &cfg).to_string_lossy().into_owned(),
             ),
+            // Where NEW use-case files are created (globalsettings.
+            // usecase_default_path, resolved) — the usecase agent's lock scope.
+            (
+                "ITER_USECASE_DIR".to_string(),
+                crate::config::usecase_dir(&project_root, &cfg).to_string_lossy().into_owned(),
+            ),
             // Let the agent's Bash tool wait on long synchronous calls (critreview)
             // up to the agent's own work timeout — the natural upper bound.
             (

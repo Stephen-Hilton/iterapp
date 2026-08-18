@@ -145,13 +145,15 @@ pub fn parse_iso(s: &str) -> Option<DateTime<Utc>> {
 }
 
 impl WorkItem {
-    /// Effective priority for ordering: error-sourced work gets a +2 boost,
-    /// and failed items awaiting retry get +2 so they go before queued work
-    /// of the same priority instead of languishing behind a deep backlog.
+    /// Effective priority for ordering. Priorities are LOWER-IS-SOONER (P0 =
+    /// most urgent, P10 = least, default 5 — inverted 2026-08-17 to match the
+    /// industry P0..Pn convention). Error-sourced work gets a -2 boost, and
+    /// failed items awaiting retry get -2 so they go before queued work of the
+    /// same priority instead of languishing behind a deep backlog.
     pub fn effective_priority(&self) -> i64 {
         self.priority
-            + if self.source == "error" { 2 } else { 0 }
-            + if self.state == STATE_FAILED { 2 } else { 0 }
+            - if self.source == "error" { 2 } else { 0 }
+            - if self.state == STATE_FAILED { 2 } else { 0 }
     }
 
     /// Is this item eligible to be picked up right now?
@@ -383,21 +385,22 @@ mod tests {
         assert!(item.failed_terminally(&cfg));
     }
 
+    // Priorities are lower-is-sooner: a SMALLER effective_priority wins the pick.
     #[test]
     fn error_source_priority_boost() {
         let mut a = WorkItem { priority: 5, ..Default::default() };
         a.source = "error".into();
-        let b = WorkItem { priority: 6, ..Default::default() };
-        assert!(a.effective_priority() > b.effective_priority());
+        let b = WorkItem { priority: 4, ..Default::default() };
+        assert!(a.effective_priority() < b.effective_priority(), "error source outranks a P4");
     }
 
     #[test]
     fn failed_state_priority_boost() {
         let failed = WorkItem { priority: 5, state: STATE_FAILED.into(), ..Default::default() };
         let queued_same = WorkItem { priority: 5, state: STATE_QUEUED.into(), ..Default::default() };
-        let queued_higher = WorkItem { priority: 8, state: STATE_QUEUED.into(), ..Default::default() };
-        assert!(failed.effective_priority() > queued_same.effective_priority());
-        assert!(queued_higher.effective_priority() > failed.effective_priority());
+        let queued_more_urgent = WorkItem { priority: 2, state: STATE_QUEUED.into(), ..Default::default() };
+        assert!(failed.effective_priority() < queued_same.effective_priority(), "retry goes before equal queued work");
+        assert!(queued_more_urgent.effective_priority() < failed.effective_priority(), "a genuinely urgent item still wins");
     }
 
     #[test]

@@ -132,7 +132,7 @@ GONE — `config.rs::TestingConfig` deleted, the sweep block removed from
 - **The loop**: a user-created "Test Loop" scheduled workitem (`state:
   scheduled`, `exec: shell`, `sched: every 120 min`) whose mainwork runs
   `"$ITER_BIN" testsweep --project "$ITER_PROJECT" --concurrency 3
-  --priority-red 4 --priority-green 2 --green-stale-hours 24
+  --priority-red 6 --priority-green 8 --green-stale-hours 24
   --group-timeout-min 20`. One click creates it: webapp Settings → Test →
   "Create TestLoop Schedule" (refuses a duplicate by title). Editing the
   workitem's command line IS the configuration; every knob is a visible flag.
@@ -149,10 +149,13 @@ GONE — `config.rs::TestingConfig` deleted, the sweep block removed from
   default 20 — raised from 10, owner call 2026-08-17). The compiled default
   exists because the budget guards EVERY runtests invocation — agents' `--broken`
   / `--fixed` gates and manual runs included, not just the sweep.
-- The remaining flags default in `testsweep.rs::SweepOptions` (3 / 4 / 2 / 24).
+- The remaining flags default in `testsweep.rs::SweepOptions` (3 / 6 / 8 / 24).
 
-Priorities stay higher-is-sooner; default work is 5, so sweep-born fix items
-fill idle capacity instead of starving user work.
+**Priorities are LOWER-IS-SOONER since 2026-08-17** (P0 = most urgent, default
+5 — inverted to the industry convention; `iter invert-priorities` migrates an
+existing open queue as newP = 10 - P). Sweep-born fix items default numerically
+ABOVE 5 (red 6, stale-green 8), so they fill idle capacity instead of starving
+user work.
 
 Behavior deltas from the old loop: no more first-pass-~90s-after-start (the
 schedule fires on its own anchor; skip-don't-backfill applies after downtime),
@@ -189,9 +192,16 @@ described above; manual: `iter testsweep`):
 1. Scan marker files (projects.json scan_roots + marker_glob), follow each
    `testgroup:` key, and interrogate the declared groups:
    - **last run not green** (never ran, red, or error) → candidate, priority
-     `workitem_priority_lastrun_not_green`
-   - **green but older than `test_green_stale_hours`** → candidate, priority
-     `workitem_priority_lastrun_green`
+     `--priority-red` (default 6)
+   - **green but older than `--green-stale-hours`** → candidate, priority
+     `--priority-green` (default 8)
+   - **declared testgroup file missing, or a group with an empty testlist**
+     (2026-08-17 flow) → ONE testwriter authoring item in `todo` (human gate;
+     dedup via `source_testgroup` — the group label, or the declared path when
+     no group exists yet). The deterministic sweep never judges minor-vs-major:
+     if the testwriter finds no CODE to test either, IT escalates to a plan
+     item carrying its gap analysis, mirroring the code agent's
+     escalate-to-plan.
    - a C4 object with an active codepath lock is skipped (mid-edit trees would
      produce meaningless results); empty testlists are skipped (that's a
      testwriter gap, not a red run)

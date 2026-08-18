@@ -73,7 +73,7 @@ so this command works from any codepath.)
 - The test directory name comes from `globalsettings.test_dir` (exported as
   `$ITER_TEST_DIR`); never guess it. The engine also enforces code/testwriter
   scope disjointness deterministically — but write it correctly anyway.
-- Set `priority` 0–10 (default 5; raise only for blocking slices) and `risk` 0–10.
+- Set `priority` 0–10 (LOWER = sooner: P0 most urgent, default 5 — drop below 5 only for blocking slices) and `risk` 0–10.
 - If the add refuses because the queue is full (`max_open_workitems`), report the
   refused items in your output instead of retrying.
 

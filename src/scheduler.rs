@@ -113,6 +113,24 @@ pub fn critfail_path(project_root: &Path, workid: &str) -> PathBuf {
     config::engine_dir(project_root).join(format!("critfail-{}.txt", workid))
 }
 
+/// Reject-flag written by `iter reject`: the agent judged the WORK invalid (out
+/// of scope, unclear, premise broken) — not that it failed at the work. The
+/// engine consumes it at the turn boundary and moves the item to `todo` with
+/// the reason recorded: the high-attention, human-review bucket, where the item
+/// can be edited and requeued — never retried automatically, never buried in
+/// the completed archive.
+pub fn reject_path(project_root: &Path, workid: &str) -> PathBuf {
+    config::engine_dir(project_root).join(format!("reject-{}.txt", workid))
+}
+
+fn take_reject(project_root: &Path, workid: &str) -> Option<String> {
+    let path = reject_path(project_root, workid);
+    let reason = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let reason = reason.trim();
+    Some(if reason.is_empty() { "rejected (no reason recorded)".to_string() } else { reason.to_string() })
+}
+
 fn take_critfail(project_root: &Path, workid: &str) -> Option<String> {
     let path = critfail_path(project_root, workid);
     let reason = std::fs::read_to_string(&path).ok()?;
@@ -275,9 +293,10 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
             let agent_defs = agents::discover(&project_root);
             // Fill slots in global priority order: every pass offers the types that
             // still have a free per-type slot, and pick_next claims the single best
-            // eligible item across all of them. The highest-priority item therefore
-            // always starts first, regardless of its type, unless that type's
-            // max_agent_count is already saturated (or zero).
+            // eligible item across all of them. The most urgent item (lowest P —
+            // priorities are lower-is-sooner) therefore always starts first,
+            // regardless of its type, unless that type's max_agent_count is
+            // already saturated (or zero).
             while running.len() < effective_max {
                 let open_types: Vec<&str> = agent_defs
                     .iter()
@@ -483,7 +502,7 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
             None => true,
             Some(b) => {
                 let cur = &items[b];
-                item.effective_priority() > cur.effective_priority()
+                item.effective_priority() < cur.effective_priority() // lower = sooner (P0 most urgent)
                     || (item.effective_priority() == cur.effective_priority()
                         && item.times.added < cur.times.added)
             }
@@ -614,7 +633,9 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
     // The workid lets an `iter critreview` subprocess flag THIS item as failed
     // deterministically (fail-flag file) instead of trusting the agent to stop.
     session.envs.push(("ITER_WORKID".to_string(), item.workid.clone()));
-    let _ = std::fs::remove_file(critfail_path(&shared.project_root, &item.workid)); // stale flag from a killed prior attempt
+    // Stale flags from a killed prior attempt.
+    let _ = std::fs::remove_file(critfail_path(&shared.project_root, &item.workid));
+    let _ = std::fs::remove_file(reject_path(&shared.project_root, &item.workid));
     let mut outputs: Vec<String> = Vec::new();
 
     // Output of engine-run shell steps, carried into the NEXT LLM turn's prompt.
@@ -677,6 +698,17 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
             if let Some(reason) = take_critfail(&shared.project_root, &item.workid) {
                 logging::warn(&tag, &format!("critreview flagged failure: {}", reason));
                 turn_result = Err(reason);
+            }
+            // `iter reject`: the agent judged the WORK invalid. Back to todo for
+            // human re-evaluation — no retries, no close-out. Critfail wins if
+            // both flags exist (a failed review is the harder signal).
+            if turn_result.is_ok() {
+                if let Some(reason) = take_reject(&shared.project_root, &item.workid) {
+                    logging::warn(&tag, &format!("agent rejected the work item → todo: {}", reason));
+                    reject_item(&shared, &item.workid, &reason, outputs.join("\n"));
+                    drop(lock);
+                    return;
+                }
             }
         }
         match turn_result {
@@ -798,6 +830,7 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
         ("ITER_REQS".into(), reqs_dir.to_string_lossy().into_owned()),
         ("ITER_TEST_DIR".into(), cfg.globalsettings.test_dir.clone()),
         ("ITER_INTERFACE_DIR".into(), config::interface_dir(&shared.project_root, &cfg).to_string_lossy().into_owned()),
+        ("ITER_USECASE_DIR".into(), config::usecase_dir(&shared.project_root, &cfg).to_string_lossy().into_owned()),
         ("ITER_WORKID".into(), item.workid.clone()),
     ];
 
@@ -930,6 +963,24 @@ fn fill_empty_stamps(times: &mut workitems::Times) {
             *stamp = closed.clone();
         }
     }
+}
+
+/// `iter reject` outcome: the item returns to `todo` (the human-review bucket —
+/// deliberately NOT complete, which is too big a pile to surface rejections
+/// from, and NOT failed, which would burn retries re-deriving the same
+/// rejection). The reason lands in lasterror; turns completed so far are kept
+/// in output so the re-evaluating human sees the agent's analysis.
+fn reject_item(shared: &Shared, workid: &str, reason: &str, partial_output: String) {
+    let _q = shared.queue_mutex.lock().unwrap();
+    let queue = shared.queue();
+    let _ = queue.mutate(workid, |it| {
+        it.state = workitems::STATE_TODO.into();
+        it.lasterror = format!("REJECTED by agent: {}", reason);
+        if !partial_output.is_empty() {
+            it.output = partial_output.clone();
+        }
+        it.times.start = String::new();
+    });
 }
 
 /// Put an item back in the queue. `refund_attempt` when the run never really started
@@ -1265,11 +1316,11 @@ mod tests {
             codepath: cp.into(),
             ..Default::default()
         };
-        // Highest prio overlaps a running item's scope; next is under an on-disk
-        // lock; the third must be picked even though it sorts last.
-        shared.queue().append(&mk("w-occupied", 9, "a/deep")).unwrap();
-        shared.queue().append(&mk("w-locked", 8, "b")).unwrap();
-        shared.queue().append(&mk("w-free", 1, "c")).unwrap();
+        // Most urgent (lowest P) overlaps a running item's scope; next is under an
+        // on-disk lock; the third must be picked even though it sorts last.
+        shared.queue().append(&mk("w-occupied", 1, "a/deep")).unwrap();
+        shared.queue().append(&mk("w-locked", 2, "b")).unwrap();
+        shared.queue().append(&mk("w-free", 9, "c")).unwrap();
         shared
             .running_paths
             .lock()
@@ -1308,7 +1359,7 @@ mod tests {
         let clash = WorkItem {
             workid: "w-clash".into(),
             item_type: "testwriter".into(),
-            priority: 9,
+            priority: 1,
             codepath: "obj/src".into(),
             ..Default::default()
         };
@@ -1339,14 +1390,14 @@ mod tests {
         let code_full = WorkItem {
             workid: "w-code-full".into(),
             item_type: "code".into(),
-            priority: 9,
+            priority: 1,
             codepath: "obj".into(),
             ..Default::default()
         };
         shared.queue().append(&code_full).unwrap();
         shared.queue().append(&code_ign).unwrap();
         let picked = pick_next(&shared, &["code"], false).expect("guard-repaired item must be pickable");
-        assert_eq!(picked.workid, "w-code-full", "higher priority wins once the guard repairs its scope");
+        assert_eq!(picked.workid, "w-code-full", "more urgent priority wins once the guard repairs its scope");
         assert!(
             picked.codepath_ignore.contains(&"test/".to_string()),
             "the repair is persisted on the claimed item: {:?}",
@@ -1392,9 +1443,9 @@ mod tests {
             ..Default::default()
         };
         shared.queue().append(&mk("w-code", "code", 5, "a")).unwrap();
-        shared.queue().append(&mk("w-refactor", "refactor", 60, "b")).unwrap();
-        shared.queue().append(&mk("w-ingest", "ingest", 6, "c")).unwrap();
-        // Priority 60 wins even though "code" sorts first alphabetically.
+        shared.queue().append(&mk("w-refactor", "refactor", 0, "b")).unwrap();
+        shared.queue().append(&mk("w-ingest", "ingest", 4, "c")).unwrap();
+        // P0 wins even though "code" sorts first alphabetically.
         let types = ["code", "ingest", "refactor"];
         assert_eq!(pick_next(&shared, &types, false).unwrap().workid, "w-refactor");
         assert_eq!(pick_next(&shared, &types, false).unwrap().workid, "w-ingest");

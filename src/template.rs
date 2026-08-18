@@ -12,6 +12,7 @@ pub const TEMPLATE: &[(&str, &str)] = &[
     (".iter/agents/plan.md", include_str!(".iter/agents/plan.md")),
     (".iter/agents/refactor.md", include_str!(".iter/agents/refactor.md")),
     (".iter/agents/testwriter.md", include_str!(".iter/agents/testwriter.md")),
+    (".iter/agents/usecase.md", include_str!(".iter/agents/usecase.md")),
     (".iter/prepostwork/deploy.md", include_str!(".iter/prepostwork/deploy.md")),
     (".iter/prepostwork/git-commit.md", include_str!(".iter/prepostwork/git-commit.md")),
     (".iter/prepostwork/git-pr.md", include_str!(".iter/prepostwork/git-pr.md")),

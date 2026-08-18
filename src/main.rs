@@ -126,11 +126,12 @@ enum Command {
         /// Testgroups run concurrently
         #[arg(long, default_value_t = 3)]
         concurrency: usize,
-        /// Priority of fix items for never/no-longer-green groups (higher = sooner; default work is 5)
-        #[arg(long, default_value_t = 4)]
+        /// Priority of fix items for never/no-longer-green groups (lower = sooner,
+        /// P0 most urgent; default work is 5, so sweep items fill idle capacity)
+        #[arg(long, default_value_t = 6)]
         priority_red: i64,
         /// Priority of fix items for was-green-now-stale groups
-        #[arg(long, default_value_t = 2)]
+        #[arg(long, default_value_t = 8)]
         priority_green: i64,
         /// A group with a green run newer than this many hours is left alone
         #[arg(long, default_value_t = 24)]
@@ -138,6 +139,56 @@ enum Command {
         /// Wall-clock budget (minutes) per testgroup run; overrun = killed → error
         #[arg(long, default_value_t = runtests::DEFAULT_GROUP_TIMEOUT_MIN)]
         group_timeout_min: u64,
+    },
+    /// Reject the CALLING work item as invalid work ($ITER_WORKID): the engine
+    /// moves it to `todo` at the next turn boundary with the reason recorded, so
+    /// a human re-evaluates. No retries are burned and nothing lands in the
+    /// completed archive — use when the work is out of scope, unclear, or its
+    /// premise no longer holds.
+    Reject {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Why the work is rejected, and what would make it acceptable
+        #[arg(long)]
+        reason: String,
+    },
+    /// Dump the scanned C4 marker tree as JSON — the same scan the webapp, the
+    /// test sweep, and validate share (scan_roots + marker_glob, ~ expanded).
+    /// The deterministic way for agents to traverse the hierarchy: each node
+    /// carries name, level, dir, declared testgroup/test_dir/bizreq/techreq,
+    /// and uses/provides.
+    Markers {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Deterministically edit a use-case file's ordered `participants:` list —
+    /// the engine-owned write path for usecase↔C4 links. Use-case files are
+    /// GLOBAL objects, so this works from any agent regardless of lock scope
+    /// (record-level edit, like the testwriter's marker-key registration).
+    Usecase {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// The *usecase.iter.md file to edit
+        #[arg(long)]
+        file: PathBuf,
+        /// Participant entry "<step> <object-ref>" (e.g. "2 core/intake") to add;
+        /// an existing entry with the same object-ref is replaced (repeatable)
+        #[arg(long)]
+        add: Vec<String>,
+        /// Object-ref (or full entry) to remove (repeatable)
+        #[arg(long)]
+        remove: Vec<String>,
+        /// Print the resulting participants, one per line
+        #[arg(long)]
+        list: bool,
+    },
+    /// One-time migration to the inverted priority scheme (2026-08-17: lower =
+    /// sooner, P0 most urgent, default 5). Rewrites every OPEN item and
+    /// scheduled template as newP = 10 - P (clamped 0..=10); the closed archive
+    /// is history and stays untouched.
+    InvertPriorities {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
     },
     /// One-time maintenance sweep: stub "# Long Description / TBD" into every
     /// structure-node marker missing the section, so a plan item can fill them in
@@ -206,6 +257,10 @@ fn main() {
                 testsweep::SweepOptions { concurrency, priority_red, priority_green, green_stale_hours, group_timeout_min },
             )
         }
+        Command::Reject { project, reason } => cmd_reject(project, reason),
+        Command::Usecase { project, file, add, remove, list } => cmd_usecase(project, file, add, remove, list),
+        Command::Markers { project } => cmd_markers(project),
+        Command::InvertPriorities { project } => cmd_invert_priorities(project),
         Command::Stubdesc { project } => cmd_stubdesc(project),
         Command::Validate { project, file, fix, template } => cmd_validate(project, file, fix, template),
         Command::Status { project } => cmd_status(project),
@@ -697,6 +752,178 @@ fn cmd_testsweep(project: PathBuf, opts: testsweep::SweepOptions) -> i32 {
         println!("  note: {}", note);
     }
     0
+}
+
+/// Reject-flag writer (`iter reject`): same file-flag pattern as critfail, but
+/// the engine's response is "back to todo for human re-evaluation" instead of
+/// "failed". Requires ITER_WORKID — outside an engine run there is no item.
+fn cmd_reject(project: PathBuf, reason: String) -> i32 {
+    let workid = std::env::var("ITER_WORKID").unwrap_or_default();
+    if workid.is_empty() {
+        eprintln!("error: ITER_WORKID is not set — iter reject only works inside an engine-run work item");
+        return 2;
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        eprintln!("error: --reason must explain why the work is rejected and what would fix it");
+        return 2;
+    }
+    let path = scheduler::reject_path(&project, &workid);
+    match std::fs::write(&path, reason) {
+        Ok(()) => {
+            println!(
+                "work item {} flagged for rejection; the engine moves it to todo at this turn's boundary. \
+                 Summarize the rejection in your output and finish the turn — do no further work.",
+                workid
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("error: cannot write reject flag {}: {}", path.display(), e);
+            1
+        }
+    }
+}
+
+/// Record-level `participants:` editor for use-case files. Reads the existing
+/// entries through the same frontmatter parser the scan uses, applies removes
+/// then adds (an add replaces an entry with the same object-ref), sorts by the
+/// leading step number, and rewrites only the participants block — the rest of
+/// the frontmatter and the narrative body pass through verbatim.
+fn cmd_usecase(project: PathBuf, file: PathBuf, add: Vec<String>, remove: Vec<String>, list: bool) -> i32 {
+    let path = if file.is_absolute() { file } else { project.join(file) };
+    let filename = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    if markers::role_of(&filename) != Some(markers::Role::Usecase) {
+        eprintln!("error: {} is not a *usecase.iter.md file (the filename declares the role)", path.display());
+        return 2;
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", path.display(), e);
+            return 2;
+        }
+    };
+    let (_, mut participants, _) = markers::frontmatter(&content);
+    // The object-ref is everything after the leading step token.
+    let ref_part = |s: &str| s.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+    let step_of = |s: &str| s.split_whitespace().next().and_then(|t| t.parse::<f64>().ok()).unwrap_or(f64::MAX);
+    for r in &remove {
+        let r = r.trim();
+        participants.retain(|p| p != r && ref_part(p) != r);
+    }
+    for a in &add {
+        let a = a.trim();
+        if a.is_empty() {
+            continue;
+        }
+        let new_ref = ref_part(a);
+        if !new_ref.is_empty() {
+            if let Some(existing) = participants.iter_mut().find(|p| ref_part(p) == new_ref) {
+                *existing = a.to_string();
+                continue;
+            }
+        }
+        participants.push(a.to_string());
+    }
+    participants.sort_by(|x, y| step_of(x).partial_cmp(&step_of(y)).unwrap_or(std::cmp::Ordering::Equal));
+
+    if !add.is_empty() || !remove.is_empty() {
+        // Rewrite: keep every frontmatter line except the old participants block,
+        // append the new block just before the closing fence.
+        let trimmed = content.trim_start();
+        let Some(rest) = trimmed.strip_prefix("---") else {
+            eprintln!("error: {} has no frontmatter fence", path.display());
+            return 2;
+        };
+        let Some(end) = rest.find("\n---") else {
+            eprintln!("error: {} has no closing frontmatter fence", path.display());
+            return 2;
+        };
+        let mut kept: Vec<String> = Vec::new();
+        let mut in_part = false;
+        for line in rest[..end].lines() {
+            let t = line.trim();
+            if in_part && t.starts_with("- ") {
+                continue;
+            }
+            in_part = false;
+            if t == "participants:" {
+                in_part = true;
+                continue;
+            }
+            kept.push(line.to_string());
+        }
+        if !participants.is_empty() {
+            kept.push("participants:".to_string());
+            for p in &participants {
+                kept.push(format!("  - {}", p));
+            }
+        }
+        let new_content = format!("---{}\n---{}", kept.join("\n"), &rest[end + 4..]);
+        if let Err(e) = std::fs::write(&path, new_content) {
+            eprintln!("error: cannot write {}: {}", path.display(), e);
+            return 1;
+        }
+        println!("{}: participants updated ({} entr{})", path.display(), participants.len(), if participants.len() == 1 { "y" } else { "ies" });
+    }
+    if list {
+        for p in &participants {
+            println!("{}", p);
+        }
+    }
+    if add.is_empty() && remove.is_empty() && !list {
+        eprintln!("nothing to do: pass --add, --remove, and/or --list");
+        return 2;
+    }
+    0
+}
+
+/// The C4 tree as JSON, for agents: the same scan (roots + glob + frontmatter)
+/// the webapp/sweep/validate share, printed instead of served.
+fn cmd_markers(project: PathBuf) -> i32 {
+    let settings = server::project_settings(&project);
+    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md").to_string();
+    let roots = server::scan_roots(&project);
+    let scan = markers::scan(&project, &roots, &glob);
+    match serde_json::to_string_pretty(&scan) {
+        Ok(json) => {
+            println!("{}", json);
+            0
+        }
+        Err(e) => {
+            eprintln!("error: cannot serialize marker scan: {}", e);
+            1
+        }
+    }
+}
+
+/// One-time queue migration for the 2026-08-17 priority inversion: open items
+/// (scheduled templates included) get newP = 10 - P under the record lock.
+fn cmd_invert_priorities(project: PathBuf) -> i32 {
+    let cfg = config::load(&project);
+    let queue = workitems::Queue::new(&project, &cfg);
+    let changed = queue.with_lock(|items| {
+        let mut n = 0usize;
+        for it in items.iter_mut() {
+            let inverted = (10 - it.priority).clamp(0, 10);
+            if inverted != it.priority {
+                it.priority = inverted;
+                n += 1;
+            }
+        }
+        n
+    });
+    match changed {
+        Ok(n) => {
+            println!("inverted priority on {} open item(s) (newP = 10 - P); closed archive untouched", n);
+            0
+        }
+        Err(e) => {
+            eprintln!("error: cannot migrate priorities: {}", e);
+            1
+        }
+    }
 }
 
 /// Flag the calling work item ($ITER_WORKID, injected by the engine) as failed.

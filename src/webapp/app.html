@@ -574,7 +574,7 @@ const PREPOST = ['deploy','git-commit','git-pr','git-pull','git-push','iterloop-
   .map(n => ({ name: n, exec: 'agent' }));
 const prepostNames = () => PREPOST.map(p => p.name);
 const prepostExec = n => (PREPOST.find(p => p.name === n) || {}).exec || 'agent';
-const AGENTS = ['plan','code','testwriter','refactor','ingest'];
+const AGENTS = ['plan','code','testwriter','usecase','refactor','ingest'];
 let PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // replaced by /api/meta in LIVE mode
 let HOME = '/Users/stephen.hilton';                              // replaced by /api/meta in LIVE mode
 let REQS_DIR = '';   // project-wide reqs dir (global bizreq/techreq) — replaced by /api/meta in LIVE mode
@@ -738,7 +738,7 @@ function mk(over) {
 
 let items = [
   mk({ title:'Add --shout flag to greet: uppercase the entire greeting line per BR-4',
-    type:'code', state:'complete', source:'user', priority:6, risk:2, codepath:'./src',
+    type:'code', state:'complete', source:'user', priority:4, risk:2, codepath:'./src',
     prework:['git-pull'], postwork:['git-commit'],
     mainwork:'Implement BR-4: add a --shout flag to src/greet.sh that uppercases the entire greeting line. Usage: ./src/greet.sh --shout [name]. Without the flag, behavior is unchanged (TR-1..TR-4 still hold). Invalid flags must exit non-zero with a one-line stderr message per TR-4. Acceptance: ./src/greet.sh --shout Ada prints HELLO, ADA! and exits 0; existing test groups still pass.',
     output:'[prework:git-pull] Repository up to date on main (a41f20c).\n[mainwork] Added --shout handling to greet.sh: parses leading flag, uppercases via tr, rejects unknown flags with exit 2 + one-line stderr. All 3 existing test scripts pass (7/7 assertions). Created follow-up work item for testwriter to add --shout coverage.\n[postwork:git-commit] Committed 1 file: src/greet.sh (b7e91d3) "add --shout flag to greet".\n[selfcheck] All agent-definition instructions completed. Handoff item created for uncovered flag tests.',
@@ -760,13 +760,13 @@ let items = [
     attempts:1, tests:{passed:45,total:45},
     times:{ added:'2026-08-11T15:38:55Z', start:'2026-08-11T15:40:54Z', preworkdone:'2026-08-11T15:41:20Z', mainworkdone:'2026-08-11T15:41:34Z', postworkdone:'2026-08-11T15:41:34Z', closed:'2026-08-11T15:41:59Z' } }),
   mk({ title:'Ingest greet requirements: verify BR/TR normalization and flag ambiguities',
-    type:'ingest', state:'complete', source:'user', priority:7, risk:1, codepath:'.',
+    type:'ingest', state:'complete', source:'user', priority:3, risk:1, codepath:'.',
     mainwork:'Read bizreq.md and techreq.md and confirm they are normalized per iterapp conventions (stable requirement IDs, one requirement per bullet, interfaces called out). Flag any ambiguities.',
     output:'[mainwork] BR-1..BR-5 and TR-1..TR-5 already normalized. Ambiguity flagged: BR-3 "friendly" is subjective — only pinned by the exclamation-mark rule.\n[selfcheck] Complete.',
     attempts:1, tests:{passed:7,total:7},
     times:{ added:'2026-08-11T00:00:00Z', start:'2026-08-11T00:01:00Z', preworkdone:'2026-08-11T00:01:00Z', mainworkdone:'2026-08-11T00:03:40Z', postworkdone:'2026-08-11T00:03:40Z', closed:'2026-08-11T00:03:41Z' } }),
   mk({ title:'Implement --lang flag slice 1: greeting table and lookup for en/es/fr',
-    type:'code', state:'in-progress', source:'agent: plan', priority:6, risk:3, codepath:'./src',
+    type:'code', state:'in-progress', source:'agent: plan', priority:4, risk:3, codepath:'./src',
     prework:['git-pull'], postwork:['git-commit','git-push'],
     mainwork:'Slice 1 of the BR-5 localization plan: add a --lang <code> flag with a greeting table for en, es, fr inside greet.sh (TR-1: stay one POSIX script). Unknown code exits 2 with one stderr line listing supported codes. Default remains English. Acceptance: ./src/greet.sh --lang es Ada prints "¡Hola, Ada!".',
     output:'', attempts:1,
@@ -782,16 +782,16 @@ let items = [
     mainwork:'Slice 2 of BR-5: allow an optional GREET_LOCALE_DIR env var pointing at *.greeting files that extend the built-in table. Missing dir is silently ignored; malformed file exits 3 with the offending path on stderr.',
     times:{ added:'2026-08-11T16:02:13Z', start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'' } }),
   mk({ title:'Run full regression after localization slices merge',
-    type:'test', state:'queued', source:'agent: plan', priority:4, risk:0, codepath:'.',
+    type:'test', state:'queued', source:'agent: plan', priority:6, risk:0, codepath:'.',
     mainwork:'Run all test groups including the new localization group once slices 1 and 2 are complete. Update all lastrun stamps; route failures per agent definition.',
     times:{ added:'2026-08-11T16:02:14Z' } }),
   mk({ title:'Refactor greet.sh flag parsing into a single case loop before more flags land',
-    type:'refactor', state:'queued', source:'agent: code', priority:4, risk:2, codepath:'./src',
+    type:'refactor', state:'queued', source:'agent: code', priority:6, risk:2, codepath:'./src',
     prework:['git-pull'], postwork:['git-commit'],
     mainwork:'Behavior-preserving: consolidate the ad-hoc flag checks (--shout, --lang) into one while/case parse loop so the next flag is a one-line addition. All groups must pass before and after with identical counts.',
     times:{ added:'2026-08-11T16:10:40Z' } }),
   mk({ title:'Plan BR-6: greeting history log with rotation (bizreq draft v2)',
-    type:'plan', state:'queued', source:'user', priority:3, risk:5, codepath:'.',
+    type:'plan', state:'queued', source:'user', priority:7, risk:5, codepath:'.',
     mainwork:'Draft BR-6 adds an opt-in greeting history. Plan parallelizable slices with tests: log write path, rotation policy, privacy note in README. Constraints TR-1/TR-2 hold. Create follow-on code and testwriter items.',
     times:{ added:'2026-08-11T16:15:00Z' } }),
   mk({ title:'Add farewell subcommand: greet.sh bye [name] mirrors greeting contract',
@@ -800,19 +800,19 @@ let items = [
     mainwork:'Draft: add a "bye" subcommand mirroring the greeting contract (BR-2 analogue: default "Goodbye, World!"). Composes with --shout and --lang. Held in todo until bizreq BR-7 is approved.',
     times:{ added:'2026-08-11T16:20:30Z' } }),
   mk({ title:'Migrate paydaay-notify repo onto iterapp: seed .iter and component test groups',
-    type:'ingest', state:'todo', source:'user', priority:6, risk:6, codepath:'.',
+    type:'ingest', state:'todo', source:'user', priority:4, risk:6, codepath:'.',
     context:['./bizreq.md','~/dev/global/rules/*req*.md'],
     mainwork:'Survey ~/dev/paydaay-notify, init .iter from the template, and create code + testwriter items per component (sender, scheduler, templates) so each can run in parallel. Held until repo access is confirmed.',
     times:{ added:'2026-08-11T16:22:00Z' } }),
   mk({ title:'Fix: contract group flaky on machines where sh is dash (printf %s escaping)',
-    type:'code', state:'failed', source:'error', priority:7, risk:3, codepath:'./test',
+    type:'code', state:'failed', source:'error', priority:3, risk:3, codepath:'./test',
     prework:['git-pull'], postwork:['git-commit'],
     mainwork:'testscript05.sh assertion 11 fails under dash: printf escaping differs from zsh/bash sh. Reproduce under dash first, fix the script to be POSIX-portable, and add a regression case. Reported by nightly run 2026-08-11T09:00Z.',
     output:'[prework:git-pull] Repository up to date.\n[mainwork] Reproduced under dash. Attempted fix broke assertion 4 under zsh; reverted. Needs a portable quoting approach.',
     attempts:2, lasterror:'mainwork failed: exit 1: fix regressed assertion 4 under zsh; reverted', tests:{passed:37,total:38},
     times:{ added:'2026-08-11T09:05:00Z', start:'2026-08-11T12:40:00Z', preworkdone:'2026-08-11T12:40:31Z', mainworkdone:'', postworkdone:'', closed:'' } }),
   mk({ title:'Deploy greet 1.1.0 to the demo host after localization ships',
-    type:'code', state:'paused', source:'user', priority:2, risk:7, codepath:'.',
+    type:'code', state:'paused', source:'user', priority:8, risk:7, codepath:'.',
     prework:['iterloop-wait-for-stop'], postwork:['deploy','git-pr'],
     mainwork:'Tag 1.1.0 and run the deploy step against the demo host. Paused until BR-5 slices complete and the E2E speed test is green.',
     times:{ added:'2026-08-11T16:30:00Z' } }),
@@ -820,7 +820,7 @@ let items = [
 
 /* one terminally-failed closed item to exercise the Failed count from the archive */
 items.push(mk({ title:'Spike: rewrite greet in awk for speed (abandoned after 3 attempts)',
-  type:'refactor', state:'failed', source:'user', priority:1, risk:8, codepath:'./src',
+  type:'refactor', state:'failed', source:'user', priority:9, risk:8, codepath:'./src',
   mainwork:'Explore whether an awk implementation is meaningfully faster than sh for greet. Keep behavior identical.',
   output:'[mainwork] awk variant passes greetings but breaks TR-2 (adds a gawk dependency on two target platforms). No portable win found.',
   attempts:3, lasterror:'attempts exhausted: no TR-2-compliant speedup found', tests:{passed:5,total:7},
@@ -940,7 +940,8 @@ function renderSummary(){
     : `${c.total} work items · click a summary button to filter`;
 }
 
-function effPrio(i){ return i.priority + (i.source==='error' ? 2 : 0); }
+/* Priorities are lower-is-sooner (P0 most urgent); error source gets a -2 boost. */
+function effPrio(i){ return i.priority - (i.source==='error' ? 2 : 0); }
 function byState(a,b){
   return STATES[a.state].order - STATES[b.state].order
     || effPrio(b) - effPrio(a)
@@ -959,7 +960,7 @@ function visibleItems(){
       if (!bc) return 1;
       return bc.localeCompare(ac);                  // newest completion first
     },
-    priority: (a,b) => effPrio(b) - effPrio(a) || a.times.added.localeCompare(b.times.added),
+    priority: (a,b) => effPrio(a) - effPrio(b) || a.times.added.localeCompare(b.times.added),
     agent: (a,b) => a.type.localeCompare(b.type) || byState(a,b),
     source: (a,b) => sourceLabel(a.source).localeCompare(sourceLabel(b.source)) || byState(a,b),
   }[sortBy] || byState;
@@ -1009,7 +1010,7 @@ function renderRows(){
           <div class="badges">
             <span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span>
             <span class="chip neutral" title="Agent type that does the work">${esc(item.type[0].toUpperCase()+item.type.slice(1))}</span>
-            <span class="chip mono" style="background:var(--s-paused-bg);color:#fff" title="Priority 0–10">P:${item.priority}</span>
+            <span class="chip mono" style="background:var(--s-paused-bg);color:#fff" title="Priority 0–10 — lower runs sooner (P0 most urgent)">P:${item.priority}</span>
             <span class="chip kv mono" title="Risk 0–10">R:${item.risk}</span>
             <span class="chip" style="background:var(--s-queued-bg);color:#fff" title="Requested by">${esc(sourceLabel(item.source))}</span>
             ${testChip(item)}
@@ -1259,7 +1260,7 @@ function openForm(mode, source, priorState){
           <option value="agent" ${(d.exec||'agent')!=='shell'?'selected':''}>exec: agent (LLM)</option>
           <option value="shell" ${d.exec==='shell'?'selected':''}>exec: shell (engine-run)</option>
         </select>
-        <label>Priority <input type="range" id="f_priority" min="0" max="10" value="${d.priority}"
+        <label title="Lower runs sooner — P0 is most urgent, default 5">Priority <input type="range" id="f_priority" min="0" max="10" value="${d.priority}"
           oninput="document.getElementById('pv').textContent=this.value"><span class="rangeval" id="pv">${d.priority}</span></label>
         <label>Risk <input type="range" id="f_risk" min="0" max="10" value="${d.risk}"
           oninput="document.getElementById('rv').textContent=this.value"><span class="rangeval" id="rv">${d.risk}</span></label>
@@ -1338,8 +1339,8 @@ function openForm(mode, source, priorState){
   $('f_postlit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('postwork', e.target); }});
   $('f_codepath').addEventListener('input', e => { $('f_pathhint').textContent = '→ ' + absCodepath(e.target.value); });
   // Scheduler source: reveal the schedule fields, restrict the save-state options
-  // to scheduled|paused, and nudge default priority to 8 ("run soon after the
-  // scheduled time"). All reversible by switching Source back.
+  // to scheduled|paused, and nudge default priority to 2 ("run soon after the
+  // scheduled time" — lower = sooner). All reversible by switching Source back.
   const syncSched = () => {
     const isSched = $('f_source').value === 'scheduler';
     $('f_schedlabel').style.display = isSched ? '' : 'none';
@@ -1356,7 +1357,7 @@ function openForm(mode, source, priorState){
       : isSched ? (priorState === 'paused' ? 'paused' : 'scheduled')
       : (mode === 'edit' && opts.some(([v]) => v === priorState) ? priorState : 'queued');
     $('f_savestate').innerHTML = opts.map(([v,l]) => `<option value="${v}" ${v===def?'selected':''}>${l}</option>`).join('');
-    if (isSched && +$('f_priority').value === 5) { $('f_priority').value = 8; document.getElementById('pv').textContent = '8'; }
+    if (isSched && +$('f_priority').value === 5) { $('f_priority').value = 2; document.getElementById('pv').textContent = '2'; }
   };
   $('f_source').addEventListener('change', syncSched);
   $('f_sk').addEventListener('change', syncSched);
@@ -2015,14 +2016,14 @@ async function renderSettings(){
       exec: 'shell',
       state: 'scheduled',
       source: 'scheduler',
-      priority: 8,
+      priority: 2,
       codepath: '.',
       codepath_ignore: ['**'],   // carve everything out: the sweep needs no lock (it skips busy C4 objects itself)
       sched: { kind: 'every', every_min: 120 },
       mainwork: '"$ITER_BIN" testsweep --project "$ITER_PROJECT" \\\n'
         + '  --concurrency 3 \\\n'
-        + '  --priority-red 4 \\\n'
-        + '  --priority-green 2 \\\n'
+        + '  --priority-red 6 \\\n'
+        + '  --priority-green 8 \\\n'
         + '  --green-stale-hours 24 \\\n'
         + '  --group-timeout-min 20',
     };
