@@ -75,6 +75,10 @@ enum Command {
         risk: Option<i64>,
         #[arg(long)]
         source: Option<String>,
+        /// Testgroup provenance this item exists to serve (escalated plans carry
+        /// the label so the non-convergence guard can count the loop's laps)
+        #[arg(long = "source-testgroup")]
+        source_testgroup: Option<String>,
     },
     /// Synchronous critical review: runs the `_critic.md` persona as a subprocess
     /// and prints its feedback to stdout — no work items involved
@@ -242,8 +246,8 @@ fn main() {
     let code = match cli.command {
         Command::Start { project, port } => cmd_start(project, port),
         Command::Run { project, once, until_idle } => cmd_run(project, once, until_idle),
-        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source } => {
-            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source)
+        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup } => {
+            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup)
         }
         Command::Critreview { project, file, context, max_retry } => {
             cmd_critreview(project, file, context, max_retry)
@@ -355,6 +359,7 @@ fn cmd_add(
     priority: Option<i64>,
     risk: Option<i64>,
     source: Option<String>,
+    source_testgroup: Option<String>,
 ) -> i32 {
     let cfg = config::load(&project);
     let mut item: WorkItem = match &file {
@@ -393,6 +398,9 @@ fn cmd_add(
     if let Some(v) = source {
         item.source = v;
     }
+    if let Some(v) = source_testgroup {
+        item.source_testgroup = v;
+    }
 
     if item.item_type.is_empty() || item.mainwork.is_empty() {
         eprintln!("error: a work item needs at least --type and --mainwork (or a --file providing them)");
@@ -425,6 +433,37 @@ fn cmd_add(
     }
 
     let queue = Queue::new(&project, &cfg);
+
+    // Non-convergence guard (2026-08-17): the escalation cycle is fix item →
+    // plan → build → tests still red → fix item → plan again. Two full laps are
+    // allowed; the THIRD plan born for the same testgroup lands in `todo` with
+    // this note instead of running, so a human breaks the loop.
+    if item.item_type == "plan" && !item.source_testgroup.is_empty() {
+        let prior_plans = queue
+            .load()
+            .iter()
+            .chain(queue.load_closed().iter())
+            .filter(|i| i.item_type == "plan" && i.source_testgroup == item.source_testgroup && i.workid != item.workid)
+            .count();
+        if prior_plans >= 2 && item.state == workitems::STATE_QUEUED {
+            item.state = workitems::STATE_TODO.into();
+            item.mainwork = format!(
+                "NON-CONVERGENCE: this is plan #{} born from testgroup \"{}\" — two full \
+                 fix→plan→build laps have not turned it green, so this loop is not converging \
+                 on its own. Held in todo for human review: reconsider the approach (the tests? \
+                 the requirements? the architecture?) before requeueing.\n\n---\n{}",
+                prior_plans + 1,
+                item.source_testgroup,
+                item.mainwork
+            );
+            eprintln!(
+                "warning: plan #{} for testgroup \"{}\" — non-convergence guard holds it in todo for human review",
+                prior_plans + 1,
+                item.source_testgroup
+            );
+        }
+    }
+
     let open = queue.load().len();
     if open >= cfg.engine.max_open_workitems {
         eprintln!(

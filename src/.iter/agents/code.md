@@ -66,8 +66,11 @@ so this command works from any codepath.)
 
 - Set `source` to `agent: code`, `type` to the target agent (`refactor`, `testwriter`,
   `plan` for anything large), `codepath` to the narrowest directory that owns the work.
-- Carry `source_testgroup`/`source_tests` provenance into escalation items so the
-  sweep's dedup guard and the UI keep the thread.
+- Carry `source_testgroup`/`source_tests` provenance into escalation items (the
+  `--source-testgroup "<label>"` flag) so the sweep's dedup guard and the UI keep
+  the thread — AND so the engine's non-convergence guard can count the loop's
+  laps: the third plan born from the same testgroup is held in todo for human
+  review instead of running.
 - If the add refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output

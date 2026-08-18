@@ -724,6 +724,37 @@ fn reject_flag_moves_item_to_todo_not_failed() {
 }
 
 #[test]
+fn third_plan_for_same_testgroup_is_held_todo_by_nonconvergence_guard() {
+    let (root, _stub) = setup_project("noconverge", 3, 20);
+    let add_plan = |title: &str| {
+        Command::new(BIN)
+            .args([
+                "add", "--project", root.to_str().unwrap(), "--type", "plan", "--title", title,
+                "--mainwork", "close the gap", "--source-testgroup", "Login E2E",
+            ])
+            .output()
+            .expect("add runs")
+    };
+    assert!(add_plan("plan lap 1").status.success());
+    assert!(add_plan("plan lap 2").status.success());
+    let third = add_plan("plan lap 3");
+    assert!(third.status.success());
+    assert!(
+        String::from_utf8_lossy(&third.stderr).contains("non-convergence"),
+        "guard announces itself: {}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    let open = open_items(&root);
+    let state = |title: &str| open.iter().find(|i| i["title"] == title).unwrap()["state"].as_str().unwrap().to_string();
+    assert_eq!(state("plan lap 1"), "queued", "two laps run freely");
+    assert_eq!(state("plan lap 2"), "queued");
+    assert_eq!(state("plan lap 3"), "todo", "the third lap waits for a human");
+    let lap3 = open.iter().find(|i| i["title"] == "plan lap 3").unwrap();
+    assert!(lap3["mainwork"].as_str().unwrap().contains("NON-CONVERGENCE"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn invert_priorities_migrates_open_queue_once() {
     let (root, _stub) = setup_project("prioinv", 3, 10);
     seed(&root, &workitem_json("e2e-inv-1", "code", "urgent old-style", "./src", "w", "", ""));

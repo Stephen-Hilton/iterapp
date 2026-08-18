@@ -90,6 +90,14 @@ pub struct Interface {
     pub description: String,
     pub file: String, // absolute marker file path
     pub body: String, // the contract itself — often a long multi-line document
+    /// Contract-enforcement tests (2026-08-17): `testgroup:` names this
+    /// interface's testgroup.iter.md (relative to this file) whose scripts
+    /// assert the REAL providers' I/O against the contract's example — drift
+    /// turns red instead of silently accumulating. Empty = a coverage gap the
+    /// sweep turns into a testwriter authoring item; the literal value `none`
+    /// opts out deliberately.
+    pub testgroup: String,
+    pub test_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -104,6 +112,13 @@ pub struct UseCase {
     pub participants: Vec<String>,
     /// The narrative after the frontmatter — the use-case description itself.
     pub body: String,
+    /// End-to-end journey tests (2026-08-17): `testgroup:` names this
+    /// use-case's testgroup.iter.md (relative to this file) whose scripts walk
+    /// the actual user journey — user-centric TDD's steering signal. Empty = a
+    /// coverage gap the sweep turns into a testwriter authoring item; the
+    /// literal value `none` opts out deliberately.
+    pub testgroup: String,
+    pub test_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -244,6 +259,8 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                         description: front.get("description").cloned().unwrap_or_default(),
                         file: path.to_string_lossy().into_owned(),
                         body,
+                        testgroup: front.get("testgroup").cloned().unwrap_or_default(),
+                        test_dir: front.get("test_dir").cloned().unwrap_or_default(),
                     });
                 }
                 Some(Role::Usecase) => {
@@ -264,6 +281,8 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                         steps,
                         participants: participants.clone(),
                         body,
+                        testgroup: front.get("testgroup").cloned().unwrap_or_default(),
+                        test_dir: front.get("test_dir").cloned().unwrap_or_default(),
                     });
                 }
                 // bizreq/techreq/testgroup files and unrecognized suffixes are plain

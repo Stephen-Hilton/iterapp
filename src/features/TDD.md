@@ -178,19 +178,41 @@ never inferred from directory positions:
     bizreq: bizreq.iter.md                # optional; webapp lightboxes use these
     techreq: techreq.iter.md
 
-No `testgroup:` key = that C4 object is DELIBERATELY outside the sweep (some
-work shouldn't be tested; absence is a choice, not an accident). A declared but
-missing file is reported. testgroup.iter.md files no marker claims are listed
-as "unowned" and never run. The testwriter's registration-chain duty: add the
-`testgroup:`/`test_dir:` keys to the marker file if missing (its one sanctioned
-write outside its codepath), and create the declared file if missing — so
-"add tests to this C4 object" is a one-item ask.
+No `testgroup:` key on a MARKER = that C4 object is DELIBERATELY outside the
+sweep (some work shouldn't be tested; absence is a choice, not an accident).
+testgroup.iter.md files no declaring file claims are listed as "unowned" and
+never run. The testwriter's registration-chain duty: add the
+`testgroup:`/`test_dir:` keys to the declaring file if missing (its one
+sanctioned write outside its codepath), and create the declared file if
+missing — so "add tests to this thing" is a one-item ask.
+
+**The sweep universe is markers + use-cases + interfaces (2026-08-17).**
+`*usecase.iter.md` and `*interface.iter.md` files declare testgroups with the
+same `testgroup:`/`test_dir:` keys — use-cases get end-to-end JOURNEY tests
+(scripts that walk the actual user journey; user-centric TDD's steering
+signal), interfaces get CONTRACT-enforcement tests (scripts asserting the real
+providers' I/O against the contract's example, so drift turns red instead of
+silently accumulating — interfaces are enforcement, not documentation). The
+missing-key rule INVERTS for these two kinds: tests are their point, so no
+`testgroup:` key is a coverage GAP that births a testwriter authoring item;
+the explicit `testgroup: none` is the deliberate opt-out. Red runs of these
+groups span C4 objects, so their fix items scope to the code root (auto_fix
+false → todo, where a human can narrow the codepath) with diagnose-locally-or-
+escalate-to-plan guidance. The usecase agent declares the E2E testgroup (with
+empty testlists) at use-case creation, so coverage follows automatically.
+
+**Non-convergence guard (2026-08-17):** escalated plans carry
+`--source-testgroup "<label>"`, and `iter add` counts the laps — the fix →
+plan → build → still-red cycle may run twice; the THIRD plan born from the
+same testgroup is held in `todo` with a NON-CONVERGENCE note so a human
+reconsiders the approach instead of the loop grinding.
 
 Sweep, each wake (`testsweep.rs`; fired by the "Test Loop" scheduled workitem
 described above; manual: `iter testsweep`):
 
-1. Scan marker files (projects.json scan_roots + marker_glob), follow each
-   `testgroup:` key, and interrogate the declared groups:
+1. Scan marker + use-case + interface files (projects.json scan_roots +
+   marker_glob), follow each `testgroup:` key, and interrogate the declared
+   groups:
    - **last run not green** (never ran, red, or error) → candidate, priority
      `--priority-red` (default 6)
    - **green but older than `--green-stale-hours`** → candidate, priority

@@ -47,18 +47,30 @@ follow-up item; don't reverse-engineer the answer from the code.
 - Per group, write a MIX: golden-path use-case tests, expected-error tests, and
   edge-case tests — dozens per group where the definitions call for it, within
   `testwriter_min_tests_per_group`/`testwriter_max_tests_per_group` from `.iter/.engine/config.json`.
+- Three test FLAVORS, by what declares the group:
+  - **marker file (C4 object)**: unit/component tests of that object's behavior.
+  - **use-case file**: end-to-end JOURNEY tests — scripts that walk the actual
+    user journey through the real participants, in order.
+  - **interface file**: CONTRACT-enforcement tests — scripts that assert the
+    real providers' inputs/outputs against the contract's example in the
+    interface file body, so drift turns red instead of silently accumulating.
+- If the CODE a group should exercise doesn't exist yet, do not write tests
+  against nothing: escalate to a plan item carrying your gap analysis and
+  `--source-testgroup "<label>"`, then finish reporting the escalation.
 
 ## Behavior
 1. Read the target `testgroup.iter.md` (from `testfiles`, context, or the
    mainwork prompt) and the requirement documents.
-2. **Registration chain — make sure it is complete.** The C4 object's marker
-   file must declare its tests (`testgroup: <path>/testgroup.iter.md` and
-   `test_dir: <subtree>`, paths relative to the marker file); without the key the
-   sweep never runs them.
-   - If the marker file lacks the `testgroup:` key: ADD it (and `test_dir:`).
+2. **Registration chain — make sure it is complete.** The DECLARING file — a
+   C4 object's marker file, a `*usecase.iter.md`, or a `*interface.iter.md`
+   (the sweep walks all three) — must declare its tests
+   (`testgroup: <path>/testgroup.iter.md` and `test_dir: <subtree>`, paths
+   relative to the declaring file); without the key the sweep never runs them.
+   - If the declaring file lacks the `testgroup:` key: ADD it (and `test_dir:`).
      This is the one sanctioned write outside your codepath — you may add or
-     correct exactly these two frontmatter keys on your C4 object's marker file,
-     and touch nothing else in it.
+     correct exactly these two frontmatter keys on your work item's declaring
+     file, and touch nothing else in it. (`testgroup: none` is the deliberate
+     opt-out for use-cases/interfaces — set it only when the item asks you to.)
    - If the declared `testgroup.iter.md` does not exist: CREATE it — markdown
      describing the groups, plus the `iterapp:testgroups` JSONL block (one line
      per group: `label`, `desc`, `auto_fix` (default false), `lastrun`,

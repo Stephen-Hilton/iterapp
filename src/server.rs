@@ -1116,35 +1116,59 @@ fn api_testgroups(project: &Path) -> Resp {
     let roots = scan_roots(project);
     let scan = markers::scan(project, &roots, glob);
     let mut claimed: Vec<PathBuf> = Vec::new();
-    let files: Vec<Value> = scan
-        .nodes
+    // One row per declaring file with a testgroup: key — markers, and (2026-08-17,
+    // same universe the sweep walks) use-cases and interfaces. `kind` tells the UI
+    // which; `testgroup: none` (deliberate opt-out) is skipped like an empty key.
+    // (kind, dir, key, name, level, declaring path)
+    let mut declared_rows: Vec<(String, String, String, String, String, String)> = Vec::new();
+    for n in scan.nodes.iter().filter(|n| !n.testgroup.is_empty()) {
+        declared_rows.push(("object".into(), n.dir.clone(), n.key.clone(), n.name.clone(), n.level.clone(), n.path.clone()));
+    }
+    for u in scan.usecases.iter().filter(|u| !u.testgroup.is_empty() && u.testgroup.trim() != "none") {
+        let dir = Path::new(&u.file).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        declared_rows.push(("usecase".into(), dir, String::new(), u.name.clone(), "usecase".into(), u.file.clone()));
+    }
+    for i in scan.interfaces.iter().filter(|i| !i.testgroup.is_empty() && i.testgroup.trim() != "none") {
+        let dir = Path::new(&i.file).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        declared_rows.push(("interface".into(), dir, String::new(), i.id.clone(), "interface".into(), i.file.clone()));
+    }
+    let tg_of = |kind: &str, declaring: &str| -> String {
+        match kind {
+            "usecase" => scan.usecases.iter().find(|u| u.file == declaring).map(|u| u.testgroup.clone()),
+            "interface" => scan.interfaces.iter().find(|i| i.file == declaring).map(|i| i.testgroup.clone()),
+            _ => scan.nodes.iter().find(|n| n.path == declaring).map(|n| n.testgroup.clone()),
+        }
+        .unwrap_or_default()
+    };
+    let files: Vec<Value> = declared_rows
         .iter()
-        .filter(|n| !n.testgroup.is_empty())
-        .map(|n| {
-            let object_dir = PathBuf::from(&n.dir);
-            let declared = object_dir.join(&n.testgroup);
+        .map(|(kind, dir, key, name, level, declaring)| {
+            let object_dir = PathBuf::from(dir);
+            let declared = object_dir.join(tg_of(kind, declaring));
             match declared.canonicalize().ok().and_then(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t))) {
                 Some((tg_file, text)) => {
                     claimed.push(tg_file.clone());
                     json!({
                         "file": tg_file.to_string_lossy(),
                         "test_dir": tg_file.parent().unwrap_or(&object_dir).to_string_lossy(),
-                        "c4_dir": n.dir,
-                        "c4_key": n.key,
-                        "c4_name": n.name,
-                        "c4_level": n.level,
-                        "marker": n.path,
+                        "kind": kind,
+                        "c4_dir": dir,
+                        "c4_key": key,
+                        "c4_name": name,
+                        "c4_level": level,
+                        "marker": declaring,
                         "groups": testgroups::parse(&text),
                     })
                 }
                 None => json!({
                     "file": declared.to_string_lossy(),
                     "missing": true,
-                    "c4_dir": n.dir,
-                    "c4_key": n.key,
-                    "c4_name": n.name,
-                    "c4_level": n.level,
-                    "marker": n.path,
+                    "kind": kind,
+                    "c4_dir": dir,
+                    "c4_key": key,
+                    "c4_name": name,
+                    "c4_level": level,
+                    "marker": declaring,
                     "groups": [],
                 }),
             }

@@ -48,6 +48,13 @@ do NOT grind out a use-case you believe is invalid.
    `<short-name>.usecase.iter.md` with frontmatter (`name`, `description`,
    `participants:`) and a plain-language narrative body — describe, don't
    state; no jargon; simple enough for a non-technical reader.
+   **Declare its tests too**: add `testgroup: <name>-test/testgroup.iter.md`
+   (and `test_dir:`) to the frontmatter and create that testgroup.iter.md with
+   the GROUPS defined (labels + descriptions of the end-to-end journey tests
+   this use-case needs) but empty testlists — the sweep turns empty testlists
+   into testwriter authoring items, so E2E coverage follows automatically.
+   Only a use-case that genuinely should not be tested gets `testgroup: none`
+   (say why in your output).
 3. **Map the C4 tree.** Get the authoritative scan (never glob it yourself):
 
        "$ITER_BIN" markers --project "$ITER_PROJECT"

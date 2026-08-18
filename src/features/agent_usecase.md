@@ -2,7 +2,9 @@
 
 Status: DESIGN LOCKED 2026-08-17 — engine mechanisms BUILT same day (reject
 verb, markers dump, participants CLI, ITER_USECASE_DIR, sweep authoring items,
-priority inversion); agent definition shipped as `.iter/agents/usecase.md`.
+priority inversion; second round: use-case/interface testgroups in the sweep
+universe, contract enforcement, the non-convergence guard); agent definition
+shipped as `.iter/agents/usecase.md`.
 
 A **use-case** is a high-level end-to-end (E2E) workflow: one discrete action
 taken by some actor within the codebase's scope. For a Netflix-like codebase:
@@ -72,6 +74,21 @@ experience of simply logging in, so they don't belong in the use-case.
 - **Priorities inverted project-wide** (same decision, same day): LOWER =
   sooner, P0 most urgent, default 5. `iter invert-priorities` migrates an
   existing open queue (newP = 10 - P).
+- **Use-cases and interfaces are sweepable units** (second round, same day):
+  both declare `testgroup:`/`test_dir:` keys like markers. For these two
+  kinds a MISSING key is a coverage gap (the sweep births a testwriter
+  authoring item in todo) because tests are their whole point — use-cases get
+  E2E journey tests, interfaces get contract-enforcement tests asserting real
+  provider I/O against the contract's example (interfaces become enforcement,
+  not documentation). `testgroup: none` is the explicit opt-out. Red runs span
+  C4 objects, so their fix items scope to the code root (usually todo — a
+  human can narrow the codepath) with diagnose-or-escalate guidance. New
+  use-cases declare their E2E testgroup at creation with empty testlists, so
+  the sweep's authoring flow fills them.
+- **Non-convergence guard, 3rd lap** (owner call: allow two laps): escalated
+  plans carry `--source-testgroup`; `iter add` counts plans per testgroup and
+  holds the third in `todo` with a NON-CONVERGENCE note — a human breaks the
+  fix→plan→build→still-red loop instead of it grinding forever.
 
 ## The usecase agent's flow
 
@@ -105,18 +122,26 @@ Handed a use-case idea from the user, the agent:
 
 ## How the TDD test loop connects (same 2026-08-17 flow decision)
 
-The Test Loop sweep (see TDD.md) walks all C4 objects and runs all testgroups:
+The Test Loop sweep (see TDD.md) walks all declaring files — markers,
+use-cases, AND interfaces — and runs all their testgroups:
 
-- **testgroup/tests MISSING** → the sweep births ONE testwriter authoring item
-  in `todo` (dedup by `source_testgroup`). Minor effort (tests only): the
-  testwriter authors and registers them; they run next sweep cycle. Major
-  effort (the CODE is missing too): the testwriter escalates to a plan item
-  with its gap analysis — plan → human gate → parallel code/testwriters —
-  mirroring the code agent's escalate-to-plan. The deterministic sweep never
-  judges minor vs major; the agent that looked does.
-- **tests PRESENT but red** → existing behavior: one fix item per group
-  (auto_fix gates queued/todo); simple fixes land directly, structural defects
-  escalate to plan with the same human gate.
+- **no `testgroup:` key on a use-case/interface** → coverage gap: ONE
+  testwriter authoring item in `todo` (create the testgroup file, register the
+  key — the testwriter's sanctioned outside-write — and author the tests).
+  Markers keep the old rule: absence is a choice.
+- **testgroup/tests MISSING or empty** → the sweep births ONE testwriter
+  authoring item in `todo` (dedup by `source_testgroup`). Minor effort (tests
+  only): the testwriter authors and registers them; they run next sweep cycle.
+  Major effort (the CODE is missing too): the testwriter escalates to a plan
+  item with its gap analysis and `--source-testgroup` — plan → human gate →
+  parallel code/testwriters — mirroring the code agent's escalate-to-plan. The
+  deterministic sweep never judges minor vs major; the agent that looked does.
+- **tests PRESENT but red** → one fix item per group (auto_fix gates
+  queued/todo). Object groups scope to the object's directory; use-case
+  journey and interface contract groups scope to the code root with
+  diagnose-or-escalate guidance. Simple fixes land directly, structural
+  defects escalate to plan with the same human gate — and the non-convergence
+  guard holds the third plan for the same group in todo.
 
 ## Use-case UI
 

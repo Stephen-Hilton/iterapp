@@ -58,22 +58,55 @@ struct AuthoringGap {
     mainwork: String,
 }
 
-/// One sweepable unit: a testgroup DECLARED by a C4 object's marker file. The
-/// marker file defines the C4 object; test ownership flows from its `testgroup:`
-/// key, never from where a testgroup.iter.md happens to sit. No key = that C4
-/// object is deliberately outside the sweep.
+/// What kind of file declared a sweepable testgroup (2026-08-17: the sweep
+/// universe grew from marker files to markers + use-cases + interfaces). The
+/// kind decides fix-item SCOPING: a C4 object's tests scope to its directory;
+/// use-case journeys and interface contracts span objects, so their red runs
+/// birth fix items scoped to the code root with diagnose-or-escalate guidance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SweepKind {
+    Object,
+    Usecase,
+    Interface,
+}
+
+impl SweepKind {
+    /// "marker file" / "use-case file" / "interface file" — for prompts.
+    fn declaring(&self) -> &'static str {
+        match self {
+            SweepKind::Object => "marker file",
+            SweepKind::Usecase => "use-case file",
+            SweepKind::Interface => "interface file",
+        }
+    }
+}
+
+/// One declaring file the sweep walks: test ownership flows from its
+/// `testgroup:` key, never from where a testgroup.iter.md happens to sit.
+struct SweepUnit {
+    kind: SweepKind,
+    name: String,
+    /// The declaring file (marker / use-case / interface), for prompts + context.
+    declaring_path: String,
+    /// The declaring file's directory: testgroup paths resolve against it.
+    object_dir: PathBuf,
+    testgroup: String,
+    test_dir: String,
+}
+
+/// One runnable unit: a testgroup declared by a `SweepUnit`, due for a run.
 #[derive(Debug)]
 struct Candidate {
+    kind: SweepKind,
     tg_file: PathBuf,
     group: TestGroup,
     priority: i64,
-    /// The C4 object's directory (= the marker file's directory): the fix item's
-    /// codepath / lock scope.
+    /// The declaring file's directory: an Object fix item's codepath / lock scope.
     object_dir: PathBuf,
-    /// Subtree carved out of the fix item's lock scope (the testwriter's turf),
-    /// relative to object_dir, e.g. "test/" or "tests/".
+    /// Subtree carved out of an Object fix item's lock scope (the testwriter's
+    /// turf), relative to object_dir, e.g. "test/" or "tests/".
     carve: String,
-    /// For the fix-item prompt: which marker declared this group.
+    /// For the fix-item prompt: which file declared this group.
     marker_path: String,
 }
 
@@ -140,42 +173,144 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
     // to test (major effort), IT escalates to plan — the deterministic sweep
     // never judges minor vs major.
     let mut authoring: Vec<AuthoringGap> = Vec::new();
+
+    // The sweep universe (2026-08-17): markers AND use-cases AND interfaces.
+    // Rules differ per kind on a MISSING `testgroup:` key — for a C4 object,
+    // absence is a choice (deliberately untested); for use-cases (E2E journey
+    // tests) and interfaces (contract-enforcement tests) tests ARE the point,
+    // so a missing key is a coverage gap that births an authoring item. The
+    // explicit value `testgroup: none` opts a use-case/interface out.
+    let mut units: Vec<SweepUnit> = Vec::new();
     for node in &scan.nodes {
         if node.testgroup.is_empty() {
             report.undeclared += 1;
             continue;
         }
-        let object_dir = PathBuf::from(&node.dir);
-        let tg_file = object_dir.join(&node.testgroup);
+        units.push(SweepUnit {
+            kind: SweepKind::Object,
+            name: node.name.clone(),
+            declaring_path: node.path.clone(),
+            object_dir: PathBuf::from(&node.dir),
+            testgroup: node.testgroup.clone(),
+            test_dir: node.test_dir.clone(),
+        });
+    }
+    let mut keyless: Vec<(SweepKind, String, String)> = Vec::new(); // (kind, name, declaring file)
+    for uc in &scan.usecases {
+        let dir = Path::new(&uc.file).parent().map(PathBuf::from).unwrap_or_else(|| code_root.clone());
+        match uc.testgroup.trim() {
+            "none" => report.undeclared += 1,
+            "" => keyless.push((SweepKind::Usecase, uc.name.clone(), uc.file.clone())),
+            tg => units.push(SweepUnit {
+                kind: SweepKind::Usecase,
+                name: uc.name.clone(),
+                declaring_path: uc.file.clone(),
+                object_dir: dir,
+                testgroup: tg.to_string(),
+                test_dir: uc.test_dir.clone(),
+            }),
+        }
+    }
+    for iface in &scan.interfaces {
+        let dir = Path::new(&iface.file).parent().map(PathBuf::from).unwrap_or_else(|| code_root.clone());
+        match iface.testgroup.trim() {
+            "none" => report.undeclared += 1,
+            "" => keyless.push((SweepKind::Interface, iface.id.clone(), iface.file.clone())),
+            tg => units.push(SweepUnit {
+                kind: SweepKind::Interface,
+                name: iface.id.clone(),
+                declaring_path: iface.file.clone(),
+                object_dir: dir,
+                testgroup: tg.to_string(),
+                test_dir: iface.test_dir.clone(),
+            }),
+        }
+    }
+
+    // Use-cases/interfaces with NO `testgroup:` key: the coverage gap itself is
+    // the finding. One authoring item each — the testwriter creates the
+    // testgroup file, adds the key to the declaring file (sanctioned write),
+    // and authors the tests.
+    for (kind, name, declaring) in keyless {
+        let flavor = match kind {
+            SweepKind::Usecase =>
+                "end-to-end JOURNEY tests: scripts that walk the actual user journey this use-case \
+                 describes, through the real participants",
+            _ =>
+                "CONTRACT-enforcement tests: scripts that assert the real providers' inputs/outputs \
+                 against the contract's example in the interface file body — so drift turns red \
+                 instead of silently accumulating",
+        };
+        report.notes.push(format!(
+            "{} \"{}\" has no testgroup: key — testwriter authoring item ensured",
+            kind.declaring(),
+            name
+        ));
+        authoring.push(AuthoringGap {
+            key: rel(Path::new(&declaring)),
+            title: format!("author {} tests for \"{}\" (no testgroup declared)",
+                if kind == SweepKind::Usecase { "E2E" } else { "contract" }, name),
+            codepath: rel(Path::new(&declaring).parent().unwrap_or(&code_root)),
+            context: vec![declaring.clone()],
+            mainwork: format!(
+                "The {declaring_kind} {declaring} declares no `testgroup:` key — this {what} has no tests.\n\
+                 Author {flavor}.\n\
+                 1. Create a testgroup.iter.md near the declaring file, add `testgroup: <relative path>` \
+                 (and `test_dir:`) to the declaring file's frontmatter — this registration is your one \
+                 sanctioned write outside the test directory — then write and register the scripts \
+                 (shell-script contract: exit 0 as-expected / 1 unexpected / other = script error; \
+                 last line `ITER_RESULT pass=X fail=Y total=Z`).\n\
+                 2. If the underlying capability doesn't exist yet to test, escalate instead: \
+                 \"$ITER_BIN\" add --project \"$ITER_PROJECT\" --type plan \
+                 --title \"plan: build out {name}\" --source-testgroup \"{key}\" \
+                 --mainwork \"<your gap analysis>\" — then finish this item reporting the escalation.\n\
+                 3. If this {what} genuinely should not be tested, set `testgroup: none` on the \
+                 declaring file and report why.",
+                declaring_kind = kind.declaring(),
+                declaring = declaring,
+                what = if kind == SweepKind::Usecase { "use-case" } else { "interface" },
+                flavor = flavor,
+                name = name,
+                key = rel(Path::new(&declaring)),
+            ),
+        });
+    }
+
+    for unit in &units {
+        let object_dir = &unit.object_dir;
+        let tg_file = object_dir.join(&unit.testgroup);
         let tg_file = match tg_file.canonicalize() {
             Ok(p) => p,
             Err(_) => {
                 report.notes.push(format!(
-                    "\"{}\": marker declares testgroup: {} but the file does not exist — testwriter authoring item ensured",
-                    node.name, node.testgroup
+                    "\"{}\": {} declares testgroup: {} but the file does not exist — testwriter authoring item ensured",
+                    unit.name,
+                    unit.kind.declaring(),
+                    unit.testgroup
                 ));
                 // The declared test dir may not exist yet either, so the item is
-                // scoped to the C4 object's directory; the prompt confines writes.
-                let declared = rel(&object_dir.join(&node.testgroup));
+                // scoped to the declaring file's directory; the prompt confines writes.
+                let declared = rel(&object_dir.join(&unit.testgroup));
                 authoring.push(AuthoringGap {
                     key: declared.clone(),
-                    title: format!("author tests for \"{}\" (declared testgroup file missing)", node.name),
-                    codepath: rel(&object_dir),
-                    context: vec![node.path.clone()],
+                    title: format!("author tests for \"{}\" (declared testgroup file missing)", unit.name),
+                    codepath: rel(object_dir),
+                    context: vec![unit.declaring_path.clone()],
                     mainwork: format!(
-                        "The marker file {marker} declares `testgroup: {tg}` but that file does not exist.\n\
+                        "The {declaring_kind} {marker} declares `testgroup: {tg}` but that file does not exist.\n\
                          Create it, and author the tests it should register:\n\
-                         1. Read the marker, its local bizreq/techreq (and the global ones in $ITER_REQS), and the code.\n\
-                         2. If the C4 object's CODE is missing too, this is a plan-sized gap, not a testwriter task: \
+                         1. Read the declaring file, the local bizreq/techreq (and the global ones in $ITER_REQS), and the code.\n\
+                         2. If the CODE this should exercise is missing too, this is a plan-sized gap, not a testwriter task: \
                          escalate — create a plan work item carrying what you found (\"$ITER_BIN\" add --project \"$ITER_PROJECT\" \
-                         --type plan --title \"plan: build out {name}\" --mainwork \"<gap analysis>\") and finish this item \
-                         reporting the escalation.\n\
+                         --type plan --title \"plan: build out {name}\" --source-testgroup \"{declared}\" \
+                         --mainwork \"<gap analysis>\") and finish this item reporting the escalation.\n\
                          3. Otherwise create {declared} with testgroups, write the test scripts (shell-script contract: \
                          exit 0 as-expected / 1 unexpected / other = script error; last line `ITER_RESULT pass=X fail=Y total=Z`), \
                          and register every test in the testlist. Confine writes to the test directory.",
-                        marker = node.path,
-                        tg = node.testgroup,
-                        name = node.name,
+                        declaring_kind = unit.kind.declaring(),
+                        marker = unit.declaring_path,
+                        tg = unit.testgroup,
+                        name = unit.name,
                         declared = declared,
                     ),
                 });
@@ -185,12 +320,12 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
         claimed.push(tg_file.clone());
         // The carve: declared test_dir, else the declared testgroups file's own
         // subdirectory (when it has one), else the global default.
-        let carve = if !node.test_dir.is_empty() {
-            node.test_dir.trim_end_matches('/').to_string()
+        let carve = if !unit.test_dir.is_empty() {
+            unit.test_dir.trim_end_matches('/').to_string()
         } else {
             tg_file
                 .parent()
-                .and_then(|p| p.strip_prefix(&object_dir).ok())
+                .and_then(|p| p.strip_prefix(object_dir).ok())
                 .map(|r| r.to_string_lossy().into_owned())
                 .filter(|r| !r.is_empty())
                 .unwrap_or_else(|| cfg.globalsettings.test_dir.clone())
@@ -205,19 +340,21 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
                 authoring.push(AuthoringGap {
                     key: group.label.clone(),
                     title: format!("author tests for testgroup \"{}\" (empty testlist)", group.label),
-                    codepath: rel(tg_file.parent().unwrap_or(&object_dir)),
-                    context: vec![tg_file.to_string_lossy().into_owned(), node.path.clone()],
+                    codepath: rel(tg_file.parent().unwrap_or(object_dir)),
+                    context: vec![tg_file.to_string_lossy().into_owned(), unit.declaring_path.clone()],
                     mainwork: format!(
                         "Testgroup \"{label}\" in {tg_file} has no tests registered.\n\
-                         Author them: read the marker file {marker}, its local bizreq/techreq (and the global ones in \
+                         Author them: read the {declaring_kind} {marker}, the local bizreq/techreq (and the global ones in \
                          $ITER_REQS), and the code; write test scripts honoring the shell-script contract (exit 0 \
                          as-expected / 1 unexpected / other = script error; last line `ITER_RESULT pass=X fail=Y total=Z`) \
                          and register each in the group's testlist. If the code this group should exercise does not \
-                         exist yet, escalate to a plan work item with your gap analysis instead of writing tests \
-                         against nothing, and finish this item reporting the escalation.",
+                         exist yet, escalate to a plan work item (`iter add --type plan --source-testgroup \"{label}\" …`) \
+                         with your gap analysis instead of writing tests against nothing, and finish this item \
+                         reporting the escalation.",
                         label = group.label,
                         tg_file = tg_file.display(),
-                        marker = node.path,
+                        declaring_kind = unit.kind.declaring(),
+                        marker = unit.declaring_path,
                     ),
                 });
                 continue;
@@ -232,29 +369,30 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
             } else {
                 opts.priority_red // never/no-longer green
             };
-            // An agent working anywhere in the C4 object makes results meaningless
+            // An agent working anywhere near the tests makes results meaningless
             // (and a testwriter may be mid-edit on the scripts): skip until quiet.
-            if let Some(lock) = locks::find_active_lock(&object_dir, &[], now) {
+            if let Some(lock) = locks::find_active_lock(object_dir, &[], now) {
                 report.notes.push(format!("skip \"{}\": codepath busy ({})", group.label, lock.display()));
                 continue;
             }
             candidates.push(Candidate {
+                kind: unit.kind,
                 tg_file: tg_file.clone(),
                 group,
                 priority,
                 object_dir: object_dir.clone(),
                 carve: carve.clone(),
-                marker_path: node.path.clone(),
+                marker_path: unit.declaring_path.clone(),
             });
         }
     }
 
-    // testgroup.iter.md files no marker file claims: surfaced, never run.
+    // testgroup.iter.md files no declaring file claims: surfaced, never run.
     for file in testgroups::find_files(&code_root) {
         let canon = file.canonicalize().unwrap_or(file.clone());
         if !claimed.contains(&canon) {
             report.notes.push(format!(
-                "unowned testgroup.iter.md (no marker file declares it via testgroup:): {}",
+                "unowned testgroup.iter.md (no marker/use-case/interface file declares it via testgroup:): {}",
                 file.display()
             ));
         }
@@ -503,14 +641,15 @@ fn build_fix_item(
              Repair the test scripts so they honor the contract: exit 0 = all as expected, exit 1 = \
              some assertion unexpected, anything else = script failure; last stdout line \
              `ITER_RESULT pass=X fail=Y total=Z`. The tests are registered in {tg_file} \
-             (declared by the marker file {marker}). Verify with: \
+             (declared by the {declaring_kind} {marker}). Verify with: \
              \"$ITER_BIN\" runtests --project \"$ITER_PROJECT\" --group \"{label}\"",
             label = group.label,
             failing_lines = failing_lines,
             tg_file = run.tg_file.display(),
+            declaring_kind = cand.kind.declaring(),
             marker = cand.marker_path,
         );
-    } else {
+    } else if cand.kind == SweepKind::Object {
         item.item_type = "code".into();
         item.state = if group.auto_fix { workitems::STATE_QUEUED.into() } else { workitems::STATE_TODO.into() };
         item.title = format!("fix red testgroup \"{}\" ({} failing)", group.label, failing.len());
@@ -533,7 +672,8 @@ fn build_fix_item(
              If the fix is comprehensive — spans C4 objects, needs design decisions, won't fit this session — \
              do NOT grind against the timeout and do NOT spawn subagents. Escalate: create a plan work item \
              carrying your full diagnosis:\n  \"$ITER_BIN\" add --project \"$ITER_PROJECT\" --type plan \
-             --title \"plan fix for testgroup {label}\" --mainwork \"<your diagnosis and scope>\" --priority {priority}\n\
+             --title \"plan fix for testgroup {label}\" --source-testgroup \"{label}\" \
+             --mainwork \"<your diagnosis and scope>\" --priority {priority}\n\
              then finish this item reporting the escalation.",
             label = group.label,
             failing_lines = failing_lines,
@@ -541,6 +681,48 @@ fn build_fix_item(
             marker = cand.marker_path,
             runs_dir = run.test_dir.join("runs").display(),
             carve = cand.carve.trim_end_matches('/'),
+            priority = cand.priority,
+        );
+    } else {
+        // Use-case journey / interface contract red: the failure spans C4
+        // objects, so the fix can't pre-scope to one directory. The item takes
+        // the whole code root as its lock scope (heavy — which is why auto_fix
+        // defaults false and this usually lands in todo, where a human can
+        // narrow the codepath before queueing) and the prompt leads with
+        // diagnosis: fix locally when the culprit is small, escalate to plan
+        // when it's structural.
+        let what = if cand.kind == SweepKind::Usecase { "use-case journey" } else { "interface contract" };
+        item.item_type = "code".into();
+        item.state = if group.auto_fix { workitems::STATE_QUEUED.into() } else { workitems::STATE_TODO.into() };
+        item.title = format!("fix red {} testgroup \"{}\" ({} failing)", what, group.label, failing.len());
+        item.codepath = ".".into();
+        item.mainwork = format!(
+            "The deterministic test sweep found the {what} testgroup \"{label}\" RED.\n\
+             Failing at sweep time:\n{failing_lines}\n\
+             Test definitions: {tg_file} (declared by the {declaring_kind} {marker})\nRun logs: {runs_dir}\n\n\
+             This failure spans C4 objects, so your lock scope is the whole code root — work surgically:\n\
+             1. FIRST reproduce — run: \"$ITER_BIN\" runtests --project \"$ITER_PROJECT\" --group \"{label}\" --broken\n   \
+                If the group is actually green the item is stale: the engine flags it and you STOP.\n\
+             2. Diagnose from the run logs WHICH object(s) are at fault ({context_hint}).\n\
+             3. Small, local culprit → fix the CODE there (never the tests), re-run neutrally while iterating, \
+                then gate completion with --fixed.\n\
+             4. Structural culprit (contract change rippling through providers, journey needs new capability) → \
+                do NOT grind: escalate — \"$ITER_BIN\" add --project \"$ITER_PROJECT\" --type plan \
+                --title \"plan fix for {what} {label}\" --source-testgroup \"{label}\" \
+                --mainwork \"<your diagnosis: objects at fault, contract/journey deltas>\" --priority {priority} \
+                — then finish this item reporting the escalation.",
+            what = what,
+            label = group.label,
+            failing_lines = failing_lines,
+            tg_file = run.tg_file.display(),
+            declaring_kind = cand.kind.declaring(),
+            marker = cand.marker_path,
+            runs_dir = run.test_dir.join("runs").display(),
+            context_hint = if cand.kind == SweepKind::Usecase {
+                "the use-case file's participants: list names them in journey order"
+            } else {
+                "the interface file's contract body is the expected shape; check its providers"
+            },
             priority = cand.priority,
         );
     }
@@ -584,6 +766,58 @@ mod tests {
         let tg_file = test_dir.join("testgroup.iter.md");
         std::fs::write(&tg_file, testgroups::update("# tests\n", &[group])).unwrap();
         tg_file
+    }
+
+    #[test]
+    fn usecase_without_testgroup_key_births_authoring_item_and_none_opts_out() {
+        let (root, _td) = setup("ucswp");
+        std::fs::create_dir_all(root.join("usecases")).unwrap();
+        std::fs::write(
+            root.join("usecases/login.usecase.iter.md"),
+            "---\nname: \"User Login\"\ndescription: \"login journey\"\n---\nbody\n",
+        )
+        .unwrap();
+        // An interface deliberately opted out contributes nothing.
+        std::fs::create_dir_all(root.join("interfaces")).unwrap();
+        std::fs::write(
+            root.join("interfaces/auth.interface.iter.md"),
+            "---\ninterface: auth-api\nkind: http\ntestgroup: none\n---\ncontract\n",
+        )
+        .unwrap();
+        let cfg = Config::default();
+        let report = sweep(&root, &cfg, &SweepOptions::default());
+        let items = Queue::new(&root, &cfg).load();
+        assert_eq!(items.len(), 1, "notes: {:?}", report.notes);
+        assert_eq!(items[0].item_type, "testwriter");
+        assert_eq!(items[0].state, workitems::STATE_TODO);
+        assert!(items[0].title.contains("E2E"), "{}", items[0].title);
+        // Dedup on a second sweep.
+        sweep(&root, &cfg, &SweepOptions::default());
+        assert_eq!(Queue::new(&root, &cfg).load().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn red_usecase_group_scopes_fix_item_to_code_root() {
+        let (root, _td) = setup("ucred");
+        let uc_test = root.join("usecases/login-test");
+        std::fs::create_dir_all(&uc_test).unwrap();
+        std::fs::write(
+            root.join("usecases/login.usecase.iter.md"),
+            "---\nname: \"User Login\"\ntestgroup: login-test/testgroup.iter.md\ntest_dir: login-test\n---\nbody\n",
+        )
+        .unwrap();
+        write_group(&uc_test, "Login E2E", &[("t1.sh", "exit 1\n")], false);
+        let cfg = Config::default();
+        let report = sweep(&root, &cfg, &SweepOptions::default());
+        assert_eq!(report.red, 1, "notes: {:?}", report.notes);
+        let items = Queue::new(&root, &cfg).load();
+        let fix = items.iter().find(|i| i.item_type == "code").expect("fix item born");
+        assert_eq!(fix.codepath, ".", "journey failures span objects → code-root scope");
+        assert_eq!(fix.state, workitems::STATE_TODO);
+        assert!(fix.mainwork.contains("use-case journey"), "{}", fix.mainwork);
+        assert!(fix.mainwork.contains("--source-testgroup"), "escalation carries provenance");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
