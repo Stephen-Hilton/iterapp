@@ -54,10 +54,30 @@ set for the target component:
 ## Other planning items (escalations, decomposition)
 
 For fix escalations and general decomposition, produce a plan whose steps can run
-in parallel wherever possible, then create the follow-on items (typically `code`
-and `testwriter`). Carry any `source_testgroup` provenance from the escalating
-item into the items you create, so the sweep's dedup guard and the UI keep the
-thread. These items may be created `queued` unless the mainwork says otherwise.
+in parallel wherever possible, then create ALL the follow-on items (typically
+`code` and `testwriter`) **in one batch, in dependency order** — never hold
+later slices back to create "when the first wave finishes", and never build a
+plan that needs you (or a human) to sequence waves by hand:
+
+- Steps with no ordering constraint: no `depends_on` — they compete on priority
+  and run in parallel.
+- Step B builds on what step A produces (e.g. A makes the tree compile, B adds
+  code to it; A relocates a module, B imports it from the new home): create A
+  first, capture the workid `iter add` prints (`added <workid> …`), and create
+  B with `--depends-on <that workid>`. Chains and fan-ins are fine (`--depends-on`
+  repeats; B may wait on several items).
+- Dependencies must NAME EXISTING ITEMS: `iter add` resolves them against the
+  queue at add time and refuses unknown ids (exit 2) — which is why the batch
+  is created in dependency order. A dependency is satisfied only when the item
+  closes complete AND everything it created is closed complete, transitively —
+  so depending on another PLAN item means "after everything that plan spawns
+  finishes", which is usually what you want.
+
+Carry any `source_testgroup` provenance from the escalating item into the items
+you create, so the sweep's dedup guard and the UI keep the thread. These items
+may be created `queued` unless the mainwork says otherwise — a queued item with
+unmet dependencies is safe: it stays visibly queued and blocked until they
+close complete.
 
 ## Creating new work items (handoff)
 
@@ -74,14 +94,14 @@ so this command works from any codepath.)
   `$ITER_TEST_DIR`); never guess it. The engine also enforces code/testwriter
   scope disjointness deterministically — but write it correctly anyway.
 - Set `priority` 0–10 (LOWER = sooner: P0 most urgent, default 5 — drop below 5 only for blocking slices) and `risk` 0–10.
-- If slices have REAL ordering constraints (B builds on what A produces), declare
-  them on the items instead of staging waves by hand: `"depends_on": ["<workid
-  or unique suffix>"]` in the item JSON (or repeatable `--depends-on <id>`).
-  A gated item stays queued but never dispatches until every dependency — and
-  everything the dependency itself created, transitively — is closed complete;
-  if a dependency fails, the dependent flips to `todo` for human review. Queue
-  the whole interdependent batch at once and let the engine sequence it. An
-  unknown, ambiguous, or cyclic dependency makes the add refuse (exit 2).
+- REAL ordering constraints are declared on the items (`"depends_on":
+  ["<workid>"]` in the JSON, or repeatable `--depends-on <id>`), never staged by
+  hand — see "Other planning items" for the batch mechanics. A gated item never
+  dispatches until every dependency (and everything it created, transitively)
+  is closed complete; a FAILED dependency flips the dependent to `todo` for
+  human review. Ambiguous, unknown, or cyclic dependencies refuse (exit 2).
+  `depends_on` composes with the TDD `todo` gate: deps on a todo item are
+  declared but dormant — the gate applies from the moment a human queues it.
 - If the add refuses because the queue is full (`max_open_workitems`), report the
   refused items in your output instead of retrying.
 
