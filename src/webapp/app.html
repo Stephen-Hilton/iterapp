@@ -2359,18 +2359,66 @@ async function loadProjects(){
     key: n.key, level: n.level || 'node', name: n.name, desc: n.description,
     uses: n.uses || [], provides: n.provides || [], depth: n.depth,
     dir: n.dir, path: n.path, body: n.body || '',
-    testgroup: n.testgroup || '', test_dir: n.test_dir || '',
+    testgroup: n.testgroup || '', test_dir: n.test_dir || '', test_loop: n.test_loop || '',
     bizreq: n.bizreq || '', techreq: n.techreq || '',
   }));
   USECASES = scan.usecases.map(u => ({ name: u.name, desc: u.description, file: u.file, steps: u.steps,
-    participants: u.participants || [], body: u.body || '' }));
-  INTERFACES = scan.interfaces.map(i => ({ id: i.id, kind: i.kind, endpoint: i.endpoint, description: i.description, file: i.file, body: i.body || '' }));
+    participants: u.participants || [], body: u.body || '', test_loop: u.test_loop || '' }));
+  INTERFACES = scan.interfaces.map(i => ({ id: i.id, kind: i.kind, endpoint: i.endpoint, description: i.description, file: i.file, body: i.body || '', test_loop: i.test_loop || '' }));
   projLoaded = true;
   return scan;
 }
 
 function ifaceTouches(m, id){
   return (m.uses || []).includes(id) || (m.provides || []).includes(id);
+}
+
+/* Test-Loop gate (test_loop_flag.md) — client mirror of the engine's resolver:
+   blocked anywhere on the ancestor chain wins; else the NEAREST explicit
+   omit/include walking up decides; no flag anywhere = included. */
+function effTestLoop(m){
+  const chain = MARKERS
+    .filter(n => n.key === m.key || n.key === '' || m.key.startsWith(n.key + '/'))
+    .sort((a,b) => b.key.length - a.key.length);
+  const blocked = chain.find(n => (n.test_loop || '').trim() === 'blocked');
+  if (blocked) return { state: 'omitted', value: 'blocked', by: blocked.key || '.' };
+  for (const n of chain) {
+    const v = (n.test_loop || '').trim();
+    if (v === 'omit') return { state: 'omitted', value: 'omit', by: n.key || '.' };
+    if (v === 'include') return { state: 'included' };
+  }
+  return { state: 'included' };
+}
+
+function tlBadge(tl){
+  if (tl.state !== 'omitted') return '';
+  const hard = tl.value === 'blocked';
+  return `<span class="useb" style="background:var(--s-paused-bg);color:#fff"
+    title="Omitted from the Test Loop (test_loop: ${esc(tl.value)}${tl.by ? ' via ' + esc(tl.by) : ''})${hard ? ' — BLOCKED: outside/vendor setup missing; only editing the marker file lifts it' : ' — the sweep skips this object; agents may re-include it'}">⛔ ${hard ? 'blocked' : 'no test loop'}</span>`;
+}
+
+/* The engine-owned toggle: POST /api/testloop shares `iter testloop`'s edit +
+   refusal rules (a blocked flag refuses everything but a human file edit). */
+async function tlApply(action, target){
+  if (!LIVE) { toast(`Mock mode — would set test_loop ${action} on ${target}`); return; }
+  try {
+    const r = await api('/api/testloop', { method: 'POST', body: JSON.stringify({ target, action }) });
+    toast(r.summary || `test_loop ${action} applied`);
+    projLoaded = false;
+    await renderProjects();
+  } catch (e) { toast('Test loop: ' + e.message); }
+}
+
+function tlButtons(ref, own, effOmitted){
+  own = (own || '').trim();
+  if (own === 'blocked') {
+    return `<span class="useb" title="test_loop: blocked — outside/vendor setup missing. Agent-proof: only a human editing the file lifts it.">⛔ blocked (edit the file to lift)</span>`;
+  }
+  return (effOmitted
+      ? `<button class="btn" data-tlact="include" data-tlref="${esc(ref)}" title="Re-enter the Test Loop (works under an omitted ancestor — nearest flag wins)">Include in Test Loop</button>`
+      : `<button class="btn" data-tlact="omit" data-tlref="${esc(ref)}" title="Park this out of the Test Loop — the sweep skips it (and everything beneath it) until re-included">Omit from Test Loop</button>`)
+    + (own ? `<button class="btn" data-tlact="clear" data-tlref="${esc(ref)}" title="Remove this file's own test_loop flag; ancestors/default apply again">Clear flag</button>` : '')
+    + `<button class="btn" data-tlact="block" data-tlref="${esc(ref)}" title="Hard park: outside/vendor setup missing. Agents cannot re-include it — only a human editing the file can.">Block (vendor)</button>`;
 }
 
 function orderedMarkers(){
@@ -2402,11 +2450,13 @@ async function renderProjects(){
       const indent = projOrder === 'hierarchy' ? m.depth * 22 : 0;
       const open = openMarker === m.key;
       const ifaceOf = (u) => INTERFACES.some(i => i.id === u);
+      const tl = effTestLoop(m);
       return `
       <div class="prow ${dim?'dimmed':''} ${step?'participant':''}" data-marker="${esc(m.key)}"
            role="button" tabindex="0" style="padding-left:${8+indent}px">
         <span class="lvltag" style="background:var(--lvl-${m.level}-bg, var(--surface2));color:var(--lvl-${m.level}-fg, var(--text))">${esc(m.level)}</span>
         <span class="pname">${esc(m.name)}</span>
+        ${tlBadge(tl)}
         <span class="pdesc">${esc(m.desc)}</span>
         <span class="uses">
           ${m.provides.map(u => `<span class="useb prov ${ifaceOf(u)?'linked':''}" title="provides interface">▲ ${esc(u)}</span>`).join('')}
@@ -2423,6 +2473,7 @@ async function renderProjects(){
           <button class="btn" data-reqlb="techreq" data-node="${esc(m.key)}">Tech Requirements</button>
           <button class="btn" data-testlb data-node="${esc(m.key)}">Testing</button>
           <button class="btn" data-viewmarker="${esc(m.key)}">View Marker File</button>
+          ${tlButtons(m.path, m.test_loop, tl.state === 'omitted')}
         </div>
       </div>` : ''}`;
     }).join('');
@@ -2453,6 +2504,7 @@ async function renderProjects(){
       <div class="dlabel">Consumers</div><div>${consumers.length ? consumers.map(m => `<span class="useb">${esc(m.name)}</span>`).join(' ') : '<span style="color:var(--text-dim)">none declared</span>'}</div>
       <div class="dlabel">Contract</div>
       <div class="textblock mono" style="max-height:60vh">${esc(i.body || '(no contract body in the marker yet — the file is frontmatter only)')}</div>
+      <div class="actions">${tlButtons(i.file, i.test_loop, ['omit','blocked'].includes((i.test_loop || '').trim()))}</div>
     </div>` : ''}`;
   }).join('');
 
@@ -2469,10 +2521,13 @@ async function renderProjects(){
       return `<div><b class="mono">${esc(step)}</b> ${node ? esc(node.name) : `<span class="mono">${esc(key || '(project root)')}</span>`}
         <span class="mono" style="color:var(--text-dim)">${node ? '· ' + esc(key || '(project root)') : key ? '— no node with this key' : ''}</span></div>`;
     }).join('');
+    const utl = (u.test_loop || '').trim();
+    const uOmit = utl === 'omit' || utl === 'blocked';
     return `<div class="prow ${on?'participant':''}" data-ucrow="${idx}" role="button" tabindex="0"
         aria-expanded="${open}" title="Click to expand and thread this use-case's participants in the tree">
       <span class="chev">${open ? '▾' : '▸'}</span>
       <span class="pname">${esc(u.name)}</span>
+      ${uOmit ? tlBadge({ state: 'omitted', value: utl, by: '' }) : ''}
       <span class="pdesc">${esc(u.desc)}</span>
       <span class="uses"><span class="useb">${Object.keys(u.steps || {}).length} participant${Object.keys(u.steps || {}).length===1?'':'s'}</span></span>
     </div>
@@ -2484,6 +2539,7 @@ async function renderProjects(){
       <div class="actions">
         <button class="btn primary" data-ucedit="${idx}">Edit</button>
         <button class="btn" data-ucdel="${idx}">Delete</button>
+        ${tlButtons(u.file, u.test_loop, uOmit)}
       </div>
     </div>` : ''}`;
   }).join('');
@@ -2597,6 +2653,8 @@ async function ucDelete(idx){
 }
 
 function projClick(e){
+  const tla = e.target.closest('[data-tlact]');
+  if (tla) { tlApply(tla.dataset.tlact, tla.dataset.tlref); return true; }
   const mk_ = e.target.closest('[data-mkworkitem]');
   if (mk_) {
     const m = MARKERS.find(x => x.key === mk_.dataset.mkworkitem);
@@ -2890,7 +2948,7 @@ async function testingLb(key){
   tg.missing = mine.filter(f => f.missing);
   tg.entries = mine
     .filter(f => !f.missing)
-    .flatMap(f => f.groups.map(g => ({ ...g, file: f.file, test_dir: f.test_dir, c4_key: f.c4_key, c4_name: f.c4_name })));
+    .flatMap(f => f.groups.map(g => ({ ...g, file: f.file, test_dir: f.test_dir, c4_key: f.c4_key, c4_name: f.c4_name, test_loop: f.test_loop })));
   tg.orphans = data.orphans || [];
   tg.undeclared = data.undeclared || [];
   tg.sel = 0; tg.logOpen = null;
@@ -2952,6 +3010,7 @@ function tgBuild(){
         <span class="chip" style="background:${tgResultColor(e.result)};color:#fff">${esc(e.result || 'never run')}</span>
         <span class="chip kv mono">${esc(e.counts || '–')}</span>
         <span class="chip meta mono">last run: <b>${e.lastrun ? esc(fmtTs(e.lastrun)) : '—'}</b></span>
+        ${e.test_loop && e.test_loop.state === 'omitted' ? `<span class="chip" style="background:var(--s-paused-bg);color:#fff" title="Parked by test_loop: ${esc(e.test_loop.value)}${e.test_loop.by ? ' via ' + esc(e.test_loop.by) : ''} — the sweep skips this group and auto-closes its unstarted fix items">⛔ omitted from test loop</span>` : ''}
         ${openItem ? `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="An open work item exists for this group (dedup guard active)">fix item: ${esc(openItem.state)} · ${esc(shortId(openItem))}</span>` : ''}
       </p>
       <p style="margin:0 0 10px;color:var(--text-dim);font-size:12.5px">${esc(e.desc || '(no group description — add "desc" in the testgroups block)')}</p>

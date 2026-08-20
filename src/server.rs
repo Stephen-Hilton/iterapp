@@ -292,6 +292,7 @@ fn route(req: &Req, engine: &Engine, port: u16) -> Resp {
         ("PUT", ["api", "file"]) => api_file_write(req, project),
         ("GET", ["api", "testgroups"]) => api_testgroups(project),
         ("POST", ["api", "testgroups", "autofix"]) => api_testgroups_autofix(req, project),
+        ("POST", ["api", "testloop"]) => api_testloop(req, project),
         ("POST", ["api", "testruns"]) => api_testruns(req, project),
         ("POST", ["api", "validate"]) => api_validate(req, project),
         ("POST", ["api", "usecases"]) => api_usecases(req, project, "create"),
@@ -1193,6 +1194,31 @@ fn api_file_write(req: &Req, project: &Path) -> Resp {
     json_resp(200, json!({ "path": path.to_string_lossy() }))
 }
 
+/// POST /api/testloop {target, action: omit|include|block|clear} — the webapp's
+/// Test-Loop gate toggle, through the same engine-owned edit path as
+/// `iter testloop`. Refusals (unknown/ambiguous target, blocked flag) come
+/// back as 409 with the reason.
+fn api_testloop(req: &Req, project: &Path) -> Resp {
+    let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    let Some(target) = body.get("target").and_then(|t| t.as_str()).filter(|t| !t.trim().is_empty()) else {
+        return err_resp(400, "target (node key/name, use-case name, interface id, or file path) is required");
+    };
+    let action = match body.get("action").and_then(|a| a.as_str()) {
+        Some("omit") => markers::TestLoopAction::Omit,
+        Some("include") => markers::TestLoopAction::Include,
+        Some("block") => markers::TestLoopAction::Block,
+        Some("clear") => markers::TestLoopAction::Clear,
+        _ => return err_resp(400, "action must be omit|include|block|clear"),
+    };
+    let settings = project_settings(project);
+    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md");
+    let scan = markers::scan(project, &scan_roots(project), glob);
+    match markers::testloop_apply(&scan, target, action) {
+        Ok(summary) => json_resp(200, json!({ "summary": summary })),
+        Err(e) => err_resp(409, &e),
+    }
+}
+
 /// GET /api/testgroups — marker-driven, matching the sweep: each `level:` marker
 /// file's MANDATORY `testgroup:` key names its testgroup.iter.md (no key = that
 /// C4 object is deliberately untested). `test_dir` in the response is the
@@ -1228,6 +1254,30 @@ fn api_testgroups(project: &Path) -> Resp {
         }
         .unwrap_or_default()
     };
+    // Test-Loop gate state per row (effective for objects — ancestry resolved;
+    // own flag for use-cases/interfaces), so parked groups show as omitted
+    // instead of silently vanishing.
+    let tl_of = |kind: &str, declaring: &str| -> Value {
+        let state = match kind {
+            "usecase" => scan
+                .usecases
+                .iter()
+                .find(|u| u.file == declaring)
+                .map(|u| markers::own_test_loop(&u.test_loop, &u.file)),
+            "interface" => scan
+                .interfaces
+                .iter()
+                .find(|i| i.file == declaring)
+                .map(|i| markers::own_test_loop(&i.test_loop, &i.file)),
+            _ => scan.nodes.iter().find(|n| n.path == declaring).map(|n| markers::effective_test_loop(n, &scan.nodes)),
+        };
+        match state {
+            Some(markers::TestLoopState::Omitted { value, by }) => {
+                json!({ "state": "omitted", "value": value, "by": by })
+            }
+            _ => json!({ "state": "included" }),
+        }
+    };
     let files: Vec<Value> = declared_rows
         .iter()
         .map(|(kind, dir, key, name, level, declaring)| {
@@ -1245,6 +1295,7 @@ fn api_testgroups(project: &Path) -> Resp {
                         "c4_name": name,
                         "c4_level": level,
                         "marker": declaring,
+                        "test_loop": tl_of(kind, declaring),
                         "groups": testgroups::parse(&text),
                     })
                 }
@@ -1257,6 +1308,7 @@ fn api_testgroups(project: &Path) -> Resp {
                     "c4_name": name,
                     "c4_level": level,
                     "marker": declaring,
+                    "test_loop": tl_of(kind, declaring),
                     "groups": [],
                 }),
             }

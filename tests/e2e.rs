@@ -1186,3 +1186,63 @@ fn stop_in_progress_item_lands_in_todo_with_git_undo_point() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The Test-Loop gate end to end (test_loop_flag.md): `iter testloop --omit`
+/// parks a container (flag lands in the marker file; the sweep skips and says
+/// so), `--include` on a child re-enters it, and the blocked contract refuses
+/// with exit 2 — the agent-facing guard proving it can fail.
+#[test]
+fn testloop_cli_flags_sweep_and_blocked_refusal() {
+    let (root, _stub) = setup_project("testloop", 3, 200);
+    let write_marker = |rel: &str, name: &str, level: &str, extra: &str| {
+        let dir = root.join(rel);
+        std::fs::create_dir_all(dir.join("test")).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.marker.iter.md", name)),
+            format!("---\nname: \"{}\"\nlevel: {}\ntestgroup: test/testgroup.iter.md\ntest_dir: test\n{}---\nbody\n", name, level, extra),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("test/testgroup.iter.md"),
+            "# tests\n```iterapp:testgroups\n{\"label\":\"G-".to_string() + name + "\",\"desc\":\"d\",\"auto_fix\":false,\"testlist\":[]}\n```\n",
+        )
+        .unwrap();
+    };
+    write_marker("ctr", "ctr", "container", "");
+    write_marker("ctr/api", "api", "component", "");
+    write_marker("vend", "vend", "container", "test_loop: blocked\n");
+
+    let run = |args: &[&str]| {
+        let mut a = vec!["testloop", "--project", root.to_str().unwrap()];
+        a.extend_from_slice(args);
+        Command::new(BIN).args(&a).output().unwrap()
+    };
+
+    // Omit the container: the flag lands in the marker file.
+    let out = run(&["--omit", "ctr"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(std::fs::read_to_string(root.join("ctr/ctr.marker.iter.md")).unwrap().contains("test_loop: omit"));
+
+    // The sweep skips the omitted subtree and reports it — no silent holes.
+    let sweep = Command::new(BIN)
+        .args(["testsweep", "--project", root.to_str().unwrap()])
+        .env("HOME", &root)
+        .output()
+        .unwrap();
+    let sweep_out = String::from_utf8_lossy(&sweep.stdout);
+    assert!(sweep_out.contains("3 omitted by test_loop flag"), "ctr + api (carry-down) + vend: {}", sweep_out);
+
+    // Include the child: re-entered under the still-omitted parent.
+    let out = run(&["--include", "api"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let list = run(&["--list"]);
+    let text = String::from_utf8_lossy(&list.stdout).into_owned();
+    assert!(text.contains("included") && text.contains("OMITTED"), "{}", text);
+
+    // Blocked contract: include refuses (exit 2), the flag survives.
+    let out = run(&["--include", "vend"]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("blocked"));
+    assert!(std::fs::read_to_string(root.join("vend/vend.marker.iter.md")).unwrap().contains("test_loop: blocked"));
+    let _ = std::fs::remove_dir_all(&root);
+}

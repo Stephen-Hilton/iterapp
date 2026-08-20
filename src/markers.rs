@@ -68,6 +68,12 @@ pub struct Node {
     /// Subtree (relative to the marker file's directory) that holds test scripts —
     /// the testwriter's lock scope, carved out of code items via codepath_ignore.
     pub test_dir: String,
+    /// Test-Loop gate (`test_loop:` key — features/test_loop_flag.md):
+    /// "omit" parks this object (and its subtree) out of the sweep, "include"
+    /// re-enters a subtree under an omitted ancestor, "blocked" is the hard
+    /// form (vendor/outside setup missing) that no descendant include and no
+    /// `iter testloop --include` can override. Empty = no opinion (inherit).
+    pub test_loop: String,
     /// This C4 object's local requirement files, relative to the marker file's
     /// directory. Optional; the webapp falls back to `bizreq.iter.md` /
     /// `techreq.iter.md` beside the marker when absent.
@@ -98,6 +104,10 @@ pub struct Interface {
     /// opts out deliberately.
     pub testgroup: String,
     pub test_dir: String,
+    /// Test-Loop gate, own-flag only (interfaces are global objects the
+    /// hierarchy doesn't own — no ancestry): "omit" or "blocked" parks the
+    /// contract tests; empty (or anything else) = swept as usual.
+    pub test_loop: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -119,6 +129,9 @@ pub struct UseCase {
     /// literal value `none` opts out deliberately.
     pub testgroup: String,
     pub test_dir: String,
+    /// Test-Loop gate, own-flag only (like interfaces): "omit" parks a
+    /// not-yet-in-focus use case, "blocked" the hard form. Empty = swept.
+    pub test_loop: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -244,6 +257,7 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                         reqs: front.get("reqs").cloned().unwrap_or_default(),
                         testgroup: front.get("testgroup").cloned().unwrap_or_default(),
                         test_dir: front.get("test_dir").cloned().unwrap_or_default(),
+                        test_loop: front.get("test_loop").cloned().unwrap_or_default(),
                         bizreq: front.get("bizreq").cloned().unwrap_or_default(),
                         techreq: front.get("techreq").cloned().unwrap_or_default(),
                         dir: dir_abs,
@@ -261,6 +275,7 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                         body,
                         testgroup: front.get("testgroup").cloned().unwrap_or_default(),
                         test_dir: front.get("test_dir").cloned().unwrap_or_default(),
+                        test_loop: front.get("test_loop").cloned().unwrap_or_default(),
                     });
                 }
                 Some(Role::Usecase) => {
@@ -283,6 +298,7 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                         body,
                         testgroup: front.get("testgroup").cloned().unwrap_or_default(),
                         test_dir: front.get("test_dir").cloned().unwrap_or_default(),
+                        test_loop: front.get("test_loop").cloned().unwrap_or_default(),
                     });
                 }
                 // bizreq/techreq/testgroup files and unrecognized suffixes are plain
@@ -298,6 +314,212 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
     result.nodes.sort_by(|a, b| a.key.cmp(&b.key));
     result.interfaces.sort_by(|a, b| a.id.cmp(&b.id));
     result
+}
+
+/* --------------------------- Test-Loop gate (features/test_loop_flag.md) ---
+The `test_loop:` frontmatter flag parks objects out of the deterministic test
+sweep without removing anything: "omit" (workflow parking, agents may flip it
+back with `iter testloop --include`), "include" (re-enter a subtree under an
+omitted ancestor), "blocked" (hard park — vendor/outside setup missing; beats
+every descendant include, and only a human editing the file lifts it). */
+
+pub const TEST_LOOP_OMIT: &str = "omit";
+pub const TEST_LOOP_INCLUDE: &str = "include";
+pub const TEST_LOOP_BLOCKED: &str = "blocked";
+
+/// The effective Test-Loop state of an object after ancestry resolution.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TestLoopState {
+    Included,
+    /// value = "omit" | "blocked"; by = key (or file) of the deciding marker.
+    Omitted { value: String, by: String },
+}
+
+/// Is `anc` the same node as, or a directory ancestor of, the node at `key`?
+/// Node keys are dirs relative to the project root; the root node's key is "".
+fn is_self_or_ancestor(anc: &str, key: &str) -> bool {
+    anc == key || anc.is_empty() || key.starts_with(&format!("{}/", anc))
+}
+
+fn display_key(key: &str) -> String {
+    if key.is_empty() { ".".to_string() } else { key.to_string() }
+}
+
+/// Effective Test-Loop state of a C4 node. `blocked` anywhere on the chain
+/// (self included) wins — out, not overridable below; otherwise the NEAREST
+/// explicit omit/include walking up from the node decides; no flag anywhere =
+/// included. Ancestry is directory nesting, the same derivation the Projects
+/// tree renders.
+pub fn effective_test_loop(node: &Node, nodes: &[Node]) -> TestLoopState {
+    let mut chain: Vec<&Node> =
+        nodes.iter().filter(|n| is_self_or_ancestor(&n.key, &node.key)).collect();
+    chain.sort_by_key(|n| std::cmp::Reverse(n.key.len())); // nearest (deepest) first
+    if let Some(b) = chain.iter().find(|n| n.test_loop.trim() == TEST_LOOP_BLOCKED) {
+        return TestLoopState::Omitted { value: TEST_LOOP_BLOCKED.into(), by: display_key(&b.key) };
+    }
+    for n in &chain {
+        match n.test_loop.trim() {
+            TEST_LOOP_OMIT => {
+                return TestLoopState::Omitted { value: TEST_LOOP_OMIT.into(), by: display_key(&n.key) }
+            }
+            TEST_LOOP_INCLUDE => return TestLoopState::Included,
+            _ => {}
+        }
+    }
+    TestLoopState::Included
+}
+
+/// Test-Loop state of a use-case or interface: own flag only — global objects
+/// the hierarchy doesn't own get no ancestry.
+pub fn own_test_loop(test_loop: &str, file: &str) -> TestLoopState {
+    match test_loop.trim() {
+        v @ (TEST_LOOP_OMIT | TEST_LOOP_BLOCKED) => {
+            TestLoopState::Omitted { value: v.into(), by: file.to_string() }
+        }
+        _ => TestLoopState::Included,
+    }
+}
+
+/// Deterministically set (Some) or remove (None) one scalar frontmatter key,
+/// preserving every other line verbatim — a record-level edit like the usecase
+/// participants editor. The file must already have a frontmatter fence.
+pub fn set_frontmatter_key(path: &Path, key: &str, value: Option<&str>) -> Result<(), String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    let trimmed = content.trim_start();
+    let Some(rest) = trimmed.strip_prefix("---") else {
+        return Err(format!("{} has no frontmatter fence", path.display()));
+    };
+    let Some(end) = rest.find("\n---") else {
+        return Err(format!("{} has no closing frontmatter fence", path.display()));
+    };
+    let mut kept: Vec<String> = Vec::new();
+    let prefix = format!("{}:", key);
+    for line in rest[..end].lines() {
+        if line.trim_start().starts_with(&prefix) {
+            continue;
+        }
+        kept.push(line.to_string());
+    }
+    if let Some(v) = value {
+        kept.push(format!("{}: {}", key, v));
+    }
+    let new_content = format!("---{}\n---{}", kept.join("\n"), &rest[end + 4..]);
+    std::fs::write(path, new_content).map_err(|e| format!("cannot write {}: {}", path.display(), e))
+}
+
+/// A `test_loop` edit action, shared by `iter testloop` and POST /api/testloop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TestLoopAction {
+    Omit,
+    Include,
+    Block,
+    Clear,
+}
+
+/// One resolvable Test-Loop target: a node, use-case, or interface.
+struct TestLoopTarget {
+    label: String, // what messages call it
+    path: String,  // the file the flag lives in
+    current: String,
+    node_key: Option<String>,
+}
+
+/// Resolve `target` (node key, node name, use-case name, interface id, or a
+/// path suffix of the declaring file) against the scan — exactly one match or
+/// refusal, never a guess.
+fn resolve_test_loop_target(scan: &Scan, target: &str) -> Result<TestLoopTarget, String> {
+    let t = target.trim().trim_end_matches('/');
+    let mut matches: Vec<TestLoopTarget> = Vec::new();
+    for n in &scan.nodes {
+        if n.key == t || n.name == t || (t == "." && n.key.is_empty()) || n.path.ends_with(t) {
+            matches.push(TestLoopTarget {
+                label: format!("object {} ({})", n.name, display_key(&n.key)),
+                path: n.path.clone(),
+                current: n.test_loop.trim().to_string(),
+                node_key: Some(n.key.clone()),
+            });
+        }
+    }
+    for u in &scan.usecases {
+        if u.name == t || u.file.ends_with(t) {
+            matches.push(TestLoopTarget {
+                label: format!("use case {}", u.name),
+                path: u.file.clone(),
+                current: u.test_loop.trim().to_string(),
+                node_key: None,
+            });
+        }
+    }
+    for i in &scan.interfaces {
+        if i.id == t || i.file.ends_with(t) {
+            matches.push(TestLoopTarget {
+                label: format!("interface {}", i.id),
+                path: i.file.clone(),
+                current: i.test_loop.trim().to_string(),
+                node_key: None,
+            });
+        }
+    }
+    matches.dedup_by(|a, b| a.path == b.path);
+    match matches.len() {
+        0 => Err(format!("\"{}\" matches no C4 object, use case, or interface", target)),
+        1 => Ok(matches.pop().expect("one match")),
+        n => Err(format!(
+            "\"{}\" is ambiguous ({} matches: {}) — use the node key or file path",
+            target,
+            n,
+            matches.iter().map(|m| m.label.as_str()).collect::<Vec<_>>().join("; ")
+        )),
+    }
+}
+
+/// Apply one Test-Loop edit. Refusals guard the `blocked` contract: an
+/// existing `blocked` value survives everything except a human editing the
+/// marker file (so an agent told to include its dependencies can never flip a
+/// vendor-blocked object — it gets a refusal to report instead), and
+/// `--include` under a blocked ANCESTOR refuses too, since the include could
+/// never take effect. Returns a one-line summary of what changed.
+pub fn testloop_apply(scan: &Scan, target: &str, action: TestLoopAction) -> Result<String, String> {
+    let t = resolve_test_loop_target(scan, target)?;
+    if t.current == TEST_LOOP_BLOCKED && action != TestLoopAction::Block {
+        return Err(format!(
+            "{} is test_loop: blocked (outside/vendor setup missing) — refusing to change it; \
+             a human lifts a block by editing {}",
+            t.label, t.path
+        ));
+    }
+    if action == TestLoopAction::Include {
+        if let Some(key) = &t.node_key {
+            let blocked_anc = scan.nodes.iter().find(|n| {
+                n.key != *key
+                    && is_self_or_ancestor(&n.key, key)
+                    && n.test_loop.trim() == TEST_LOOP_BLOCKED
+            });
+            if let Some(anc) = blocked_anc {
+                return Err(format!(
+                    "{} sits under blocked ancestor {} (test_loop: blocked) — an include there \
+                     can never take effect; a human lifts the block by editing {}",
+                    t.label,
+                    display_key(&anc.key),
+                    anc.path
+                ));
+            }
+        }
+    }
+    let value = match action {
+        TestLoopAction::Omit => Some(TEST_LOOP_OMIT),
+        TestLoopAction::Include => Some(TEST_LOOP_INCLUDE),
+        TestLoopAction::Block => Some(TEST_LOOP_BLOCKED),
+        TestLoopAction::Clear => None,
+    };
+    set_frontmatter_key(Path::new(&t.path), "test_loop", value)?;
+    Ok(format!(
+        "{}: test_loop {} (was {})",
+        t.label,
+        value.map(|v| format!("→ {}", v)).unwrap_or_else(|| "cleared".into()),
+        if t.current.is_empty() { "unset" } else { &t.current }
+    ))
 }
 
 /// Does this marker text already carry a `# Long Description` heading (any level)?
@@ -349,6 +571,119 @@ mod tests {
         assert_eq!(role_of("x.interface.iter.md"), Some(Role::Interface));
         assert_eq!(role_of("notes.iter.md"), None);
         assert_eq!(role_of("marker.md"), None, "must end .iter.md");
+    }
+
+    // Test-Loop gate resolution (features/test_loop_flag.md): every rule
+    // proves it can fail.
+    #[test]
+    fn test_loop_nearest_wins_and_blocked_beats_include() {
+        let mk = |key: &str, tl: &str| Node { key: key.into(), test_loop: tl.into(), ..Default::default() };
+        let nodes = vec![
+            mk("", ""),
+            mk("core", TEST_LOOP_OMIT),
+            mk("core/api", TEST_LOOP_INCLUDE),
+            mk("core/db", ""),
+            mk("vendor", TEST_LOOP_BLOCKED),
+            mk("vendor/pay", TEST_LOOP_INCLUDE),
+            mk("other", ""),
+        ];
+        let eff = |key: &str| effective_test_loop(nodes.iter().find(|n| n.key == key).unwrap(), &nodes);
+        assert_eq!(eff("core/api"), TestLoopState::Included, "nearest include re-enters under an omitted ancestor");
+        assert_eq!(eff("core/db"), TestLoopState::Omitted { value: "omit".into(), by: "core".into() }, "omit carries down");
+        assert!(eff("core").is_omitted_test());
+        assert_eq!(
+            eff("vendor/pay"),
+            TestLoopState::Omitted { value: "blocked".into(), by: "vendor".into() },
+            "blocked beats a descendant include"
+        );
+        assert_eq!(eff("other"), TestLoopState::Included, "no flag anywhere = included");
+
+        // Root-node ("") flags govern everything.
+        let rooted = vec![mk("", TEST_LOOP_OMIT), mk("a", ""), mk("a/b", TEST_LOOP_INCLUDE)];
+        let eff2 = |key: &str| effective_test_loop(rooted.iter().find(|n| n.key == key).unwrap(), &rooted);
+        assert!(eff2("a").is_omitted_test(), "root omit reaches undecorated descendants");
+        assert_eq!(eff2("a/b"), TestLoopState::Included, "…but a nearer include still wins");
+
+        // Use-cases/interfaces: own flag only.
+        assert!(own_test_loop("blocked", "f").is_omitted_test());
+        assert!(own_test_loop("omit", "f").is_omitted_test());
+        assert_eq!(own_test_loop("include", "f"), TestLoopState::Included);
+        assert_eq!(own_test_loop("", "f"), TestLoopState::Included);
+    }
+
+    impl TestLoopState {
+        fn is_omitted_test(&self) -> bool {
+            matches!(self, TestLoopState::Omitted { .. })
+        }
+    }
+
+    #[test]
+    fn set_frontmatter_key_preserves_everything_else() {
+        let dir = std::env::temp_dir().join(format!("iter-tlkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.marker.iter.md");
+        std::fs::write(&f, "---\nname: \"X\"\nlevel: container\ntestgroup: test/testgroup.iter.md\n---\n\n# Body\nstays verbatim\n").unwrap();
+        set_frontmatter_key(&f, "test_loop", Some("omit")).unwrap();
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.contains("test_loop: omit"), "{}", text);
+        assert!(text.contains("name: \"X\"") && text.contains("stays verbatim"), "{}", text);
+        // Replace, not duplicate.
+        set_frontmatter_key(&f, "test_loop", Some("include")).unwrap();
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(text.matches("test_loop:").count(), 1, "{}", text);
+        assert!(text.contains("test_loop: include"));
+        // Clear removes the key entirely.
+        set_frontmatter_key(&f, "test_loop", None).unwrap();
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(!text.contains("test_loop"), "{}", text);
+        assert!(text.contains("level: container") && text.contains("stays verbatim"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn testloop_apply_guards_the_blocked_contract() {
+        let dir = std::env::temp_dir().join(format!("iter-tlapply-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["vendor/pay", "core"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let write = |rel: &str, tl: &str| {
+            let path = dir.join(rel);
+            let extra = if tl.is_empty() { String::new() } else { format!("test_loop: {}\n", tl) };
+            std::fs::write(&path, format!("---\nname: \"n\"\nlevel: container\n{}---\nbody\n", extra)).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let vendor = write("vendor/vendor.marker.iter.md", "blocked");
+        let pay = write("vendor/pay/pay.marker.iter.md", "");
+        let core = write("core/core.marker.iter.md", "omit");
+        let mkn = |key: &str, path: &str, tl: &str| Node {
+            key: key.into(),
+            name: key.replace('/', "-"),
+            path: path.into(),
+            test_loop: tl.into(),
+            ..Default::default()
+        };
+        let scan = Scan {
+            nodes: vec![mkn("vendor", &vendor, "blocked"), mkn("vendor/pay", &pay, ""), mkn("core", &core, "omit")],
+            ..Default::default()
+        };
+        // Blocked self: include/omit/clear all refuse; only a human file edit lifts it.
+        for action in [TestLoopAction::Include, TestLoopAction::Omit, TestLoopAction::Clear] {
+            let err = testloop_apply(&scan, "vendor", action).unwrap_err();
+            assert!(err.contains("blocked"), "{:?}: {}", action, err);
+        }
+        // Include under a blocked ANCESTOR refuses too — it could never take effect.
+        let err = testloop_apply(&scan, "vendor/pay", TestLoopAction::Include).unwrap_err();
+        assert!(err.contains("blocked ancestor"), "{}", err);
+        // Unknown and ambiguous refs refuse, never guess.
+        assert!(testloop_apply(&scan, "nope", TestLoopAction::Omit).unwrap_err().contains("matches no"));
+        assert!(testloop_apply(&scan, "marker.iter.md", TestLoopAction::Omit).unwrap_err().contains("ambiguous"));
+        // A normal include lands in the file.
+        let summary = testloop_apply(&scan, "core", TestLoopAction::Include).unwrap();
+        assert!(summary.contains("include"), "{}", summary);
+        assert!(std::fs::read_to_string(&core).unwrap().contains("test_loop: include"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

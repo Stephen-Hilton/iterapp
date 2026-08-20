@@ -196,6 +196,35 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
+    /// Test-Loop gate editor: park C4 objects / use cases / interfaces out of
+    /// the test sweep (`test_loop:` frontmatter flag) or bring them back —
+    /// the engine-owned write path, usable from any agent regardless of lock
+    /// scope. Omitting a node carries down its whole subtree; `--include` on a
+    /// descendant re-enters it (nearest flag wins). `--block` is the hard park
+    /// (outside/vendor setup missing): `--include`/`--omit`/`--clear` REFUSE
+    /// to touch a blocked flag (exit 2) — only a human editing the marker
+    /// file lifts it.
+    Testloop {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Park this object out of the sweep (repeatable). Ref = node key,
+        /// name, use-case name, interface id, or declaring-file path suffix
+        #[arg(long)]
+        omit: Vec<String>,
+        /// Re-enter this object (repeatable) — works under an omitted
+        /// ancestor; refused under a blocked one
+        #[arg(long)]
+        include: Vec<String>,
+        /// Hard-park: needs outside/vendor setup; agent-proof (repeatable)
+        #[arg(long)]
+        block: Vec<String>,
+        /// Remove the flag so ancestors/default apply again (repeatable)
+        #[arg(long)]
+        clear: Vec<String>,
+        /// Print every object with its own flag and EFFECTIVE state
+        #[arg(long)]
+        list: bool,
+    },
     /// One-time migration to the inverted priority scheme (2026-08-17: lower =
     /// sooner, P0 most urgent, default 5). Rewrites every OPEN item and
     /// scheduled template as newP = 10 - P (clamped 0..=10); the closed archive
@@ -274,6 +303,9 @@ fn main() {
         Command::Reject { project, reason } => cmd_reject(project, reason),
         Command::Usecase { project, file, add, remove, list } => cmd_usecase(project, file, add, remove, list),
         Command::Markers { project } => cmd_markers(project),
+        Command::Testloop { project, omit, include, block, clear, list } => {
+            cmd_testloop(project, omit, include, block, clear, list)
+        }
         Command::InvertPriorities { project } => cmd_invert_priorities(project),
         Command::Stubdesc { project } => cmd_stubdesc(project),
         Command::Validate { project, file, fix, template } => cmd_validate(project, file, fix, template),
@@ -952,6 +984,80 @@ fn cmd_usecase(project: PathBuf, file: PathBuf, add: Vec<String>, remove: Vec<St
     if add.is_empty() && remove.is_empty() && !list {
         eprintln!("nothing to do: pass --add, --remove, and/or --list");
         return 2;
+    }
+    0
+}
+
+/// Test-Loop gate editor (features/test_loop_flag.md). Each edit re-scans so
+/// later refs in the same invocation see earlier edits; any refusal (unknown/
+/// ambiguous ref, or touching a blocked flag) aborts with exit 2 — partial
+/// application is reported, never silent.
+fn cmd_testloop(
+    project: PathBuf,
+    omit: Vec<String>,
+    include: Vec<String>,
+    block: Vec<String>,
+    clear: Vec<String>,
+    list: bool,
+) -> i32 {
+    let settings = server::project_settings(&project);
+    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md").to_string();
+    let roots = server::scan_roots(&project);
+    let scan_now = || markers::scan(&project, &roots, &glob);
+
+    let edits: Vec<(markers::TestLoopAction, &Vec<String>)> = vec![
+        (markers::TestLoopAction::Omit, &omit),
+        (markers::TestLoopAction::Include, &include),
+        (markers::TestLoopAction::Block, &block),
+        (markers::TestLoopAction::Clear, &clear),
+    ];
+    let mut edited = 0usize;
+    for (action, refs) in edits {
+        for target in refs {
+            match markers::testloop_apply(&scan_now(), target, action) {
+                Ok(summary) => {
+                    println!("{}", summary);
+                    edited += 1;
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    if edited > 0 {
+                        eprintln!("note: {} earlier edit(s) in this invocation were already applied", edited);
+                    }
+                    return 2;
+                }
+            }
+        }
+    }
+
+    if list || edited == 0 {
+        let scan = scan_now();
+        println!("test loop state (flag → effective):");
+        for n in &scan.nodes {
+            let flag = if n.test_loop.trim().is_empty() { "-".to_string() } else { n.test_loop.trim().to_string() };
+            let eff = match markers::effective_test_loop(n, &scan.nodes) {
+                markers::TestLoopState::Included => "included".to_string(),
+                markers::TestLoopState::Omitted { value, by } => format!("OMITTED ({} via {})", value, by),
+            };
+            let key = if n.key.is_empty() { ".".to_string() } else { n.key.clone() };
+            println!("  object    {:40} {:10} {:8} → {}", key, n.name, flag, eff);
+        }
+        for u in &scan.usecases {
+            let flag = if u.test_loop.trim().is_empty() { "-".to_string() } else { u.test_loop.trim().to_string() };
+            let eff = match markers::own_test_loop(&u.test_loop, &u.file) {
+                markers::TestLoopState::Included => "included".to_string(),
+                markers::TestLoopState::Omitted { value, .. } => format!("OMITTED ({})", value),
+            };
+            println!("  usecase   {:51} {:8} → {}", u.name, flag, eff);
+        }
+        for i in &scan.interfaces {
+            let flag = if i.test_loop.trim().is_empty() { "-".to_string() } else { i.test_loop.trim().to_string() };
+            let eff = match markers::own_test_loop(&i.test_loop, &i.file) {
+                markers::TestLoopState::Included => "included".to_string(),
+                markers::TestLoopState::Omitted { value, .. } => format!("OMITTED ({})", value),
+            };
+            println!("  interface {:51} {:8} → {}", i.id, flag, eff);
+        }
     }
     0
 }

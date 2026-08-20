@@ -87,9 +87,25 @@ do NOT grind out a use-case you believe is invalid.
 
    Set `source` to `agent: usecase` when using `--file`. In the plan mainwork,
    instruct that each built object gets linked back into the use-case file via
-   `"$ITER_BIN" usecase --file <usecase file> --add "<step> <ref>"` when its
-   code item completes — links reflect what was BUILT, not what was proposed.
-6. Priorities are lower-is-sooner (P0 most urgent, default 5); the plan item at
+   `"$ITER_BIN" usecase --file <usecase file> --add "<step> <ref>"` AND
+   re-entered into the Test Loop via `"$ITER_BIN" testloop --include "<ref>"`
+   when its code item completes — links and sweep coverage reflect what was
+   BUILT, not what was proposed (an object without a marker yet cannot be
+   included; it enters the sweep the moment it exists and is included).
+6. **Re-enable the Test Loop for this use-case's dependencies** (use-case
+   centric TDD: the user parks broad subtrees with `test_loop: omit` and each
+   new use-case pulls exactly its dependencies back into the sweep). For EVERY
+   PRESENT participant you referenced in step 4, run:
+
+       "$ITER_BIN" testloop --project "$ITER_PROJECT" --include "<object-ref>"
+
+   The nearest flag wins, so including a component works even under an omitted
+   container. If the command REFUSES because an object is `test_loop: blocked`
+   (outside/vendor setup missing), do NOT try to force or work around it — the
+   refusal is the design. Report the blocked object in your output so the user
+   decides. Never `--omit`/`--block`/`--clear` anything: your job is only to
+   include this use-case's dependencies.
+7. Priorities are lower-is-sooner (P0 most urgent, default 5); the plan item at
    P3 runs ahead of default work without preempting urgent fixes.
 
 ## Focus
@@ -104,8 +120,9 @@ do NOT grind out a use-case you believe is invalid.
 
 ## Output
 End with: the use-case file path, participants referenced (present objects),
-the gap list and the plan item you created (or "no gaps"), requirement
-conflicts you noticed, and any rejection (with its reason) if you rejected.
+the Test-Loop includes you applied and any refused-as-blocked objects, the gap
+list and the plan item you created (or "no gaps"), requirement conflicts you
+noticed, and any rejection (with its reason) if you rejected.
 
 ## CI note
 GitHub Actions may be intentionally disabled repo-wide. Do NOT create work items

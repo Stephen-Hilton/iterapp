@@ -218,6 +218,30 @@ pub fn validate_file(path: &Path, fix: bool) -> std::io::Result<Vec<Finding>> {
         }
     }
 
+    // The Test-Loop gate flag (features/test_loop_flag.md): a typo'd value
+    // silently means INCLUDED — the exact wrong failure mode for a parking
+    // flag — so any value outside the vocabulary warns.
+    if matches!(role, Some(Role::Marker) | Some(Role::Usecase) | Some(Role::Interface)) {
+        if let Some(v) = front.get("test_loop") {
+            let v = v.trim();
+            if !matches!(v, "omit" | "include" | "blocked") {
+                push(
+                    Severity::Warn,
+                    "bad-test-loop",
+                    format!("`test_loop: {}` is not omit|include|blocked — an unrecognized value silently means INCLUDED in the sweep", v),
+                    false,
+                );
+            } else if v == "include" && !matches!(role, Some(Role::Marker)) {
+                push(
+                    Severity::Info,
+                    "test-loop-include-noop",
+                    "`test_loop: include` on a use-case/interface is already the default — global objects have no ancestry, so only omit|blocked change anything here".into(),
+                    false,
+                );
+            }
+        }
+    }
+
     // 3. Role-specific expectations (report-only).
     match role {
         Some(Role::Marker) => {

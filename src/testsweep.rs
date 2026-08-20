@@ -122,14 +122,18 @@ pub struct SweepReport {
     pub stale_closed: usize,
     /// C4 objects whose marker file has no `testgroup:` key — deliberately untested.
     pub undeclared: usize,
+    /// Objects/use-cases/interfaces parked out of the sweep by `test_loop:`
+    /// omit|blocked (own flag or an ancestor's) — counted and named in notes,
+    /// never silently dropped.
+    pub omitted: usize,
     pub notes: Vec<String>,
 }
 
 impl SweepReport {
     pub fn summary(&self) -> String {
         format!(
-            "test sweep: {} declared group(s) examined, {} ran ({} green, {} red, {} error); {} item(s) created, {} refreshed, {} stale auto-closed; {} C4 object(s) without a testgroup: key",
-            self.examined, self.ran, self.green, self.red, self.error, self.items_created, self.items_refreshed, self.stale_closed, self.undeclared
+            "test sweep: {} declared group(s) examined, {} ran ({} green, {} red, {} error); {} item(s) created, {} refreshed, {} stale auto-closed; {} C4 object(s) without a testgroup: key; {} omitted by test_loop flag",
+            self.examined, self.ran, self.green, self.red, self.error, self.items_created, self.items_refreshed, self.stale_closed, self.undeclared, self.omitted
         )
     }
 }
@@ -181,7 +185,25 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
     // so a missing key is a coverage gap that births an authoring item. The
     // explicit value `testgroup: none` opts a use-case/interface out.
     let mut units: Vec<SweepUnit> = Vec::new();
+    // Parked by the test_loop flag (features/test_loop_flag.md): reported, and
+    // their groups' UNSTARTED sweep-born items auto-closed — but never run.
+    // (name, tg file if declared, flag value, deciding marker)
+    let mut parked: Vec<(String, Option<PathBuf>, String, String)> = Vec::new();
     for node in &scan.nodes {
+        // The gate comes first: parked is parked, testgroup key or not.
+        // Effective state resolves ancestry (nearest omit/include wins,
+        // blocked beats everything), so omitting a container carries down.
+        if let markers::TestLoopState::Omitted { value, by } = markers::effective_test_loop(node, &scan.nodes) {
+            report.omitted += 1;
+            report.notes.push(format!(
+                "omitted from test loop: object \"{}\" (test_loop: {} via {})",
+                node.name, value, by
+            ));
+            let tg = (!node.testgroup.is_empty() && node.testgroup.trim() != "none")
+                .then(|| PathBuf::from(&node.dir).join(&node.testgroup));
+            parked.push((node.name.clone(), tg, value, by));
+            continue;
+        }
         if node.testgroup.is_empty() {
             report.undeclared += 1;
             continue;
@@ -198,6 +220,17 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
     let mut keyless: Vec<(SweepKind, String, String)> = Vec::new(); // (kind, name, declaring file)
     for uc in &scan.usecases {
         let dir = Path::new(&uc.file).parent().map(PathBuf::from).unwrap_or_else(|| code_root.clone());
+        // Own flag only (no ancestry): a parked use case is skipped entirely —
+        // its missing-key authoring machinery is suspended too, since parked
+        // means "not spending attention here yet".
+        if let markers::TestLoopState::Omitted { value, by } = markers::own_test_loop(&uc.test_loop, &uc.file) {
+            report.omitted += 1;
+            report.notes.push(format!("omitted from test loop: use case \"{}\" (test_loop: {})", uc.name, value));
+            let tg = (!uc.testgroup.trim().is_empty() && uc.testgroup.trim() != "none")
+                .then(|| dir.join(uc.testgroup.trim()));
+            parked.push((uc.name.clone(), tg, value, by));
+            continue;
+        }
         match uc.testgroup.trim() {
             "none" => report.undeclared += 1,
             "" => keyless.push((SweepKind::Usecase, uc.name.clone(), uc.file.clone())),
@@ -213,6 +246,14 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
     }
     for iface in &scan.interfaces {
         let dir = Path::new(&iface.file).parent().map(PathBuf::from).unwrap_or_else(|| code_root.clone());
+        if let markers::TestLoopState::Omitted { value, by } = markers::own_test_loop(&iface.test_loop, &iface.file) {
+            report.omitted += 1;
+            report.notes.push(format!("omitted from test loop: interface \"{}\" (test_loop: {})", iface.id, value));
+            let tg = (!iface.testgroup.trim().is_empty() && iface.testgroup.trim() != "none")
+                .then(|| dir.join(iface.testgroup.trim()));
+            parked.push((iface.id.clone(), tg, value, by));
+            continue;
+        }
         match iface.testgroup.trim() {
             "none" => report.undeclared += 1,
             "" => keyless.push((SweepKind::Interface, iface.id.clone(), iface.file.clone())),
@@ -387,6 +428,28 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
         }
     }
 
+    // Parked units (test_loop flag): their testgroup files stay CLAIMED — a
+    // parked container must not make its groups look "unowned" — and any
+    // UNSTARTED sweep-born item for their groups auto-closes, so parked work
+    // stops burning agent time. Lifting the flag reverses it all: the next
+    // sweep re-runs the groups and re-births fix items if they are still red.
+    {
+        let queue = Queue::new(project_root, cfg);
+        for (name, tg, value, by) in &parked {
+            let Some(tg) = tg else { continue };
+            let Ok(tg_file) = tg.canonicalize() else { continue };
+            claimed.push(tg_file.clone());
+            let Ok(content) = std::fs::read_to_string(&tg_file) else { continue };
+            for group in testgroups::parse(&content) {
+                let reason = format!(
+                    "testgroup \"{}\" of \"{}\" is omitted from the test loop (test_loop: {} via {}); item was unstarted",
+                    group.label, name, value, by
+                );
+                report.stale_closed += close_stale_items(&queue, &group.label, &reason);
+            }
+        }
+    }
+
     // testgroup.iter.md files no declaring file claims: surfaced, never run.
     for file in testgroups::find_files(&code_root) {
         let canon = file.canonicalize().unwrap_or(file.clone());
@@ -473,7 +536,11 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
         match run.outcome {
             Outcome::Green => {
                 report.green += 1;
-                report.stale_closed += close_stale_items(&queue, &cand.group.label);
+                report.stale_closed += close_stale_items(
+                    &queue,
+                    &cand.group.label,
+                    &format!("testgroup \"{}\" is green again; item was stale (never started)", cand.group.label),
+                );
             }
             Outcome::Red | Outcome::Error => {
                 if run.outcome == Outcome::Red {
@@ -499,10 +566,11 @@ enum Action {
     Deduped,
 }
 
-/// Green group: any sweep-born item still sitting unstarted (todo/queued, zero
-/// attempts) is stale — the deterministic, zero-agent stale-close. Items an agent
-/// has started are left alone.
-fn close_stale_items(queue: &Queue, label: &str) -> usize {
+/// Any sweep-born item still sitting unstarted (todo/queued, zero attempts)
+/// for this group is closed with `reason` — the deterministic, zero-agent
+/// stale-close, used when a group came back green and when its object was
+/// parked by the test_loop flag. Items an agent has started are left alone.
+fn close_stale_items(queue: &Queue, label: &str, reason: &str) -> usize {
     let closed: Vec<WorkItem> = queue
         .with_lock(|items| {
             let mut out = Vec::new();
@@ -514,10 +582,7 @@ fn close_stale_items(queue: &Queue, label: &str) -> usize {
                 if stale {
                     let mut done = i.clone();
                     done.state = workitems::STATE_COMPLETE.into();
-                    done.output = format!(
-                        "auto-closed by test sweep: testgroup \"{}\" is green again; item was stale (never started)",
-                        label
-                    );
+                    done.output = format!("auto-closed by test sweep: {}", reason);
                     done.times.closed = workitems::now_iso();
                     out.push(done);
                 }
@@ -530,7 +595,7 @@ fn close_stale_items(queue: &Queue, label: &str) -> usize {
         if let Err(e) = queue.append_closed(item) {
             logging::error("sweep", &format!("cannot archive auto-closed item {}: {}", item.workid, e));
         } else {
-            logging::info("sweep", &format!("auto-closed stale item {} (\"{}\" green again)", item.workid, label));
+            logging::info("sweep", &format!("auto-closed stale item {} (\"{}\": {})", item.workid, label, reason));
         }
     }
     closed.len()
@@ -766,6 +831,97 @@ mod tests {
         let tg_file = test_dir.join("testgroup.iter.md");
         std::fs::write(&tg_file, testgroups::update("# tests\n", &[group])).unwrap();
         tg_file
+    }
+
+    // The Test-Loop gate (features/test_loop_flag.md): an omitted container's
+    // groups never run and its unstarted sweep items auto-close, while an
+    // `include` child underneath re-enters the sweep — break either side of
+    // the resolver and this goes red.
+    #[test]
+    fn test_loop_flag_parks_subtree_and_include_reenters() {
+        let (root, _td) = setup("tlpark");
+        // Container comp/ is omitted; its own (red) group must not run.
+        std::fs::write(
+            root.join("comp/comp.marker.iter.md"),
+            "---\nname: \"Comp\"\nlevel: container\ntestgroup: test/testgroup.iter.md\ntest_dir: test\ntest_loop: omit\n---\nbody\n",
+        )
+        .unwrap();
+        write_group(&root.join("comp/test"), "Parked G", &[("t1.sh", "exit 1\n")], false);
+        // Component comp/sub/ carries an explicit include — re-entered, runs red.
+        let sub_test = root.join("comp/sub/test");
+        std::fs::create_dir_all(&sub_test).unwrap();
+        std::fs::write(
+            root.join("comp/sub/sub.marker.iter.md"),
+            "---\nname: \"Sub\"\nlevel: component\ntestgroup: test/testgroup.iter.md\ntest_dir: test\ntest_loop: include\n---\nbody\n",
+        )
+        .unwrap();
+        write_group(&sub_test, "Sub G", &[("t1.sh", "exit 1\n")], false);
+        // An unstarted sweep-born item for the parked group must auto-close.
+        let cfg = Config::default();
+        let queue = Queue::new(&root, &cfg);
+        let mut stale = WorkItem {
+            workid: "w-parked".into(),
+            item_type: "code".into(),
+            state: workitems::STATE_TODO.into(),
+            source: SOURCE.into(),
+            source_testgroup: "Parked G".into(),
+            ..Default::default()
+        };
+        stale.times.added = workitems::now_iso();
+        queue.append(&stale).unwrap();
+
+        let report = sweep(&root, &cfg, &SweepOptions::default());
+        assert_eq!(report.omitted, 1, "the container is omitted: {:?}", report.notes);
+        assert_eq!(report.red, 1, "the included child still runs: {:?}", report.notes);
+        assert!(report.notes.iter().any(|n| n.contains("omitted from test loop") && n.contains("Comp")));
+        let open = queue.load();
+        assert!(
+            open.iter().any(|i| i.source_testgroup == "Sub G"),
+            "fix item born for the included child: {:?}",
+            open.iter().map(|i| &i.source_testgroup).collect::<Vec<_>>()
+        );
+        assert!(!open.iter().any(|i| i.workid == "w-parked"), "parked group's unstarted item auto-closes");
+        let closed = queue.load_closed();
+        let auto = closed.iter().find(|i| i.workid == "w-parked").expect("archived");
+        assert!(auto.output.contains("omitted from the test loop"), "{}", auto.output);
+        assert_eq!(report.stale_closed, 1);
+        // Nothing ran for the parked group: no fix item for it.
+        assert!(!open.iter().any(|i| i.source_testgroup == "Parked G"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A parked use case is skipped entirely — even its missing-testgroup-key
+    // authoring machinery is suspended while parked.
+    #[test]
+    fn parked_usecase_suspends_authoring_and_runs() {
+        let (root, _td) = setup("tluc");
+        std::fs::write(
+            root.join("comp/comp.marker.iter.md"),
+            "---\nname: \"Comp\"\nlevel: component\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("usecases")).unwrap();
+        std::fs::write(
+            root.join("usecases/later.usecase.iter.md"),
+            "---\nname: \"Later Feature\"\ndescription: \"parked\"\ntest_loop: omit\n---\nbody\n",
+        )
+        .unwrap();
+        let cfg = Config::default();
+        let report = sweep(&root, &cfg, &SweepOptions::default());
+        assert_eq!(report.omitted, 1, "notes: {:?}", report.notes);
+        assert!(
+            Queue::new(&root, &cfg).load().is_empty(),
+            "no authoring item while parked — the missing-key machinery is suspended"
+        );
+        // Lift the flag: the coverage gap surfaces again.
+        std::fs::write(
+            root.join("usecases/later.usecase.iter.md"),
+            "---\nname: \"Later Feature\"\ndescription: \"parked\"\n---\nbody\n",
+        )
+        .unwrap();
+        sweep(&root, &cfg, &SweepOptions::default());
+        assert_eq!(Queue::new(&root, &cfg).load().len(), 1, "authoring item born once unparked");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
