@@ -977,3 +977,117 @@ fn schedule_api_semantics() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+/// Work-item dependencies (workitem_dependency.md), against the real engine
+/// loop with the fake runner: B (MORE urgent, disjoint codepath, its own agent
+/// type — nothing but the gate holds it) must not dispatch until A closes
+/// complete. Break the gate and B starts first, turning this red.
+#[test]
+fn dependency_gate_orders_dispatch() {
+    let (root, stub) = setup_project("depgate", 3, 200);
+    std::fs::create_dir_all(root.join("depb")).unwrap();
+    seed(&root, &workitem_json("dep-a", "code", "dep a", "./src", "do the foundation work", "", ""));
+    seed(
+        &root,
+        r#"{"workid":"dep-b","title":"dep b","type":"plan","state":"queued","source":"user","priority":0,"risk":0,"codepath":"./depb","depends_on":["dep-a"],"context":[],"testfiles":[],"prework":[],"mainwork":"build on the foundation","postwork":[],"output":"","attempts":0,"lasterror":"","times":{"added":"2026-08-11T00:00:00Z","start":"","preworkdone":"","mainworkdone":"","postworkdone":"","closed":""}}"#,
+    );
+
+    run_engine(&root, &stub, Duration::from_secs(120));
+
+    assert!(open_items(&root).is_empty(), "queue must drain");
+    let closed = closed_items(&root);
+    let a = closed.iter().find(|i| i["workid"] == "dep-a").expect("A closed");
+    let b = closed.iter().find(|i| i["workid"] == "dep-b").expect("B closed");
+    assert_eq!(a["state"], "complete");
+    assert_eq!(b["state"], "complete");
+    // The gate in one assertion: despite priority 0, B started only after A closed.
+    let a_closed = a["times"]["closed"].as_str().unwrap();
+    let b_start = b["times"]["start"].as_str().unwrap();
+    assert!(
+        b_start >= a_closed,
+        "B (P0) must wait for A: B started {} but A closed {}",
+        b_start,
+        a_closed
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A FAILED dependency never releases the dependent: when A exhausts its
+/// attempts, B lands in `todo` carrying a note that names A — it never
+/// dispatches, and the engine still reaches idle (no silent hang).
+#[test]
+fn failed_dependency_lands_dependent_in_todo() {
+    let (root, stub) = setup_project("depfail", 1, 200); // max_attempts 1 → first failure is terminal
+    std::fs::create_dir_all(root.join("depb")).unwrap();
+    seed(&root, &workitem_json("dep-a", "code", "doomed foundation", "./src", "FAIL_TRIGGER", "", ""));
+    seed(
+        &root,
+        r#"{"workid":"dep-b","title":"dep b","type":"code","state":"queued","source":"user","priority":0,"risk":0,"codepath":"./depb","depends_on":["dep-a"],"context":[],"testfiles":[],"prework":[],"mainwork":"build on the foundation","postwork":[],"output":"","attempts":0,"lasterror":"","times":{"added":"2026-08-11T00:00:00Z","start":"","preworkdone":"","mainworkdone":"","postworkdone":"","closed":""}}"#,
+    );
+
+    run_engine(&root, &stub, Duration::from_secs(120));
+
+    let closed = closed_items(&root);
+    let a = closed.iter().find(|i| i["workid"] == "dep-a").expect("A closed");
+    assert_eq!(a["state"], "failed");
+    assert!(!closed.iter().any(|i| i["workid"] == "dep-b"), "B must never run or close");
+    let open = open_items(&root);
+    let b = open.iter().find(|i| i["workid"] == "dep-b").expect("B stays open");
+    assert_eq!(b["state"], "todo", "failed dependency flips the dependent to todo for human review");
+    let note = b["lasterror"].as_str().unwrap();
+    assert!(
+        note.contains("DEPENDENCY FAILED") && note.contains("dep-a"),
+        "note names the failed dependency: {}",
+        note
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `iter add` dependency plumbing: unique suffixes resolve to full workids
+/// (last-12 is the convention), ambiguous or unknown suffixes REFUSE with exit
+/// 2 rather than guessing, and a cycle is refused with the path named.
+#[test]
+fn add_resolves_suffixes_and_refuses_cycles() {
+    let (root, _stub) = setup_project("depadd", 3, 200);
+    seed(&root, &workitem_json("e2e-dep-parent-123456789abc", "code", "parent", "./src", "parent work", "", ""));
+    seed(&root, &workitem_json("e2e-dep-other-99999999-9abc", "code", "other", "./src", "other work", "", ""));
+
+    let add = |extra: &[&str]| {
+        let mut args = vec!["add", "--project", root.to_str().unwrap(), "--type", "code", "--mainwork", "child work"];
+        args.extend_from_slice(extra);
+        Command::new(BIN).args(&args).output().unwrap()
+    };
+
+    // Unique last-12 suffix resolves and is stored as the full workid.
+    let ok = add(&["--depends-on", "123456789abc", "--title", "gated child"]);
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    let open = open_items(&root);
+    let child = open.iter().find(|i| i["title"] == "gated child").expect("child added");
+    assert_eq!(child["depends_on"][0], "e2e-dep-parent-123456789abc");
+
+    // Ambiguous suffix: both seeds end in "9abc" — refused, exit 2.
+    let ambiguous = add(&["--depends-on", "9abc"]);
+    assert_eq!(ambiguous.status.code(), Some(2), "{}", String::from_utf8_lossy(&ambiguous.stderr));
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("ambiguous"));
+
+    // Unknown suffix: refused, exit 2.
+    let unknown = add(&["--depends-on", "no-such-item"]);
+    assert_eq!(unknown.status.code(), Some(2), "{}", String::from_utf8_lossy(&unknown.stderr));
+
+    // Cycle: an open item already depends on "cyc-a"; adding cyc-a depending
+    // back on it must refuse with the path named.
+    seed(
+        &root,
+        r#"{"workid":"cyc-b-000000000000","title":"cyc b","type":"code","state":"queued","source":"user","priority":5,"risk":0,"codepath":"./src","depends_on":["cyc-a-111111111111"],"context":[],"testfiles":[],"prework":[],"mainwork":"b","postwork":[],"output":"","attempts":0,"lasterror":"","times":{"added":"2026-08-11T00:00:00Z","start":"","preworkdone":"","mainworkdone":"","postworkdone":"","closed":""}}"#,
+    );
+    let f = root.join("cycle-item.json");
+    std::fs::write(&f, r#"{"workid":"cyc-a-111111111111","type":"code","mainwork":"a","depends_on":["cyc-b-000000000000"]}"#).unwrap();
+    let cycle = Command::new(BIN)
+        .args(["add", "--project", root.to_str().unwrap(), "--file", f.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(cycle.status.code(), Some(2), "{}", String::from_utf8_lossy(&cycle.stderr));
+    let err = String::from_utf8_lossy(&cycle.stderr);
+    assert!(err.contains("cycle") && err.contains("111111111111") && err.contains("000000000000"), "{}", err);
+    let _ = std::fs::remove_dir_all(&root);
+}

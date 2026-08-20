@@ -289,6 +289,17 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
             }
         }
 
+        // Dependency housekeeping: a queued item whose dependency closed
+        // FAILED (or vanished) can never dispatch — flip it to `todo` with the
+        // blocker named, so a human reviews it instead of a silent hang, and
+        // it never runs on a broken foundation.
+        if !stop_picking {
+            let _q = shared.queue_mutex.lock().unwrap();
+            for (workid, why) in flip_failed_dependents(&shared.queue()) {
+                logging::warn("engine", &format!("{} → todo: {}", short(&workid), why));
+            }
+        }
+
         if !stop_picking && !holding {
             let agent_defs = agents::discover(&project_root);
             // Fill slots in global priority order: every pass offers the types that
@@ -434,6 +445,48 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
     }
 }
 
+/// A FAILED dependency never releases the dependent: queued (and retryable
+/// failed) items whose dependency can never satisfy — closed failed, or
+/// missing — flip to `todo` with a note naming the failed dependency, the same
+/// human-review bucket `iter reject` uses (failure births reviewable work).
+/// `todo` items with dependencies are untouched: the gate applies to dispatch
+/// of QUEUED items only. Returns the (workid, reason) pairs flipped.
+fn flip_failed_dependents(queue: &Queue) -> Vec<(String, String)> {
+    let gated = |i: &WorkItem| {
+        !i.depends_on.is_empty()
+            && (i.state == workitems::STATE_QUEUED || i.state == workitems::STATE_FAILED)
+    };
+    let items = queue.load();
+    if !items.iter().any(gated) {
+        return Vec::new();
+    }
+    let closed = queue.load_closed();
+    let flips: Vec<(String, String)> = items
+        .iter()
+        .filter(|i| gated(i))
+        .filter_map(|i| match workitems::dep_status(i, &items, &closed) {
+            workitems::DepStatus::Failed(why) => Some((i.workid.clone(), why)),
+            _ => None,
+        })
+        .collect();
+    if flips.is_empty() {
+        return flips;
+    }
+    let apply = flips.clone();
+    let _ = queue.with_lock(move |items| {
+        for (workid, why) in &apply {
+            if let Some(it) = items.iter_mut().find(|i| i.workid == *workid) {
+                if it.state == workitems::STATE_QUEUED || it.state == workitems::STATE_FAILED {
+                    it.state = workitems::STATE_TODO.into();
+                    it.lasterror = format!("DEPENDENCY FAILED: {}", why);
+                    it.times.start = String::new();
+                }
+            }
+        }
+    });
+    flips
+}
+
 fn summarize(items: &[WorkItem], running: usize) -> String {
     let count = |s: &str| items.iter().filter(|i| i.state == s).count();
     format!(
@@ -467,6 +520,8 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
     let now = chrono::Utc::now();
     let code_root = config::code_root(&shared.project_root, &cfg);
     let occupied: Vec<(PathBuf, Vec<String>)> = shared.running_paths.lock().unwrap().values().cloned().collect();
+    // Closed archive, loaded once per pick and only if a candidate has deps.
+    let mut closed_cache: Option<Vec<WorkItem>> = None;
     let mut best: Option<usize> = None;
     let mut best_repairs: Vec<String> = Vec::new();
     for (i, item) in items.iter().enumerate() {
@@ -478,6 +533,16 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
         };
         if !slot_ok || !item.eligible(&cfg, now) || deferred.contains(&item.workid) {
             continue;
+        }
+        // Dependency gate (features/workitem_dependency.md): evaluated BEFORE
+        // the lock checks. An unsatisfied dependency keeps the item visibly
+        // queued; a FAILED dependency is handled by flip_failed_dependents at
+        // the tick boundary, so both just skip here.
+        if !item.depends_on.is_empty() {
+            let closed = closed_cache.get_or_insert_with(|| queue.load_closed());
+            if workitems::dep_status(item, &items, closed) != workitems::DepStatus::Satisfied {
+                continue;
+            }
         }
         // Keep moving down the queue: a candidate that cannot run right now — its
         // codepath overlaps a running item's scope, or an on-disk lock (another
@@ -1424,6 +1489,94 @@ mod tests {
         let mut ignoring = code.clone();
         ignoring.codepath_ignore = vec!["test/".into()];
         assert!(disjointness_repairs(&ignoring, &cand_path, &items, &code_root, "test").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The dependency dispatch gate (workitem_dependency.md): a queued item with
+    // an unsatisfied dependency is never dispatched, however urgent.
+    #[test]
+    fn dependency_gate_blocks_dispatch() {
+        let root = std::env::temp_dir().join(format!("iterloop-depgate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["a", "b"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let shared = test_shared(&root);
+        let a = WorkItem {
+            workid: "dep-a".into(),
+            item_type: "code".into(),
+            state: workitems::STATE_IN_PROGRESS.into(),
+            codepath: "a".into(),
+            ..Default::default()
+        };
+        // B is MORE urgent (P0) and on a disjoint codepath — only the gate
+        // holds it back; break the gate and this test goes red.
+        let b = WorkItem {
+            workid: "dep-b".into(),
+            item_type: "code".into(),
+            priority: 0,
+            codepath: "b".into(),
+            depends_on: vec!["dep-a".into()],
+            ..Default::default()
+        };
+        shared.queue().append(&a).unwrap();
+        shared.queue().append(&b).unwrap();
+        assert!(pick_next(&shared, &["code"], false).is_none(), "B must not dispatch while its dependency is open");
+
+        // A closes complete (no descendants) → B dispatches.
+        let mut done = a.clone();
+        done.state = workitems::STATE_COMPLETE.into();
+        shared.queue().close(&done).unwrap();
+        let picked = pick_next(&shared, &["code"], false).expect("satisfied dependency releases the item");
+        assert_eq!(picked.workid, "dep-b");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A FAILED dependency flips the dependent to `todo` with the blocker named
+    // — never a silent hang, never a run on a broken foundation. A `todo` item
+    // with dependencies is untouched (state semantics pinned).
+    #[test]
+    fn failed_dependency_flips_queued_to_todo() {
+        let root = std::env::temp_dir().join(format!("iterloop-depfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let shared = test_shared(&root);
+        let queue = shared.queue();
+        let a_failed = WorkItem { workid: "dep-a".into(), state: workitems::STATE_FAILED.into(), ..Default::default() };
+        queue.append_closed(&a_failed).unwrap();
+        let b = WorkItem {
+            workid: "dep-b".into(),
+            item_type: "code".into(),
+            codepath: "b".into(),
+            depends_on: vec!["dep-a".into()],
+            ..Default::default()
+        };
+        let parked = WorkItem {
+            workid: "dep-c".into(),
+            item_type: "code".into(),
+            state: workitems::STATE_TODO.into(),
+            depends_on: vec!["dep-a".into()],
+            ..Default::default()
+        };
+        queue.append(&b).unwrap();
+        queue.append(&parked).unwrap();
+
+        let flips = flip_failed_dependents(&queue);
+        assert_eq!(flips.len(), 1, "only the QUEUED dependent flips: {:?}", flips);
+        assert_eq!(flips[0].0, "dep-b");
+        let items = queue.load();
+        let b_now = items.iter().find(|i| i.workid == "dep-b").unwrap();
+        assert_eq!(b_now.state, workitems::STATE_TODO);
+        assert!(
+            b_now.lasterror.contains("DEPENDENCY FAILED") && b_now.lasterror.contains("dep-a"),
+            "note names the failed dependency: {}",
+            b_now.lasterror
+        );
+        let c_now = items.iter().find(|i| i.workid == "dep-c").unwrap();
+        assert_eq!(c_now.state, workitems::STATE_TODO);
+        assert!(c_now.lasterror.is_empty(), "todo items are untouched until queued");
+        // And nothing dispatches.
+        assert!(pick_next(&shared, &["code"], false).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

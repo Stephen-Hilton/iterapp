@@ -79,6 +79,16 @@ enum Command {
         /// the label so the non-convergence guard can count the loop's laps)
         #[arg(long = "source-testgroup")]
         source_testgroup: Option<String>,
+        /// This item must not dispatch until the named work item closes complete
+        /// (descendants included). A workid or any unambiguous suffix — the
+        /// convention is the last 12 chars, what the webapp shows (repeatable)
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+        /// Satisfy dependencies on the named items' own completion only,
+        /// ignoring the items they created (plan items normally wait for
+        /// their descendants too)
+        #[arg(long = "depends-on-shallow")]
+        depends_on_shallow: bool,
     },
     /// Synchronous critical review: runs the `_critic.md` persona as a subprocess
     /// and prints its feedback to stdout — no work items involved
@@ -246,8 +256,8 @@ fn main() {
     let code = match cli.command {
         Command::Start { project, port } => cmd_start(project, port),
         Command::Run { project, once, until_idle } => cmd_run(project, once, until_idle),
-        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup } => {
-            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup)
+        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow } => {
+            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow)
         }
         Command::Critreview { project, file, context, max_retry } => {
             cmd_critreview(project, file, context, max_retry)
@@ -360,6 +370,8 @@ fn cmd_add(
     risk: Option<i64>,
     source: Option<String>,
     source_testgroup: Option<String>,
+    depends_on: Vec<String>,
+    depends_on_shallow: bool,
 ) -> i32 {
     let cfg = config::load(&project);
     let mut item: WorkItem = match &file {
@@ -401,6 +413,12 @@ fn cmd_add(
     if let Some(v) = source_testgroup {
         item.source_testgroup = v;
     }
+    if !depends_on.is_empty() {
+        item.depends_on = depends_on;
+    }
+    if depends_on_shallow {
+        item.depends_on_shallow = true;
+    }
 
     if item.item_type.is_empty() || item.mainwork.is_empty() {
         eprintln!("error: a work item needs at least --type and --mainwork (or a --file providing them)");
@@ -421,6 +439,15 @@ fn cmd_add(
     if item.state.is_empty() {
         item.state = workitems::STATE_QUEUED.into();
     }
+    // Provenance for transitive dependency satisfaction: an `iter add` run
+    // inside an engine work item stamps that item as this one's creator.
+    if item.created_by.is_empty() {
+        if let Ok(wid) = std::env::var("ITER_WORKID") {
+            if !wid.is_empty() {
+                item.created_by = wid;
+            }
+        }
+    }
 
     // Warn at add, enforce at pick.
     let known: Vec<String> = agents::discover(&project).into_iter().map(|a| a.type_name).collect();
@@ -433,6 +460,17 @@ fn cmd_add(
     }
 
     let queue = Queue::new(&project, &cfg);
+
+    // Dependency resolution: suffixes → full workids, refusing unknown or
+    // ambiguous suffixes and cycles (exit 2 — refuse, never guess).
+    if !item.depends_on.is_empty() {
+        let open = queue.load();
+        let closed = queue.load_closed();
+        if let Err(e) = workitems::resolve_depends_on(&mut item, &open, &closed) {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    }
 
     // Non-convergence guard (2026-08-17): the escalation cycle is fix item →
     // plan → build → tests still red → fix item → plan again. Two full laps are
@@ -1007,22 +1045,32 @@ fn cmd_status(project: PathBuf) -> i32 {
             println!("  {}: {}", state, n);
         }
     }
+    let closed_items = queue.load_closed();
     for item in &items {
+        // Dependency gate: name the blocker on gated items (last-12, the
+        // webapp-header convention), or the reason the gate can never open.
+        let dep_note = if item.depends_on.is_empty() {
+            String::new()
+        } else {
+            match workitems::dep_status(item, &items, &closed_items) {
+                workitems::DepStatus::Satisfied => String::new(),
+                workitems::DepStatus::Blocked(id) => format!(" blocked-by: {}", workitems::short12(&id)),
+                workitems::DepStatus::Failed(why) => format!(" dep-failed: {}", why),
+            }
+        };
         println!(
-            "  [{}] {} \"{}\" type={} prio={} source={} attempts={}",
+            "  [{}] {} \"{}\" type={} prio={} source={} attempts={}{}",
             item.state,
             &item.workid.chars().take(8).collect::<String>(),
             item.title,
             item.item_type,
             item.priority,
             item.source,
-            item.attempts
+            item.attempts,
+            dep_note
         );
     }
-    let closed = std::fs::read_to_string(&queue.closed_path)
-        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
-        .unwrap_or(0);
-    println!("closed: {} archived", closed);
+    println!("closed: {} archived", closed_items.len());
 
     let mut locks_found = Vec::new();
     collect_locks(&project, &mut locks_found);

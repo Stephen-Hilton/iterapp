@@ -12,7 +12,7 @@
     --shadow: 0 8px 28px rgba(20, 26, 40, 0.16);
     --row-shadow: 0 1px 2px rgba(20, 26, 40, 0.07);
 
-    --s-total-bg: #7c3aed;   --s-total-fg: #ffffff;
+    --s-total-bg: #1b3358;   --s-total-fg: #ffffff; /* dark navy — distinct from Scheduled's purple */
     --s-complete-bg: #1a9a4a; --s-complete-fg: #ffffff;
     --s-progress-bg: #e8a71c; --s-progress-fg: #241a02;
     --s-queued-bg: #2f7fd6;  --s-queued-fg: #ffffff;
@@ -98,6 +98,11 @@
   }
   .nav a:hover { background: var(--surface2); color: var(--text); }
   .nav a.here { background: var(--surface2); color: var(--text); font-weight: 600; }
+  /* child row under a server entry (its per-server Settings page) */
+  .nav a.srvchild {
+    margin-left: 19px; padding: 3.5px 9px; font-size: 12px;
+    border-left: 2px solid var(--border); border-radius: 0 6px 6px 0;
+  }
 
   /* ---------- main ---------- */
   .main { padding: 16px 22px 60px; min-width: 0; }
@@ -115,7 +120,7 @@
   .enginechip .lbl { color: var(--text-dim); font-weight: 500; }
 
   /* ---------- summary strip ---------- */
-  .summary { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; }
+  .summary { display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; }
   .sumbtn {
     border: none; border-radius: 9px; padding: 9px 6px 7px;
     display: grid; justify-items: center; gap: 1px;
@@ -497,12 +502,10 @@
     </div>
     <div class="navgroup">
       <div class="navhead">Running Servers</div>
-      <nav class="nav" id="serverSwitch"></nav>
       <!-- One running server per project; iterloop and iterapp are its two
-           halves, so THIS server's settings live here, under the server list. -->
-      <nav class="nav">
-        <a href="#/settings" data-view="settings">Settings</a>
-      </nav>
+           halves, so THIS server's Settings renders as an indented CHILD of
+           the current server's row (injected by the server-list renderer). -->
+      <nav class="nav" id="serverSwitch"></nav>
     </div>
   </aside>
 
@@ -575,6 +578,19 @@ const PREPOST = ['deploy','git-commit','git-pr','git-pull','git-push','iterloop-
 const prepostNames = () => PREPOST.map(p => p.name);
 const prepostExec = n => (PREPOST.find(p => p.name === n) || {}).exec || 'agent';
 const AGENTS = ['plan','code','testwriter','usecase','refactor','ingest'];
+
+/* Live agent definitions (fetched at startup when LIVE, mock otherwise). The
+   New WorkItem form reads default_codepath_resolved / default_codepath_ignore
+   from here to pre-fill fields when an agent type is picked. */
+let AGENT_DEFS = [];
+const agentDefaults = (t) => {
+  const a = AGENT_DEFS.find(x => x.type === t) || {};
+  return {
+    codepath: (a.default_codepath_resolved || '').trim(),
+    ignore: (a.default_codepath_ignore_resolved || a.default_codepath_ignore || '')
+      .split(',').map(s => s.trim()).filter(Boolean),
+  };
+};
 let PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // replaced by /api/meta in LIVE mode
 let HOME = '/Users/stephen.hilton';                              // replaced by /api/meta in LIVE mode
 let REQS_DIR = '';   // project-wide reqs dir (global bizreq/techreq) — replaced by /api/meta in LIVE mode
@@ -728,7 +744,7 @@ function literalContextLines(){
 function mk(over) {
   return Object.assign({
     workid: uuid(), title:'', type:'code', state:'todo', source:'user',
-    priority:5, risk:0, codepath:'./src', codepath_ignore:[],
+    priority:5, risk:0, codepath:'./src', codepath_ignore:[], depends_on:[],
     context:[], testfiles:[],
     prework:[], mainwork:'', postwork:[], output:'', attempts:0, lasterror:'',
     tests:null,
@@ -902,6 +918,28 @@ function testChip(item){
   return `<span class="chip mono" style="background:${bg};color:${fg}" title="Tests passed / total">T:${t.passed}/${t.total} · ${p}%</span>`;
 }
 
+/* Dependency chain chips (workitem_dependency.md). The header is what gets
+   scanned, so gated items name their blocker there: `dep_status` is computed
+   server-side (open queue + full closed archive, descendants included) and
+   injected by /api/workitems on items that have depends_on. */
+function id12(id){ return String(id).slice(-12); }
+function depChip(item){
+  const deps = item.depends_on || [];
+  if (!deps.length) return '';
+  const ids = deps.map(id12).join(', ');
+  const shallow = item.depends_on_shallow ? ' (shallow: dependency completion only, descendants ignored)' : '';
+  const ds = item.dep_status;
+  if (ds && ds.state === 'failed')
+    return `<span class="chip" style="background:var(--s-failed-bg);color:#fff" title="${esc(ds.by || 'dependency failed')} — flips to todo for human review">⛓ dep failed</span>`;
+  if (ds && ds.state === 'blocked')
+    return `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="Not dispatchable until dependencies close complete${shallow} — waits for: ${esc(ids)}">⛓ blocked-by: ${esc(id12(ds.by))}</span>`;
+  return `<span class="chip kv mono" title="Dependencies${ds ? ' satisfied' : ''}${shallow}: ${esc(ids)}">⛓ after: ${esc(ids)}</span>`;
+}
+function blocksChip(item){
+  const n = items.filter(o => (o.depends_on || []).includes(item.workid) && !o.times.closed).length;
+  return n ? `<span class="chip kv mono" title="Open work items gated on this one finishing">blocks: ${n}</span>` : '';
+}
+
 function sourceLabel(src){
   if (src === 'user') return 'User';
   if (src === 'error') return 'Error';
@@ -925,6 +963,7 @@ function renderSummary(){
     ['todo','☐ ToDo','var(--s-todo-bg)','var(--s-todo-fg)'],
     ['failed','✕ Failed','var(--s-failed-bg)','var(--s-failed-fg)'],
     ['paused','❙❙ Paused','var(--s-paused-bg)','var(--s-paused-fg)'],
+    ['scheduled','⏱ Scheduled','var(--s-scheduled-bg)','var(--s-scheduled-fg)'],
   ];
   $('summary').className = 'summary' + (activeFilters.size ? ' filtered' : '');
   $('summary').innerHTML = defs.map(([key,label,bg,fg]) => {
@@ -1015,6 +1054,7 @@ function renderRows(){
             <span class="chip" style="background:var(--s-queued-bg);color:#fff" title="Requested by">${esc(sourceLabel(item.source))}</span>
             ${testChip(item)}
             ${item.source_testgroup ? `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="Born from this testgroup (sweep provenance)${(item.source_tests||[]).length ? ' — red at birth: ' + esc(item.source_tests.join(', ')) : ''}">TG: ${esc(item.source_testgroup)}</span>` : ''}
+            ${depChip(item)}${blocksChip(item)}
             ${item.sched && item.sched.kind ? `<span class="chip mono" style="background:var(--s-scheduled-bg);color:#fff" title="Schedule — last fired: ${esc(item.sched.last_fired || 'never')}">⏱ ${esc(schedDesc(item.sched))}</span>` : ''}
             ${item.source_schedule ? `<span class="chip" style="background:var(--s-scheduled-bg);color:#fff" title="Born from schedule ${esc(item.source_schedule)}">SCHED RUN</span>` : ''}
             ${item.exec === 'shell' ? `<span class="chip mono" style="background:var(--s-paused-bg);color:#fff" title="exec: shell — the engine runs the steps as shell commands; no LLM">⚙ shell</span>` : ''}
@@ -1294,7 +1334,13 @@ function openForm(mode, source, priorState){
       <div>
         <textarea id="f_codepath_ignore" rows="1" style="width:100%" class="mono"
           placeholder="subtrees carved OUT of the lock scope — one .gitignore-style pattern per line, relative to CodePath (e.g. test/)">${esc((d.codepath_ignore||[]).join('\n'))}</textarea>
-        <div class="pathhint" style="opacity:.75">this item won’t lock or touch these subtrees, so another work item can own them in parallel (e.g. code ignores <span class="mono">test/</span> while a testwriter locks it)</div>
+        <div class="pathhint" style="opacity:.75">this item won’t lock or touch these subtrees, so another work item can own them in parallel (e.g. code ignores <span class="mono">test/</span> while a testwriter locks it) · special: <span class="mono">**</span> carves out EVERYTHING = lockless — only for run-only items that write nothing (the Test Loop sweep), never for items that edit files</div>
+      </div>
+      <span class="flabel top-align">Depends on</span>
+      <div>
+        <textarea id="f_depends" rows="1" style="width:100%" class="mono"
+          placeholder="work items this one must wait for — one workid or unique suffix (last-12 shown in the header) per line">${esc((d.depends_on||[]).join('\n'))}</textarea>
+        <div class="pathhint" style="opacity:.75">gates dispatch of QUEUED items only: not runnable until each dependency closes complete AND everything it created closed complete too · a FAILED dependency flips this item to todo for review · unknown/ambiguous ids and cycles are refused on save</div>
       </div>
       <span class="flabel top-align">Context</span>
       <div>
@@ -1338,6 +1384,32 @@ function openForm(mode, source, priorState){
   $('f_prelit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('prework', e.target); }});
   $('f_postlit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('postwork', e.target); }});
   $('f_codepath').addEventListener('input', e => { $('f_pathhint').textContent = '→ ' + absCodepath(e.target.value); });
+  // Per-agent defaults (create mode only): picking an agent type pre-fills
+  // codepath / codepath_ignore from the agent def's default_codepath(_ignore)
+  // frontmatter, so conventions (usecase agent → usecases dir + test-dir carve)
+  // fill themselves in. A field is only overwritten while it still holds a
+  // default — the generic './src' / empty, or a default this form applied on an
+  // earlier selection. User-typed values are never clobbered.
+  if (mode === 'create') {
+    const applied = { codepath: null, ignore: null };
+    const applyAgentDefaults = () => {
+      const nd = agentDefaults($('f_type').value);
+      const cp = $('f_codepath'), ig = $('f_codepath_ignore');
+      const cpVal = cp.value.trim();
+      if (cpVal === './src' || cpVal === '' || cpVal === applied.codepath) {
+        const v = nd.codepath || './src';
+        if (cp.value !== v) { cp.value = v; $('f_pathhint').textContent = '→ ' + absCodepath(v); }
+        applied.codepath = nd.codepath ? v : null;
+      }
+      const igVal = ig.value.trim();
+      if (igVal === '' || igVal === applied.ignore) {
+        ig.value = nd.ignore.join('\n');
+        applied.ignore = nd.ignore.length ? ig.value : null;
+      }
+    };
+    $('f_type').addEventListener('change', applyAgentDefaults);
+    applyAgentDefaults();
+  }
   // Scheduler source: reveal the schedule fields, restrict the save-state options
   // to scheduled|paused, and nudge default priority to 2 ("run soon after the
   // scheduled time" — lower = sooner). All reversible by switching Source back.
@@ -1385,6 +1457,7 @@ function saveDraft(targetState){
   d.source = $('f_source').value;
   d.codepath = absCodepath($('f_codepath').value);   // entered relative, stored absolute
   d.codepath_ignore = $('f_codepath_ignore').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  d.depends_on = $('f_depends').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.context = $('f_context').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.testfiles = $('f_testfiles').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.mainwork = $('f_mainwork').value;
@@ -1403,7 +1476,7 @@ function saveDraft(targetState){
     if (mode === 'edit') {
       const fields = { title: d.title, type: d.type, priority: d.priority, risk: d.risk,
         source: d.source, codepath: d.codepath, codepath_ignore: d.codepath_ignore,
-        context: d.context, testfiles: d.testfiles,
+        depends_on: d.depends_on, context: d.context, testfiles: d.testfiles,
         prework: d.prework, postwork: d.postwork, mainwork: d.mainwork,
         exec: d.exec, sched: d.sched };
       const stateAction = targetState === 'queued' ? 'queue' : targetState === 'todo' ? 'todo'
@@ -1818,12 +1891,19 @@ const AGENT_FIELDS = {
   model_flags: ['', 'text', 'extra claude CLI flags, e.g. --dangerously-skip-permissions'],
   llm_run_mode: ['headless', 'text', 'reserved — headless is the only mode today'],
   sleep_interval_sec: [30, 'num', 'reserved — parsed but not used by the engine yet'],
+  default_codepath: ['', 'text', 'pre-fills CodePath when this agent type is picked in New WorkItem — {usecase_dir}/{interface_dir}/{test_dir} placeholders resolve per project; empty = leave the field alone'],
+  default_codepath_ignore: ['', 'text', 'pre-fills CodePath ignore (comma-separated patterns; same placeholders resolve) — e.g. the usecase agent carves {test_dir}/ so testwriters work in parallel'],
 };
 const MOCK_AGENT_DEFS = AGENTS.map(t => ({
   type: t, description: `the ${t} agent`, visible: true,
   max_agent_count: t === 'code' ? 3 : 1, max_work_timeout_sec: 3600, max_connection_timeout_sec: 30,
   model: 'opus', model_flags: '--dangerously-skip-permissions', llm_run_mode: 'headless',
-  sleep_interval_sec: 30, body: `# Agent Definition: ${t}\n\n(open via iter start to edit the real prompt)`,
+  sleep_interval_sec: 30,
+  default_codepath: t === 'usecase' ? '{usecase_dir}' : '',
+  default_codepath_resolved: t === 'usecase' ? 'usecases' : '',
+  default_codepath_ignore: t === 'usecase' ? '{test_dir}/' : '',
+  default_codepath_ignore_resolved: t === 'usecase' ? 'test/' : '',
+  body: `# Agent Definition: ${t}\n\n(open via iter start to edit the real prompt)`,
 }));
 
 function agentFieldsHtml(a){
@@ -2948,13 +3028,19 @@ async function renderServers(){
       }));
     } catch (e) { servers = []; }
   }
+  // Settings applies to THE SERVER YOU'RE BROWSING, so it renders as an
+  // indented child of the current server's row (other servers get no child —
+  // their settings live in their own webapp).
+  const onSettings = location.hash.replace(/^#\//,'') === 'settings';
+  const settingsChild = `<a href="#/settings" data-view="settings" class="srvchild ${onSettings ? 'here' : ''}"
+       title="this server's settings (engine config + project settings)">Settings</a>`;
   $('serverSwitch').innerHTML = servers.map(s => `
     <a href="#" class="srv ${s.current ? 'here' : ''}" data-server="${esc(s.slug)}"
        title="http://${esc(s.slug)}.localhost:${s.port}/">
       <span class="dot" style="background:${slugColor(s.slug)}"></span>
       ${esc(s.slug)}
-      <small>:${s.port}</small></a>`).join('')
-    || '<span style="color:var(--text-dim);font-size:11.5px;padding:2px 9px">only this one</span>';
+      <small>:${s.port}</small></a>${s.current ? settingsChild : ''}`).join('')
+    || `<span style="color:var(--text-dim);font-size:11.5px;padding:2px 9px">only this one</span>${settingsChild}`;
 }
 
 $('serverSwitch').addEventListener('click', (e) => {
@@ -2967,6 +3053,10 @@ $('serverSwitch').addEventListener('click', (e) => {
   else toast(`(mock) would open http://${s.slug}.localhost:${s.port}/`);
 });
 
+// Agent defs feed the New WorkItem form's per-type defaults; fetched once at
+// startup (a failure just means no pre-fill — the form still works).
+AGENT_DEFS = LIVE ? [] : MOCK_AGENT_DEFS;
+if (LIVE) api('/api/agents').then(d => { AGENT_DEFS = d.agents || []; }).catch(() => {});
 render();
 navTo(location.hash.replace(/^#\//,'') || 'workitems');
 renderServers();

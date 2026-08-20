@@ -85,6 +85,14 @@ experience of simply logging in, so they don't belong in the use-case.
   human can narrow the codepath) with diagnose-or-escalate guidance. New
   use-cases declare their E2E testgroup at creation with empty testlists, so
   the sweep's authoring flow fills them.
+- **New-WorkItem defaults live on agent defs** (2026-08-18):
+  `default_codepath` / `default_codepath_ignore` frontmatter keys, with
+  `{usecase_dir}`/`{interface_dir}`/`{test_dir}` placeholders resolved
+  per-project by the server; the form pre-fills them when a type is picked and
+  never clobbers user-typed values. The usecase agent ships
+  `default_codepath: {usecase_dir}`, `default_codepath_ignore: {test_dir}/` —
+  lock the usecases tree, carve every per-usecase test dir for parallel
+  testwriters.
 - **Non-convergence guard, 3rd lap** (owner call: allow two laps): escalated
   plans carry `--source-testgroup`; `iter add` counts plans per testgroup and
   holds the third in `todo` with a NON-CONVERGENCE note — a human breaks the
@@ -102,9 +110,19 @@ Handed a use-case idea from the user, the agent:
      1-character password").
    The rejection spells out WHY and what the user might change to fix it; the
    user re-evaluates the todo item (edit + requeue), or deletes it.
-2. **Creates the use-case object**: `<short-name>.usecase.iter.md` in
-   `$ITER_USECASE_DIR` — frontmatter (`name`, `description`, `participants:`)
-   plus a plain-language narrative of what the use-case is expected to do.
+2. **Creates the use-case as a FOLDER** (layout decision 2026-08-18, mirroring
+   PDY-TECH-030's folder-owns-its-files law for C4 objects):
+
+       $ITER_USECASE_DIR/<short-name>/
+         <short-name>.usecase.iter.md    ← declaring file: name/description/participants + narrative
+         <test_dir>/testgroup.iter.md    ← E2E groups declared, testlists empty (sweep fills via authoring items)
+
+   The `testgroup:`/`test_dir:` keys on the usecase file use the project's
+   `test_dir` name (`tests` on pdy-dev, `test` by default). **NO marker file**
+   in usecase folders: markers declare C4 NODES, and a use-case is the overlay
+   ACROSS nodes — a marker here would mint a phantom object in the hierarchy
+   and double-sweep the folder. The `*usecase.iter.md` file is the declaring
+   file; its filename carries the role.
 3. **Identifies required C4 objects** from `iter markers` + the reqs docs
    (e.g. "User Auth" implies an API gateway and an auth key strategy — those
    architecture decisions **should** live in the global techreq/bizreq).

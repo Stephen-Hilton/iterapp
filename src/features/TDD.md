@@ -198,8 +198,11 @@ missing-key rule INVERTS for these two kinds: tests are their point, so no
 the explicit `testgroup: none` is the deliberate opt-out. Red runs of these
 groups span C4 objects, so their fix items scope to the code root (auto_fix
 false → todo, where a human can narrow the codepath) with diagnose-locally-or-
-escalate-to-plan guidance. The usecase agent declares the E2E testgroup (with
-empty testlists) at use-case creation, so coverage follows automatically.
+escalate-to-plan guidance. The usecase agent creates each use-case as a FOLDER
+(`usecases/<name>/` holding the usecase file + a `<test_dir>/` subtree, no
+marker — the same folder-owns-its-files law as C4 objects) and declares the
+E2E testgroup (with empty testlists) at creation, so coverage follows
+automatically.
 
 **Non-convergence guard (2026-08-17):** escalated plans carry
 `--source-testgroup "<label>"`, and `iter add` counts the laps — the fix →

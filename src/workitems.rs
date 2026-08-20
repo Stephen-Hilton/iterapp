@@ -49,6 +49,10 @@ fn is_agent_exec(s: &str) -> bool {
     s.is_empty() || s == EXEC_AGENT
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Times {
@@ -95,6 +99,23 @@ pub struct WorkItem {
     /// The schedule spec; only meaningful while state == "scheduled".
     #[serde(skip_serializing_if = "Sched::is_none")]
     pub sched: Sched,
+    /// Ordering gate: full workids this item must wait for. A queued item is
+    /// not dispatchable until every dependency is SATISFIED — closed complete,
+    /// and (unless depends_on_shallow) every item the dependency created is
+    /// itself closed complete, transitively. Evaluated before lock checks;
+    /// gates dispatch of QUEUED items only (a todo item stays parked as usual).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// Opt-out of transitive satisfaction: wait for the named items' own
+    /// completion only, ignoring the items they created (a plan item
+    /// "completes" the moment it spawns children — rarely what a caller wants).
+    #[serde(skip_serializing_if = "is_false")]
+    pub depends_on_shallow: bool,
+    /// Engine-recorded provenance: the workid of the work item whose agent ran
+    /// the `iter add` that created this item (from $ITER_WORKID). This is what
+    /// makes transitive dependency satisfaction possible.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub created_by: String,
     pub context: Vec<String>,
     pub testfiles: Vec<String>,
     pub prework: Vec<String>,
@@ -123,6 +144,9 @@ impl Default for WorkItem {
             source_schedule: String::new(),
             exec: EXEC_AGENT.into(),
             sched: Sched::default(),
+            depends_on: Vec::new(),
+            depends_on_shallow: false,
+            created_by: String::new(),
             context: Vec::new(),
             testfiles: Vec::new(),
             prework: Vec::new(),
@@ -179,6 +203,164 @@ impl WorkItem {
     pub fn failed_terminally(&self, cfg: &Config) -> bool {
         self.state == STATE_FAILED && self.attempts >= cfg.engine.max_attempts
     }
+}
+
+/// The last-12-characters view of a workid — what the webapp header shows and
+/// the suffix convention dependency notes use.
+pub fn short12(workid: &str) -> String {
+    let chars: Vec<char> = workid.chars().collect();
+    chars[chars.len().saturating_sub(12)..].iter().collect()
+}
+
+/// Where one item's `depends_on` stands right now, against the open queue and
+/// the closed archive.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DepStatus {
+    /// Every dependency closed complete (descendants included unless shallow).
+    Satisfied,
+    /// Waiting: the named workid (a dependency or one of its descendants) is
+    /// still open. The item stays visibly queued.
+    Blocked(String),
+    /// This dependency can never satisfy (closed failed, or missing) — the
+    /// message says which and why. The engine flips the dependent to `todo`.
+    Failed(String),
+}
+
+/// Evaluate an item's dependency gate. First non-satisfied dependency wins.
+pub fn dep_status(item: &WorkItem, open: &[WorkItem], closed: &[WorkItem]) -> DepStatus {
+    for dep in &item.depends_on {
+        match one_dep_status(dep, item.depends_on_shallow, open, closed) {
+            DepStatus::Satisfied => {}
+            other => return other,
+        }
+    }
+    DepStatus::Satisfied
+}
+
+/// SATISFIED means the dependency closed COMPLETE — and its descendants too:
+/// a plan item "completes" the moment it spawns children, so unless shallow,
+/// every item the dependency created (via the engine-recorded `created_by`)
+/// must itself be closed complete, transitively. A dependency (or descendant)
+/// that closed FAILED never releases the dependent — that surfaces as Failed
+/// so the engine can flip the dependent to `todo` for human review, never a
+/// silent run on a broken foundation and never a silent hang.
+fn one_dep_status(dep: &str, shallow: bool, open: &[WorkItem], closed: &[WorkItem]) -> DepStatus {
+    if open.iter().any(|i| i.workid == dep) {
+        return DepStatus::Blocked(dep.to_string());
+    }
+    let Some(done) = closed.iter().rev().find(|i| i.workid == dep) else {
+        return DepStatus::Failed(format!(
+            "dependency {} found in neither the open queue nor the closed archive",
+            short12(dep)
+        ));
+    };
+    if done.state != STATE_COMPLETE {
+        return DepStatus::Failed(format!("dependency {} closed {}", short12(dep), done.state));
+    }
+    if shallow {
+        return DepStatus::Satisfied;
+    }
+    let mut stack = vec![dep.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(child) = open.iter().find(|i| i.created_by == id) {
+            return DepStatus::Blocked(child.workid.clone());
+        }
+        for child in closed.iter().filter(|i| i.created_by == id) {
+            if child.state != STATE_COMPLETE {
+                return DepStatus::Failed(format!(
+                    "descendant {} of dependency {} closed {}",
+                    short12(&child.workid),
+                    short12(dep),
+                    child.state
+                ));
+            }
+            stack.push(child.workid.clone());
+        }
+    }
+    DepStatus::Satisfied
+}
+
+/// Resolve each `depends_on` entry — a full workid or any unambiguous suffix
+/// (the convention is the last 12 characters, what the webapp header shows) —
+/// against open and closed items, then refuse cycles. An unknown or ambiguous
+/// suffix REFUSES the add rather than guessing; a dependency may name a closed
+/// item (satisfied immediately — useful for idempotent re-adds). On success
+/// `item.depends_on` holds deduplicated full workids.
+pub fn resolve_depends_on(item: &mut WorkItem, open: &[WorkItem], closed: &[WorkItem]) -> Result<(), String> {
+    let mut resolved: Vec<String> = Vec::new();
+    for entry in &item.depends_on {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let mut matches: Vec<&str> = open
+            .iter()
+            .chain(closed.iter())
+            .map(|i| i.workid.as_str())
+            .filter(|id| *id == entry || id.ends_with(entry))
+            .collect();
+        matches.sort();
+        matches.dedup();
+        match matches.len() {
+            0 => return Err(format!("depends_on \"{}\" matches no work item (open or closed)", entry)),
+            1 => {
+                let id = matches[0].to_string();
+                if id == item.workid {
+                    return Err(format!("depends_on \"{}\" is the item itself — a cycle of one", entry));
+                }
+                if !resolved.contains(&id) {
+                    resolved.push(id);
+                }
+            }
+            n => {
+                return Err(format!(
+                    "depends_on \"{}\" is ambiguous ({} work items end with it — use a longer suffix)",
+                    entry, n
+                ))
+            }
+        }
+    }
+    item.depends_on = resolved;
+    if let Some(path) = find_cycle(item, open) {
+        return Err(format!("depends_on creates a cycle: {}", path.join(" → ")));
+    }
+    Ok(())
+}
+
+/// Walk the dependency graph from `item` through the OPEN items' `depends_on`
+/// edges (closed items gate nothing, so no cycle can run through them). Any id
+/// revisited on the current path is a cycle; the returned path names it.
+fn find_cycle(item: &WorkItem, open: &[WorkItem]) -> Option<Vec<String>> {
+    let mut edges: std::collections::HashMap<&str, &[String]> =
+        open.iter().map(|i| (i.workid.as_str(), i.depends_on.as_slice())).collect();
+    edges.insert(item.workid.as_str(), item.depends_on.as_slice());
+
+    fn walk<'a>(
+        id: &'a str,
+        edges: &std::collections::HashMap<&'a str, &'a [String]>,
+        path: &mut Vec<&'a str>,
+    ) -> Option<Vec<String>> {
+        if let Some(pos) = path.iter().position(|p| *p == id) {
+            let mut cycle: Vec<String> = path[pos..].iter().map(|s| short12(s)).collect();
+            cycle.push(short12(id));
+            return Some(cycle);
+        }
+        path.push(id);
+        if let Some(deps) = edges.get(id) {
+            for dep in deps.iter() {
+                if let Some(cycle) = walk(dep.as_str(), edges, path) {
+                    return Some(cycle);
+                }
+            }
+        }
+        path.pop();
+        None
+    }
+    walk(item.workid.as_str(), &edges, &mut Vec::new())
 }
 
 /// The work-item queue: `.iter/.engine/workitems.jsonl` plus the append-only
@@ -401,6 +583,86 @@ mod tests {
         let queued_more_urgent = WorkItem { priority: 2, state: STATE_QUEUED.into(), ..Default::default() };
         assert!(failed.effective_priority() < queued_same.effective_priority(), "retry goes before equal queued work");
         assert!(queued_more_urgent.effective_priority() < failed.effective_priority(), "a genuinely urgent item still wins");
+    }
+
+    // The dependency gate (workitem_dependency.md): every guard proves it can fail.
+    #[test]
+    fn dependency_gate_states() {
+        let b = WorkItem { workid: "b".into(), depends_on: vec!["a".into()], ..Default::default() };
+        // Dependency still open (any state) → blocked, visibly waiting.
+        let open = vec![WorkItem { workid: "a".into(), state: STATE_IN_PROGRESS.into(), ..Default::default() }, b.clone()];
+        assert_eq!(dep_status(&b, &open, &[]), DepStatus::Blocked("a".into()));
+        // Closed complete with no descendants → satisfied.
+        let a_done = WorkItem { workid: "a".into(), state: STATE_COMPLETE.into(), ..Default::default() };
+        assert_eq!(dep_status(&b, &[b.clone()], &[a_done]), DepStatus::Satisfied);
+        // Closed failed NEVER releases the dependent.
+        let a_failed = WorkItem { workid: "a".into(), state: STATE_FAILED.into(), ..Default::default() };
+        assert!(matches!(dep_status(&b, &[b.clone()], &[a_failed]), DepStatus::Failed(_)));
+        // A missing dependency is a visible failure, not a silent hang.
+        assert!(matches!(dep_status(&b, &[b.clone()], &[]), DepStatus::Failed(_)));
+    }
+
+    #[test]
+    fn transitive_descendants_gate() {
+        // A plan item "completes" the moment it spawns children: A closed
+        // complete but its created child C is still open → B stays blocked.
+        let mut b = WorkItem { workid: "b".into(), depends_on: vec!["a".into()], ..Default::default() };
+        let a_done = WorkItem { workid: "a".into(), state: STATE_COMPLETE.into(), ..Default::default() };
+        let c_open = WorkItem { workid: "c".into(), created_by: "a".into(), ..Default::default() };
+        assert_eq!(dep_status(&b, &[b.clone(), c_open.clone()], &[a_done.clone()]), DepStatus::Blocked("c".into()));
+        // C closes complete → satisfied; an open grandchild re-blocks.
+        let c_done = WorkItem { workid: "c".into(), state: STATE_COMPLETE.into(), created_by: "a".into(), ..Default::default() };
+        assert_eq!(dep_status(&b, &[b.clone()], &[a_done.clone(), c_done.clone()]), DepStatus::Satisfied);
+        let g_open = WorkItem { workid: "g".into(), created_by: "c".into(), ..Default::default() };
+        assert_eq!(
+            dep_status(&b, &[b.clone(), g_open], &[a_done.clone(), c_done.clone()]),
+            DepStatus::Blocked("g".into())
+        );
+        // A descendant that closed failed poisons the gate — no silent run on
+        // a broken foundation.
+        let g_failed = WorkItem { workid: "g".into(), state: STATE_FAILED.into(), created_by: "c".into(), ..Default::default() };
+        assert!(matches!(
+            dep_status(&b, &[b.clone()], &[a_done.clone(), c_done, g_failed]),
+            DepStatus::Failed(_)
+        ));
+        // The shallow flag inverts: A's own completion is enough.
+        b.depends_on_shallow = true;
+        assert_eq!(dep_status(&b, &[b.clone(), c_open], &[a_done]), DepStatus::Satisfied);
+    }
+
+    #[test]
+    fn depends_on_resolution_and_cycles() {
+        let mk = |id: &str| WorkItem { workid: id.into(), ..Default::default() };
+        let open = vec![
+            mk("11111111-aaaa-bbbb-cccc-123456789abc"),
+            mk("22222222-aaaa-bbbb-cccc-aaaaaaaa9abc"),
+        ];
+        let closed =
+            vec![WorkItem { workid: "33333333-dddd-eeee-ffff-fedcba987654".into(), state: STATE_COMPLETE.into(), ..Default::default() }];
+        // The last-12 convention (what the webapp header shows) resolves.
+        let mut item = WorkItem { workid: "new".into(), depends_on: vec!["123456789abc".into()], ..Default::default() };
+        resolve_depends_on(&mut item, &open, &closed).unwrap();
+        assert_eq!(item.depends_on, vec!["11111111-aaaa-bbbb-cccc-123456789abc".to_string()]);
+        // A dependency may name a closed item (satisfied immediately).
+        let mut item = WorkItem { workid: "new".into(), depends_on: vec!["fedcba987654".into()], ..Default::default() };
+        resolve_depends_on(&mut item, &open, &closed).unwrap();
+        assert_eq!(item.depends_on, vec!["33333333-dddd-eeee-ffff-fedcba987654".to_string()]);
+        // Ambiguous suffix REFUSED, never guessed; unknown refused too.
+        let mut item = WorkItem { workid: "new".into(), depends_on: vec!["9abc".into()], ..Default::default() };
+        assert!(resolve_depends_on(&mut item, &open, &closed).unwrap_err().contains("ambiguous"));
+        let mut item = WorkItem { workid: "new".into(), depends_on: vec!["deadbeef".into()], ..Default::default() };
+        assert!(resolve_depends_on(&mut item, &open, &closed).unwrap_err().contains("matches no work item"));
+        // Self-dependency is a cycle of one.
+        let mut item = mk("11111111-aaaa-bbbb-cccc-123456789abc");
+        item.depends_on = vec!["123456789abc".into()];
+        assert!(resolve_depends_on(&mut item, &open, &closed).unwrap_err().contains("itself"));
+        // A→B→A refused with the cycle path named.
+        let mut b = mk("bbbbbbbb-2222-3333-4444-bbbbbbbbbbbb");
+        b.depends_on = vec!["aaaaaaaa-2222-3333-4444-aaaaaaaaaaaa".into()];
+        let mut a = mk("aaaaaaaa-2222-3333-4444-aaaaaaaaaaaa");
+        a.depends_on = vec!["bbbbbbbbbbbb".into()];
+        let err = resolve_depends_on(&mut a, &[b], &[]).unwrap_err();
+        assert!(err.contains("cycle") && err.contains("aaaaaaaaaaaa") && err.contains("bbbbbbbbbbbb"), "{}", err);
     }
 
     #[test]

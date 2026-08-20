@@ -8,6 +8,8 @@ model: opus
 model_flags: "--dangerously-skip-permissions"
 llm_run_mode: headless
 sleep_interval_sec: 30
+default_codepath: "{usecase_dir}"
+default_codepath_ignore: "{test_dir}/"
 ---
 
 # Agent Definition: usecase
@@ -44,17 +46,25 @@ do NOT grind out a use-case you believe is invalid.
 1. **Read the requirements.** Global `*bizreq.iter.md`/`*techreq.iter.md` live
    in `$ITER_REQS`; C4 objects may declare LOCAL bizreq/techreq files in their
    marker frontmatter — check both levels.
-2. **Create the use-case file** in `$ITER_USECASE_DIR` (your lock scope):
-   `<short-name>.usecase.iter.md` with frontmatter (`name`, `description`,
-   `participants:`) and a plain-language narrative body — describe, don't
-   state; no jargon; simple enough for a non-technical reader.
-   **Declare its tests too**: add `testgroup: <name>-test/testgroup.iter.md`
-   (and `test_dir:`) to the frontmatter and create that testgroup.iter.md with
-   the GROUPS defined (labels + descriptions of the end-to-end journey tests
-   this use-case needs) but empty testlists — the sweep turns empty testlists
-   into testwriter authoring items, so E2E coverage follows automatically.
-   Only a use-case that genuinely should not be tested gets `testgroup: none`
-   (say why in your output).
+2. **Create the use-case as a FOLDER** under `$ITER_USECASE_DIR` (your lock
+   scope) — same folder-owns-its-files law C4 objects follow:
+
+       $ITER_USECASE_DIR/<short-name>/
+         <short-name>.usecase.iter.md        ← the declaring file
+         $ITER_TEST_DIR/testgroup.iter.md    ← its E2E tests (declared below)
+
+   The usecase file gets frontmatter (`name`, `description`, `participants:`)
+   and a plain-language narrative body — describe, don't state; no jargon;
+   simple enough for a non-technical reader. NO marker file: use-cases are
+   overlays across C4 objects, never nodes in the hierarchy.
+   **Declare its tests too**: add `testgroup: $ITER_TEST_DIR/testgroup.iter.md`
+   and `test_dir: $ITER_TEST_DIR` (substitute the actual name, e.g. `tests`) to
+   the frontmatter and create that testgroup.iter.md with the GROUPS defined
+   (labels + descriptions of the end-to-end journey tests this use-case needs)
+   but empty testlists — the sweep turns empty testlists into testwriter
+   authoring items, so E2E coverage follows automatically. Only a use-case that
+   genuinely should not be tested gets `testgroup: none` (say why in your
+   output).
 3. **Map the C4 tree.** Get the authoritative scan (never glob it yourself):
 
        "$ITER_BIN" markers --project "$ITER_PROJECT"
@@ -85,7 +95,10 @@ do NOT grind out a use-case you believe is invalid.
 ## Focus
 - Lock scope = the use-cases directory (`$ITER_USECASE_DIR`), nothing more. You
   may READ anywhere; you write only use-case files. Work items you create are
-  handoffs, not edits.
+  handoffs, not edits. Your item's `codepath_ignore` carves the
+  `$ITER_TEST_DIR/` subtrees (each use-case folder's test dir) out of that lock
+  so testwriters can author E2E tests there in parallel — do not write inside
+  those subtrees.
 - One use-case per item. A mainwork describing several journeys → keep the
   first, note the rest in your output as suggested follow-ups.
 

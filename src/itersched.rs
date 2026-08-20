@@ -143,6 +143,11 @@ pub fn clone_from(parent: &WorkItem, now_iso: &str) -> WorkItem {
     c.source = "scheduler".into();
     c.source_schedule = parent.workid.clone();
     c.sched = Sched::default();
+    // Schedules are cadence-driven: a dependency gate on a recurring run would
+    // invite a silent never-runs, so clones never carry one (the API refuses
+    // depends_on on templates; this covers hand-edited queues too).
+    c.depends_on = Vec::new();
+    c.depends_on_shallow = false;
     c.attempts = 0;
     c.output = String::new();
     c.lasterror = String::new();

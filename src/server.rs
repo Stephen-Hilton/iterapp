@@ -430,11 +430,31 @@ fn api_meta(project: &Path) -> Resp {
 
 fn api_list(project: &Path) -> Resp {
     let queue = queue_for(project);
-    let mut closed = queue.load_closed();
+    let open = queue.load();
+    let closed = queue.load_closed();
+    // Dependency-gated items get their gate's live status injected (computed
+    // against the FULL closed archive, before truncation), so the webapp header
+    // can show the blocked-by chain without re-deriving engine semantics.
+    let open_vals: Vec<Value> = open
+        .iter()
+        .map(|i| {
+            let mut v = serde_json::to_value(i).expect("workitem serializes");
+            if !i.depends_on.is_empty() {
+                let (state, by) = match workitems::dep_status(i, &open, &closed) {
+                    workitems::DepStatus::Satisfied => ("ok", Value::Null),
+                    workitems::DepStatus::Blocked(id) => ("blocked", json!(id)),
+                    workitems::DepStatus::Failed(why) => ("failed", json!(why)),
+                };
+                v["dep_status"] = json!({ "state": state, "by": by });
+            }
+            v
+        })
+        .collect();
+    let mut closed = closed;
     if closed.len() > 500 {
         closed = closed.split_off(closed.len() - 500);
     }
-    json_resp(200, json!({ "open": queue.load(), "closed": closed }))
+    json_resp(200, json!({ "open": open_vals, "closed": closed }))
 }
 
 fn api_create(req: &Req, project: &Path) -> Resp {
@@ -468,6 +488,18 @@ fn api_create(req: &Req, project: &Path) -> Resp {
     } else if !matches!(item.state.as_str(), "queued" | "todo" | "paused") {
         item.state = workitems::STATE_QUEUED.into();
     }
+    if !item.depends_on.is_empty() {
+        // Schedules are cadence-driven; mixing gates and cadence invites a
+        // silent never-runs, so templates never carry dependencies.
+        if !item.sched.is_none() {
+            return err_resp(400, "schedule templates cannot have depends_on — schedules are cadence-driven, not gated");
+        }
+        let open = queue.load();
+        let closed = queue.load_closed();
+        if let Err(e) = workitems::resolve_depends_on(&mut item, &open, &closed) {
+            return err_resp(400, &e);
+        }
+    }
     let known: Vec<String> = crate::agents::discover(project).into_iter().map(|a| a.type_name).collect();
     let warning = (item.exec != workitems::EXEC_SHELL && !known.is_empty() && !known.contains(&item.item_type))
         .then(|| format!("type \"{}\" matches no agent in .iter/agents/", item.item_type));
@@ -494,7 +526,7 @@ fn api_get(project: &Path, id: &str) -> Resp {
 
 const EDITABLE: &[&str] = &[
     "title", "type", "priority", "risk", "source", "codepath", "codepath_ignore", "context", "testfiles", "prework",
-    "postwork", "mainwork", "exec", "sched",
+    "postwork", "mainwork", "exec", "sched", "depends_on", "depends_on_shallow",
 ];
 
 fn api_patch(req: &Req, project: &Path, id: &str) -> Resp {
@@ -502,26 +534,37 @@ fn api_patch(req: &Req, project: &Path, id: &str) -> Resp {
         return err_resp(400, "body must be a JSON object of editable fields");
     };
     let queue = queue_for(project);
+    let closed = queue.load_closed();
     let result = queue.with_lock(|items| {
-        let Some(item) = items.iter_mut().find(|i| i.workid == id) else {
+        let Some(pos) = items.iter().position(|i| i.workid == id) else {
             return Err((404, "no such open work item".to_string()));
         };
-        if item.state != workitems::STATE_TODO
-            && item.state != workitems::STATE_PAUSED
-            && item.state != workitems::STATE_SCHEDULED
+        if items[pos].state != workitems::STATE_TODO
+            && items[pos].state != workitems::STATE_PAUSED
+            && items[pos].state != workitems::STATE_SCHEDULED
         {
-            return Err((409, format!("only todo/paused/scheduled items are editable (state: {})", item.state)));
+            return Err((409, format!("only todo/paused/scheduled items are editable (state: {})", items[pos].state)));
         }
-        let mut v = serde_json::to_value(&*item).expect("serializes");
+        let mut v = serde_json::to_value(&items[pos]).expect("serializes");
         for (key, val) in &patch {
             if EDITABLE.contains(&key.as_str()) {
                 v[key] = val.clone();
             }
         }
         match serde_json::from_value::<WorkItem>(v) {
-            Ok(updated) => {
-                *item = updated;
-                Ok(item.clone())
+            Ok(mut updated) => {
+                if !updated.depends_on.is_empty() {
+                    if !updated.sched.is_none() {
+                        return Err((400, "schedule templates cannot have depends_on — schedules are cadence-driven, not gated".to_string()));
+                    }
+                    // Same refusal rules as create: unknown/ambiguous suffixes
+                    // and cycles never land in the queue.
+                    if let Err(e) = workitems::resolve_depends_on(&mut updated, items, &closed) {
+                        return Err((400, e));
+                    }
+                }
+                items[pos] = updated;
+                Ok(items[pos].clone())
             }
             Err(e) => Err((400, format!("invalid patch: {}", e))),
         }
@@ -779,18 +822,44 @@ fn api_config_put(req: &Req, project: &Path) -> Resp {
     json_resp(200, v)
 }
 
-fn agent_json(a: &crate::agents::AgentDef) -> Value {
+/// Resolve `default_codepath` / `default_codepath_ignore` placeholders
+/// ({usecase_dir}/{interface_dir}/{test_dir}) to paths RELATIVE to the code
+/// root, so the pre-filled value reads the way a user would type it
+/// ("usecases", not an absolute path; "{test_dir}/" → "tests/" on pdy).
+fn resolve_default_codepath(project: &Path, raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    let cfg = config::load(project);
+    let code_root = config::code_root(project, &cfg);
+    let rel = |p: std::path::PathBuf| match p.strip_prefix(&code_root) {
+        Ok(r) if !r.as_os_str().is_empty() => r.to_string_lossy().into_owned(),
+        Ok(_) => ".".to_string(),
+        Err(_) => p.to_string_lossy().into_owned(),
+    };
+    raw.replace("{usecase_dir}", &rel(config::usecase_dir(project, &cfg)))
+        .replace("{interface_dir}", &rel(config::interface_dir(project, &cfg)))
+        .replace("{test_dir}", &cfg.globalsettings.test_dir)
+}
+
+fn agent_json(project: &Path, a: &crate::agents::AgentDef) -> Value {
     json!({
         "type": a.type_name, "description": a.description, "visible": a.visible,
         "max_agent_count": a.max_agent_count, "max_work_timeout_sec": a.max_work_timeout_sec,
         "max_connection_timeout_sec": a.max_connection_timeout_sec, "model": a.model,
         "model_flags": a.model_flags, "llm_run_mode": a.llm_run_mode,
-        "sleep_interval_sec": a.sleep_interval_sec, "body": a.body,
+        "sleep_interval_sec": a.sleep_interval_sec,
+        "default_codepath": a.default_codepath,
+        "default_codepath_resolved": resolve_default_codepath(project, &a.default_codepath),
+        "default_codepath_ignore": a.default_codepath_ignore,
+        "default_codepath_ignore_resolved": resolve_default_codepath(project, &a.default_codepath_ignore),
+        "body": a.body,
     })
 }
 
 fn api_agents_get(project: &Path) -> Resp {
-    let agents: Vec<Value> = crate::agents::discover(project).iter().map(agent_json).collect();
+    let agents: Vec<Value> =
+        crate::agents::discover(project).iter().map(|a| agent_json(project, a)).collect();
     json_resp(200, json!({ "agents": agents }))
 }
 
@@ -845,7 +914,7 @@ fn api_agent_put(req: &Req, project: &Path, name: &str) -> Resp {
     if std::fs::write(&tmp, &rewritten).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
         return err_resp(500, "cannot write agent file");
     }
-    json_resp(200, agent_json(&crate::agents::parse(name, &rewritten)))
+    json_resp(200, agent_json(project, &crate::agents::parse(name, &rewritten)))
 }
 
 fn api_projectsettings_put(req: &Req, project: &Path) -> Resp {

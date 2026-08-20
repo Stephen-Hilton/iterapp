@@ -74,6 +74,14 @@ so this command works from any codepath.)
   `$ITER_TEST_DIR`); never guess it. The engine also enforces code/testwriter
   scope disjointness deterministically — but write it correctly anyway.
 - Set `priority` 0–10 (LOWER = sooner: P0 most urgent, default 5 — drop below 5 only for blocking slices) and `risk` 0–10.
+- If slices have REAL ordering constraints (B builds on what A produces), declare
+  them on the items instead of staging waves by hand: `"depends_on": ["<workid
+  or unique suffix>"]` in the item JSON (or repeatable `--depends-on <id>`).
+  A gated item stays queued but never dispatches until every dependency — and
+  everything the dependency itself created, transitively — is closed complete;
+  if a dependency fails, the dependent flips to `todo` for human review. Queue
+  the whole interdependent batch at once and let the engine sequence it. An
+  unknown, ambiguous, or cyclic dependency makes the add refuse (exit 2).
 - If the add refuses because the queue is full (`max_open_workitems`), report the
   refused items in your output instead of retrying.
 

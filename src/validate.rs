@@ -74,6 +74,14 @@ fn interface_kind_sections(kind: &str) -> Option<&'static [&'static str]> {
     }
 }
 const INTERFACE_TAIL_SECTIONS: &[&str] = &["Worked examples", "Invariants"];
+/// The one OPTIONAL section, accepted on every kind and only as the file's last
+/// section, after `## Invariants`. It carries a declared deviation from the
+/// internal transport law (pdy techreq PDY-TECH-039: service-to-service calls
+/// ride the Linkerd mesh with mutual TLS and speak gRPC): what deviates, why
+/// gRPC is impractical there, and what still holds. Its absence is valid and
+/// normal — a contract with no section declares no exception, and an
+/// undeclared deviation is therefore a defect wherever it appears in code.
+const INTERFACE_OPTIONAL_TAIL_SECTION: &str = "Exceptions";
 
 /// Identity-bearing keys that belong to specific roles; anywhere else they are
 /// harmless (the filename wins) but confuse readers.
@@ -266,7 +274,8 @@ pub fn validate_file(path: &Path, fix: bool) -> std::io::Result<Vec<Finding>> {
             }
             // The body IS the contract, in the fixed format: an H1 title, a
             // summary under 300 chars, the kind's required H2 sections, then
-            // `## Worked examples` (strict JSON) and `## Invariants` last.
+            // `## Worked examples` (strict JSON) and `## Invariants` last —
+            // optionally followed by `## Exceptions`, the only optional section.
             let contract = body.trim();
             if contract.is_empty() {
                 push(
@@ -348,17 +357,35 @@ pub fn validate_file(path: &Path, fix: bool) -> std::io::Result<Vec<Finding>> {
                         }
                     }
                     for s in &sections {
-                        let allowed = required.iter().chain(INTERFACE_TAIL_SECTIONS).any(|n| s.eq_ignore_ascii_case(n));
+                        let allowed = required
+                            .iter()
+                            .chain(INTERFACE_TAIL_SECTIONS)
+                            .chain(std::iter::once(&INTERFACE_OPTIONAL_TAIL_SECTION))
+                            .any(|n| s.eq_ignore_ascii_case(n));
                         if !allowed {
                             push(Severity::Warn, "unexpected-section", format!("`## {}` is not a section of the fixed format for `kind: {}` — the contract holds ONLY the format's sections; other prose belongs on a marker or techreq", s, kind), false);
                         }
                     }
-                    // Tail order: Worked examples, then Invariants, closing the file.
-                    let tail_ok = sections.len() >= 2
-                        && sections[sections.len() - 2].eq_ignore_ascii_case("Worked examples")
-                        && sections[sections.len() - 1].eq_ignore_ascii_case("Invariants");
+                    // Tail order: Worked examples, then Invariants, then the
+                    // optional `## Exceptions` when the contract declares one.
+                    // An `## Exceptions` anywhere but last is an ordering fault,
+                    // not a new section: the deviation must read after the
+                    // invariants it qualifies.
+                    let exceptions_last = sections
+                        .last()
+                        .map(|s| s.eq_ignore_ascii_case(INTERFACE_OPTIONAL_TAIL_SECTION))
+                        .unwrap_or(false);
+                    if has(INTERFACE_OPTIONAL_TAIL_SECTION) && !exceptions_last {
+                        push(Severity::Warn, "section-order", "`## Exceptions` is optional, but when it is present it must be the FINAL section, after `## Invariants`".into(), false);
+                    }
+                    // Everything the two required tail sections must close, with
+                    // the optional section (when last) set aside first.
+                    let core = if exceptions_last { &sections[..sections.len() - 1] } else { &sections[..] };
+                    let tail_ok = core.len() >= 2
+                        && core[core.len() - 2].eq_ignore_ascii_case("Worked examples")
+                        && core[core.len() - 1].eq_ignore_ascii_case("Invariants");
                     if !tail_ok && INTERFACE_TAIL_SECTIONS.iter().all(|n| has(n)) {
-                        push(Severity::Warn, "section-order", "`## Worked examples` then `## Invariants` must be the last two sections".into(), false);
+                        push(Severity::Warn, "section-order", "`## Worked examples` then `## Invariants` must be the last two sections, ahead of an optional closing `## Exceptions`".into(), false);
                     }
                     // Worked examples must be machine-checkable: a strict-JSON fence.
                     let we_json = blocks.iter().any(|(lang, _, sec)| lang == "json" && sec.eq_ignore_ascii_case("Worked examples"));
@@ -503,7 +530,7 @@ fn interface_template(kind: &str) -> String {
         }
     };
     format!(
-        "---\ninterface: <kebab-case-id>\nkind: {}                    # request-reply | event | stream | dataset\ndescription: \"<one line: what data crosses this boundary>\"\n---\n\n# <kebab-case-id> — contract\n\n<Named summary, under 300 characters: what goes in, what comes out, and why.\nNo carrier, no consumers, no deployment.>\n\n{}\n## Invariants\n\n- <property the examples cannot show: totality, determinism, ordering, limits,\n  closed vocabularies>\n- Transport-neutral: these messages ride any carrier unchanged; carrier\n  bindings (routes, ports, topics, flags, exit codes) live on the serving\n  object's marker, never here.\n",
+        "---\ninterface: <kebab-case-id>\nkind: {}                    # request-reply | event | stream | dataset\ndescription: \"<one line: what data crosses this boundary>\"\n---\n\n# <kebab-case-id> — contract\n\n<Named summary, under 300 characters: what goes in, what comes out, and why.\nNo carrier, no consumers, no deployment.>\n\n{}\n## Invariants\n\n- <property the examples cannot show: totality, determinism, ordering, limits,\n  closed vocabularies>\n- Transport-neutral: these messages ride any carrier unchanged; carrier\n  bindings (routes, ports, topics, flags, exit codes) live on the serving\n  object's marker, never here.\n\n## Exceptions\n\n<!-- none — a declared deviation from the internal mesh-mTLS-gRPC transport law goes here (what deviates, why gRPC is impractical there, what still holds: mesh transit, mTLS); with no declaration there is no exception, so leave this section empty or drop it -->\n",
         kind, middle
     )
 }
@@ -787,6 +814,38 @@ mod tests {
         std::fs::write(&p, swapped).unwrap();
         assert!(codes(&validate_file(&p, false).unwrap()).contains(&"section-order"));
 
+        // `## Exceptions` is optional and legal ONLY as the closing section.
+        // Present and last: the whole file is clean, no findings at all.
+        let with_exc = format!(
+            "{}\n## Exceptions\n\n- Kafka's wire protocol, not gRPC: the broker speaks its own binary protocol and no gRPC front end exists for it. Still on the mesh, still mTLS.\n",
+            CLEAN_IFACE
+        );
+        std::fs::write(&p, &with_exc).unwrap();
+        let fs = validate_file(&p, false).unwrap();
+        assert!(fs.is_empty(), "well-formed trailing `## Exceptions` should validate clean: {:?}", fs);
+
+        // Absent stays valid — the baseline contract has no Exceptions section.
+        std::fs::write(&p, CLEAN_IFACE).unwrap();
+        assert!(validate_file(&p, false).unwrap().is_empty());
+
+        // Wrong position: same section, moved ahead of Worked examples/Invariants.
+        let misplaced = CLEAN_IFACE.replacen(
+            "## Worked examples",
+            "## Exceptions\n\n- Redis protocol, not gRPC.\n\n## Worked examples",
+            1,
+        );
+        std::fs::write(&p, misplaced).unwrap();
+        let c = codes(&validate_file(&p, false).unwrap());
+        assert!(c.contains(&"section-order"), "`## Exceptions` before the tail must be flagged: {:?}", c);
+
+        // Misspelled/near-miss variants are not the optional section — they are
+        // simply sections the fixed format does not have.
+        for variant in ["## Exception", "## exceptions to the rule", "## Execptions"] {
+            std::fs::write(&p, format!("{}\n{}\n\n- x\n", CLEAN_IFACE, variant)).unwrap();
+            let c = codes(&validate_file(&p, false).unwrap());
+            assert!(c.contains(&"unexpected-section"), "{} should not pass as the optional section: {:?}", variant, c);
+        }
+
         // Worked examples without a strict-JSON fence.
         std::fs::write(&p, CLEAN_IFACE.replace("```json", "```")).unwrap();
         assert!(codes(&validate_file(&p, false).unwrap()).contains(&"worked-examples-not-json"));
@@ -810,7 +869,7 @@ mod tests {
         // The request-reply skeleton names every section the validator requires.
         let p = dir.join("new.interface.iter.md");
         let t = template_for(&p).unwrap();
-        for section in ["## Request", "## Reply, success shape", "## Reply, failure shape", "## Worked examples", "## Invariants"] {
+        for section in ["## Request", "## Reply, success shape", "## Reply, failure shape", "## Worked examples", "## Invariants", "## Exceptions"] {
             assert!(t.contains(section), "missing {} in:\n{}", section, t);
         }
 
@@ -818,6 +877,17 @@ mod tests {
         std::fs::write(&p, "---\ninterface: x\nkind: event\n---\n").unwrap();
         let t = template_for(&p).unwrap();
         assert!(t.contains("## Event") && !t.contains("## Request"), "{}", t);
+
+        // Every kind's skeleton ends with the optional `## Exceptions`, empty
+        // but for a placeholder line, so an author sees where a declared
+        // deviation from the mesh-mTLS-gRPC transport law goes.
+        for kind in ["request-reply", "event", "stream", "dataset"] {
+            std::fs::write(&p, format!("---\ninterface: x\nkind: {}\n---\n", kind)).unwrap();
+            let t = template_for(&p).unwrap();
+            let (_, after) = t.split_once("## Exceptions").unwrap_or_else(|| panic!("{} skeleton has no `## Exceptions`:\n{}", kind, t));
+            assert!(!after.contains("## "), "`## Exceptions` is not the last section of the {} skeleton:\n{}", kind, t);
+            assert!(after.contains("<!--"), "`## Exceptions` has no placeholder comment in the {} skeleton:\n{}", kind, t);
+        }
 
         // Every role has a template; a no-role filename is an error.
         for f in ["a.marker.iter.md", "a.bizreq.iter.md", "a.techreq.iter.md", "a.testgroup.iter.md", "a.usecase.iter.md"] {

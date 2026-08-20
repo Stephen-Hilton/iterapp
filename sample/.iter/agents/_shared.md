@@ -161,6 +161,13 @@ frontmatter; without it the node has no name/level on the Projects map.
   - closing every file, in order: `## Worked examples` (normative pairs in one
     strict-JSON fence) and `## Invariants` (few bullets — only what examples
     cannot show)
+  - optionally, and ONLY as the final section after `## Invariants`:
+    `## Exceptions` — a declared deviation from the internal transport law that
+    service-to-service calls ride the mesh with mutual TLS and speak gRPC. State
+    what deviates (e.g. a component that must speak an infrastructure wire
+    protocol such as Redis's or Kafka's), why gRPC is impractical there, and
+    what still holds (mesh transit, mTLS). Most contracts have no such section,
+    and that is the normal case: no section, no exception
 
   Message shapes are pseudo-JSON with constraints as inline comments. JSON is
   the NOTATION, not a wire format — conventions for what JSON cannot say:
