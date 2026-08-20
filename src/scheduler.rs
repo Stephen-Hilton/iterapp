@@ -1305,7 +1305,8 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
         let (label, prompt, shell) = resolve_prepost(&shared.project_root, entry, "postwork");
         steps.push(StepTurn { phase: Phase::Postwork, turn: Turn { label, prompt }, shell });
     }
-    let shared_text = agents::shared_instructions(&shared.project_root);
+    let shared_text =
+        agents::shared_instructions(&shared.project_root, shared.cfg().globalsettings.critreview_max_rounds);
     let shared_section = shared_text
         .as_deref()
         .map(|t| format!("\n\n# Shared instructions (all agents — .iter/agents/_shared.md)\n{}", t))

@@ -62,6 +62,11 @@ pub struct GlobalSettings {
     pub testwriter_min_tests_per_group: u32,
     #[serde(alias = "test_max")]
     pub testwriter_max_tests_per_group: u32,
+    /// Max critical-review rounds per work item — substituted into the shared
+    /// agent instructions (`{critreview_max_rounds}` in _shared.md), so the
+    /// cap agents obey is a setting, not prompt-frozen prose. Each round is a
+    /// synchronous critic session (minutes of wall clock plus spend).
+    pub critreview_max_rounds: u32,
     /// The per-component test directory name (relative to a component's root).
     /// Definitive, not a guess: testwriter items scope their codepath/lock to
     /// `<component>/<test_dir>` and code items list `<test_dir>/` in codepath_ignore
@@ -91,6 +96,7 @@ impl Default for GlobalSettings {
             code_root: ".".into(),
             testwriter_min_tests_per_group: 20,
             testwriter_max_tests_per_group: 100,
+            critreview_max_rounds: 3,
             test_dir: "test".into(),
             usecase_default_path: "{codepath}/usecases/".into(),
             interface_default_path: "{codepath}/interfaces/".into(),

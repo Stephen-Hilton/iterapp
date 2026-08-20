@@ -83,13 +83,16 @@ pub fn discover(project_root: &Path) -> Vec<AgentDef> {
 /// Instructions shared by EVERY agent: `.iter/agents/_shared.md`. Appended to each
 /// agent's composed context at run time — the store-once place for all-agent rules.
 /// Returns None when the file is missing or effectively empty.
-pub fn shared_instructions(project_root: &Path) -> Option<String> {
+/// The `_shared.md` text appended to every agent turn. `{critreview_max_rounds}`
+/// (Settings → globalsettings.critreview_max_rounds) substitutes here, so the
+/// review-round cap agents obey is a live setting, not prompt-frozen prose.
+pub fn shared_instructions(project_root: &Path, critreview_max_rounds: u32) -> Option<String> {
     let text = std::fs::read_to_string(agents_dir(project_root).join("_shared.md")).ok()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(trimmed.replace("{critreview_max_rounds}", &critreview_max_rounds.to_string()))
     }
 }
 
@@ -237,9 +240,16 @@ mod tests {
     #[test]
     fn shared_instructions_loaded_from_underscore_file() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let text = shared_instructions(&root).expect("template ships _shared.md");
+        let text = shared_instructions(&root, 3).expect("template ships _shared.md");
         assert!(text.contains("frontmatter"), "the template's first shared rule");
-        assert!(shared_instructions(Path::new("/nonexistent/nowhere")).is_none());
+        // The review-round cap is a SETTING: the placeholder must substitute,
+        // never reach an agent verbatim.
+        assert!(text.contains("at most 3 review round"), "cap substituted: {}",
+            text.lines().find(|l| l.contains("review round")).unwrap_or(""));
+        assert!(!text.contains("{critreview_max_rounds}"));
+        let text5 = shared_instructions(&root, 5).unwrap();
+        assert!(text5.contains("at most 5 review round"), "the setting drives the number");
+        assert!(shared_instructions(Path::new("/nonexistent/nowhere"), 3).is_none());
     }
 
     #[test]

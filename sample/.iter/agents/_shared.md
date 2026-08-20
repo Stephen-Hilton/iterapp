@@ -42,8 +42,10 @@ synchronously — no work items involved — BEFORE acting on the reviewed resul
    yourself: decide which items are valid given the requirements, do a
    cost/benefit pass on the valid ones, implement what is worth doing, and record
    each item's disposition in your output.
-4. One more review after major revisions is fine; never run more than two per
-   work item.
+4. After major revisions, request another review of the revised material. Cap:
+   at most {critreview_max_rounds} review round(s) per work item (Settings →
+   `critreview_max_rounds`); stop earlier the moment a review comes back with
+   no material findings — rounds are a budget, not a target.
 
 Exit codes: **0** — feedback on stdout, triage it. **Any nonzero exit** — the
 review could not be delivered and your work item has already been flagged to

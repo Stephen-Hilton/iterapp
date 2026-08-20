@@ -1895,6 +1895,7 @@ const CONFIG = {
   globalsettings: {
     user_timezone: ['UTC', 'timezone for displaying timestamps — data stays UTC on disk; DST handled automatically'],
     code_root: ['.', 'base dir for relative codepaths/context/testfiles — set e.g. .. or ~/dev/myproject when .iter lives in a subdir of the codebase; default . = where .iter lives'],
+    critreview_max_rounds: [3, 'max critical-review rounds an agent runs per work item — substituted into _shared.md as {critreview_max_rounds}; each round is a synchronous critic session (minutes + spend), and agents stop earlier when a review has no material findings'],
     testwriter_min_tests_per_group: [20, 'minimum tests a testwriter agent produces per testgroup (floor)'],
     testwriter_max_tests_per_group: [100, 'maximum tests a testwriter agent produces per testgroup'],
     test_dir: ['test', 'the per-component test directory name — testwriter items lock <component>/<test_dir>, code items list it in codepath_ignore; exported to agents as ITER_TEST_DIR'],
@@ -1988,6 +1989,8 @@ function settingsLayout(){
         Object.keys(CONFIG.engine).map(k => cfg('engine', k))],
       ['Test', 'Testwriter output bounds and the test-directory layout. The deterministic test loop itself runs as a "Test Loop" scheduled workitem whose command carries every knob as a visible flag — create it below, tune/pause it in WorkItems — see features/TDD.md',
         ['testwriter_min_tests_per_group','testwriter_max_tests_per_group','test_dir'].map(k => cfg('globalsettings', k))],
+      ['Review', 'Critical-review budget: how many critic rounds an agent may run per work item (the cap _shared.md tells every agent; takes effect on the next agent spin-up, no restart needed)',
+        [cfg('globalsettings','critreview_max_rounds')]],
       ['Usage limits', 'Account-usage throttle: tiered agent caps from Claude Code’s server-reported 5h/7d utilization, kept fresh by the probe session',
         Object.keys(CONFIG.limits).map(k => cfg('limits', k))],
       ['Logging', 'Engine log output and rotation',
