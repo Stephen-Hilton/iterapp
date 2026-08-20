@@ -89,6 +89,11 @@ enum Command {
         /// their descendants too)
         #[arg(long = "depends-on-shallow")]
         depends_on_shallow: bool,
+        /// How items created BY this one are born: "review" → children land
+        /// todo (human gate per stage), "auto" → queued (fully automated).
+        /// Unset inherits the creating parent's mode (user items: review)
+        #[arg(long)]
+        automation: Option<String>,
     },
     /// Synchronous critical review: runs the `_critic.md` persona as a subprocess
     /// and prints its feedback to stdout — no work items involved
@@ -285,8 +290,8 @@ fn main() {
     let code = match cli.command {
         Command::Start { project, port } => cmd_start(project, port),
         Command::Run { project, once, until_idle } => cmd_run(project, once, until_idle),
-        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow } => {
-            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow)
+        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation } => {
+            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation)
         }
         Command::Critreview { project, file, context, max_retry } => {
             cmd_critreview(project, file, context, max_retry)
@@ -404,6 +409,7 @@ fn cmd_add(
     source_testgroup: Option<String>,
     depends_on: Vec<String>,
     depends_on_shallow: bool,
+    automation: Option<String>,
 ) -> i32 {
     let cfg = config::load(&project);
     let mut item: WorkItem = match &file {
@@ -451,6 +457,15 @@ fn cmd_add(
     if depends_on_shallow {
         item.depends_on_shallow = true;
     }
+    if let Some(v) = automation {
+        item.automation = v;
+    }
+    // A typo'd mode silently meaning "review" is the wrong failure mode.
+    let mode = item.automation.trim().to_string();
+    if !mode.is_empty() && mode != workitems::AUTOMATION_REVIEW && mode != workitems::AUTOMATION_AUTO {
+        eprintln!("error: automation must be \"review\" or \"auto\" (got \"{}\")", mode);
+        return 2;
+    }
 
     if item.item_type.is_empty() || item.mainwork.is_empty() {
         eprintln!("error: a work item needs at least --type and --mainwork (or a --file providing them)");
@@ -492,6 +507,43 @@ fn cmd_add(
     }
 
     let queue = Queue::new(&project, &cfg);
+
+    // Automation mode (features/workitem_automation.md), agent-sourced adds
+    // only ($ITER_WORKID present — an engine-run work item created this):
+    // an unset mode inherits the creating parent's, then the child's state is
+    // DERIVED from the effective mode — review → todo (human gate per stage),
+    // auto → queued (fully automated). Prompts do not decide state: a
+    // prompt-written todo/queued is overridden (and said so); an explicit
+    // `paused` survives. Guards applied below (non-convergence) still win.
+    let in_workitem = std::env::var("ITER_WORKID").ok().filter(|w| !w.is_empty());
+    if let Some(parent_id) = &in_workitem {
+        if item.automation.trim().is_empty() {
+            let parent = queue
+                .load()
+                .into_iter()
+                .find(|i| i.workid == *parent_id)
+                .or_else(|| queue.load_closed().into_iter().rev().find(|i| i.workid == *parent_id));
+            if let Some(p) = parent {
+                item.automation = p.automation.trim().to_string();
+            }
+        }
+        let derived = if item.automation.trim() == workitems::AUTOMATION_AUTO {
+            workitems::STATE_QUEUED
+        } else {
+            workitems::STATE_TODO
+        };
+        if matches!(item.state.as_str(), workitems::STATE_QUEUED | workitems::STATE_TODO)
+            && item.state != derived
+        {
+            eprintln!(
+                "note: state \"{}\" overridden to \"{}\" — the automation mode ({}) decides how agent-created items are born",
+                item.state,
+                derived,
+                if item.automation.trim().is_empty() { "review, inherited default" } else { item.automation.trim() }
+            );
+            item.state = derived.into();
+        }
+    }
 
     // Dependency resolution: suffixes → full workids, refusing unknown or
     // ambiguous suffixes and cycles (exit 2 — refuse, never guess).

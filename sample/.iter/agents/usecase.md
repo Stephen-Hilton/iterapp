@@ -79,7 +79,9 @@ do NOT grind out a use-case you believe is invalid.
    `"$ITER_BIN" usecase --file <path> --add "<step> <ref>"` instead.
 5. **MISSING objects**: open **ONE plan work item covering ALL the gaps** (a
    single plan keeps shared interfaces coherent; the plan agent decomposes into
-   parallel code/testwriter items itself, each gated `todo` for human review):
+   parallel code/testwriter items itself — whether those are gated for human
+   review or run fully automated follows the request's automation mode, never
+   your instruction):
 
        "$ITER_BIN" add --project "$ITER_PROJECT" --type plan --priority 3 \
          --title "plan: build out C4 objects for usecase <name>" \

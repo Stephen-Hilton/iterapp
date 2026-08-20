@@ -489,6 +489,12 @@ fn api_create(req: &Req, project: &Path) -> Resp {
     } else if !matches!(item.state.as_str(), "queued" | "todo" | "paused") {
         item.state = workitems::STATE_QUEUED.into();
     }
+    {
+        let mode = item.automation.trim();
+        if !mode.is_empty() && mode != workitems::AUTOMATION_REVIEW && mode != workitems::AUTOMATION_AUTO {
+            return err_resp(400, &format!("automation must be \"review\" or \"auto\" (got \"{}\")", mode));
+        }
+    }
     if !item.depends_on.is_empty() {
         // Schedules are cadence-driven; mixing gates and cadence invites a
         // silent never-runs, so templates never carry dependencies.
@@ -527,7 +533,7 @@ fn api_get(project: &Path, id: &str) -> Resp {
 
 const EDITABLE: &[&str] = &[
     "title", "type", "priority", "risk", "source", "codepath", "codepath_ignore", "context", "testfiles", "prework",
-    "postwork", "mainwork", "exec", "sched", "depends_on", "depends_on_shallow",
+    "postwork", "mainwork", "exec", "sched", "depends_on", "depends_on_shallow", "automation",
 ];
 
 fn api_patch(req: &Req, project: &Path, id: &str) -> Resp {
@@ -554,6 +560,10 @@ fn api_patch(req: &Req, project: &Path, id: &str) -> Resp {
         }
         match serde_json::from_value::<WorkItem>(v) {
             Ok(mut updated) => {
+                let mode = updated.automation.trim();
+                if !mode.is_empty() && mode != workitems::AUTOMATION_REVIEW && mode != workitems::AUTOMATION_AUTO {
+                    return Err((400, format!("automation must be \"review\" or \"auto\" (got \"{}\")", mode)));
+                }
                 if !updated.depends_on.is_empty() {
                     if !updated.sched.is_none() {
                         return Err((400, "schedule templates cannot have depends_on — schedules are cadence-driven, not gated".to_string()));

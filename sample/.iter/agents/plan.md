@@ -40,8 +40,10 @@ set for the target component:
      are the most review-critical artifact: they shape what "done" means.
 3. **Request a critical review** (per the shared instructions) of the plan +
    testgroups BEFORE creating any work items. Triage the feedback and revise.
-4. Create **two work items in state `todo`** (NOT queued — the human flips them
-   to queued after reviewing the documents; order-independent):
+4. Create **two work items** (order-independent; do NOT set `state` — the
+   engine derives it from the request's automation mode: review → `todo` so
+   the human reads the documents first, auto → `queued` for a fully automated
+   build):
    - a `code` item — implement the approved plan. `codepath` = the component
      directory, with `"codepath_ignore": ["$ITER_TEST_DIR/"]`.
    - a `testwriter` item — write the tests for every group. `codepath` =
@@ -74,10 +76,10 @@ plan that needs you (or a human) to sequence waves by hand:
   finishes", which is usually what you want.
 
 Carry any `source_testgroup` provenance from the escalating item into the items
-you create, so the sweep's dedup guard and the UI keep the thread. These items
-may be created `queued` unless the mainwork says otherwise — a queued item with
-unmet dependencies is safe: it stays visibly queued and blocked until they
-close complete.
+you create, so the sweep's dedup guard and the UI keep the thread. Never set
+`state` (see the shared rule — the automation mode decides). A queued item
+with unmet dependencies is safe: it stays visibly queued and blocked until
+they close complete.
 
 ## Creating new work items (handoff)
 
@@ -89,7 +91,7 @@ so this command works from any codepath.)
 
 - Set `source` to `agent: plan`, `type` to the target agent, and `codepath` to the
   narrowest directory the work owns (this is the lock scope — narrower = more
-  parallelism). For the TDD flow set `"state": "todo"` in the item JSON.
+  parallelism). Never set `state` — the automation mode decides (shared rule).
 - The test directory name comes from `globalsettings.test_dir` (exported as
   `$ITER_TEST_DIR`); never guess it. The engine also enforces code/testwriter
   scope disjointness deterministically — but write it correctly anyway.
@@ -100,8 +102,8 @@ so this command works from any codepath.)
   dispatches until every dependency (and everything it created, transitively)
   is closed complete; a FAILED dependency flips the dependent to `todo` for
   human review. Ambiguous, unknown, or cyclic dependencies refuse (exit 2).
-  `depends_on` composes with the TDD `todo` gate: deps on a todo item are
-  declared but dormant — the gate applies from the moment a human queues it.
+  `depends_on` composes with review-mode gating: deps on a todo item are
+  declared but dormant — the gate applies from the moment the item is queued.
 - If the add refuses because the queue is full (`max_open_workitems`), report the
   refused items in your output instead of retrying.
 

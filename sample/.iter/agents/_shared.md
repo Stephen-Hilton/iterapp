@@ -54,6 +54,19 @@ do). STOP immediately: do not create work items, do not proceed without the
 review, end your session stating the critreview failure. A requested review is
 part of the work — work without it is not done.
 
+## Work items you create: never set `state`
+
+Do not set `state` on work items you create (`iter add`). The engine derives it
+from YOUR work item's automation mode, inherited down the whole chain from the
+original request: `automation: review` → your items are born `todo` (a human
+reviews each stage before it runs); `automation: auto` → born `queued` (fully
+automated build). Any `todo`/`queued` you write is overridden — the mode, not
+the prompt, decides. Design every handoff to work in BOTH modes: the documents
+and mainwork must stand alone whether a human reads them first or an agent
+picks them up seconds later. (Guards outrank automation: `iter reject`, the
+non-convergence guard, and failed dependencies land items in `todo` in any
+mode.)
+
 ## Lock scope and codepath_ignore
 
 Your work item's `codepath` is your lock scope: the directory tree you own for

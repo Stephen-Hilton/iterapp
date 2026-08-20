@@ -168,7 +168,13 @@ fn full_lifecycle_concurrency_and_handoff() {
     // serialize them; the handoff trigger makes the plan agent create a 4th item
     // mid-run via `iter add`, exactly like a real agent would.
     seed(&root, &workitem_json("e2e-code-1", "code", "code seed", "./src", "implement the thing", r#""git-pull""#, r#""git-commit""#));
-    seed(&root, &workitem_json("e2e-plan-1", "plan", "plan seed", ".", "plan the thing HANDOFF_TRIGGER", "", ""));
+    // automation:auto so the handoff child is born QUEUED and the queue can
+    // drain — under the default (review) it would land todo for human review.
+    seed(
+        &root,
+        &workitem_json("e2e-plan-1", "plan", "plan seed", ".", "plan the thing HANDOFF_TRIGGER", "", "")
+            .replace("\"state\":\"queued\"", "\"state\":\"queued\",\"automation\":\"auto\""),
+    );
     // (type "testwriter": the old test agent is retired — the deterministic sweep runs tests.)
     seed(&root, &workitem_json("e2e-test-1", "testwriter", "testwriter seed", ".", "write the tests", r#""inline literal prework step""#, ""));
 
@@ -1244,5 +1250,66 @@ fn testloop_cli_flags_sweep_and_blocked_refusal() {
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("blocked"));
     assert!(std::fs::read_to_string(root.join("vend/vend.marker.iter.md")).unwrap().contains("test_loop: blocked"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The automation mode (workitem_automation.md) governs how agent-created
+/// items are born — engine-enforced, so a prompt-written state cannot
+/// override the request's intent. Inheritance flows through $ITER_WORKID.
+#[test]
+fn automation_mode_governs_agent_created_state() {
+    let (root, _stub) = setup_project("automode", 3, 200);
+    seed(
+        &root,
+        r#"{"workid":"par-auto","title":"auto parent","type":"plan","state":"in-progress","source":"user","priority":5,"risk":0,"codepath":".","automation":"auto","context":[],"testfiles":[],"prework":[],"mainwork":"m","postwork":[],"output":"","attempts":1,"lasterror":"","times":{"added":"2026-08-11T00:00:00Z","start":"2026-08-11T00:01:00Z","preworkdone":"","mainworkdone":"","postworkdone":"","closed":""}}"#,
+    );
+    seed(
+        &root,
+        r#"{"workid":"par-rev","title":"review parent","type":"plan","state":"in-progress","source":"user","priority":5,"risk":0,"codepath":".","context":[],"testfiles":[],"prework":[],"mainwork":"m","postwork":[],"output":"","attempts":1,"lasterror":"","times":{"added":"2026-08-11T00:00:00Z","start":"2026-08-11T00:01:00Z","preworkdone":"","mainworkdone":"","postworkdone":"","closed":""}}"#,
+    );
+    let add = |parent: Option<&str>, json: &str, tag: &str| {
+        let f = root.join(format!("item-{}.json", tag));
+        std::fs::write(&f, json).unwrap();
+        let mut cmd = Command::new(BIN);
+        cmd.args(["add", "--project", root.to_str().unwrap(), "--file", f.to_str().unwrap()]);
+        match parent {
+            Some(p) => cmd.env("ITER_WORKID", p),
+            None => cmd.env_remove("ITER_WORKID"),
+        };
+        cmd.output().unwrap()
+    };
+    let item_by_title = |title: &str| {
+        open_items(&root).into_iter().find(|i| i["title"] == title).unwrap_or_else(|| panic!("{} added", title))
+    };
+
+    // Under an auto parent, a prompt-written "todo" is overridden to queued —
+    // the mode, not the prompt, decides (and the override is said out loud).
+    let out = add(Some("par-auto"), r#"{"type":"code","title":"c-auto","mainwork":"m","state":"todo"}"#, "a");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("overridden"));
+    let c_auto = item_by_title("c-auto");
+    assert_eq!(c_auto["state"], "queued");
+    assert_eq!(c_auto["automation"], "auto", "the mode is stored, so grandchildren inherit it");
+
+    // Under a review-default parent, the child lands todo (human gate).
+    let out = add(Some("par-rev"), r#"{"type":"code","title":"c-rev","mainwork":"m"}"#, "r");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(item_by_title("c-rev")["state"], "todo");
+
+    // Grandchild of the auto lineage: inherits auto through the stored mode.
+    let c_auto_id = c_auto["workid"].as_str().unwrap().to_string();
+    let out = add(Some(&c_auto_id), r#"{"type":"code","title":"c-grand","mainwork":"m"}"#, "g");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let grand = item_by_title("c-grand");
+    assert_eq!(grand["state"], "queued", "auto inherits transitively");
+    assert_eq!(grand["automation"], "auto");
+
+    // User adds (no $ITER_WORKID) are never overridden; a typo'd mode refuses.
+    let out = add(None, r#"{"type":"code","title":"c-user","mainwork":"m"}"#, "u");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(item_by_title("c-user")["state"], "queued", "user default state untouched");
+    let out = add(None, r#"{"type":"code","title":"c-bad","mainwork":"m","automation":"fullauto"}"#, "b");
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("automation must be"));
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -19,6 +19,14 @@ pub const STATE_SCHEDULED: &str = "scheduled";
 pub const EXEC_AGENT: &str = "agent";
 pub const EXEC_SHELL: &str = "shell";
 
+/// Automation mode (features/workitem_automation.md): how this lineage's
+/// OFFSPRING are born. "review" — children land `todo` (human gate per
+/// stage); "auto" — children land `queued` (fully automated build). Unset
+/// inherits the creating parent's mode at add time; a user-created item with
+/// no mode means "review".
+pub const AUTOMATION_REVIEW: &str = "review";
+pub const AUTOMATION_AUTO: &str = "auto";
+
 /// When a `scheduled` template fires (itersched.rs): the schedule spec.
 /// Minute granularity by design — the check cadence is 59s.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -116,6 +124,13 @@ pub struct WorkItem {
     /// makes transitive dependency satisfaction possible.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub created_by: String,
+    /// "review" | "auto" (or "" = unset → inherit parent / default review):
+    /// whether items THIS item creates are born `todo` (human gate) or
+    /// `queued` (fully automated). Engine-enforced on agent-sourced adds —
+    /// prompts do not decide state; guards (reject, non-convergence, failed
+    /// deps) still outrank it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub automation: String,
     /// Engine-recorded at each run start: HEAD of the item's codepath repo the
     /// moment work began (empty if the codepath is not in a git repo). The
     /// undo point offered when a run is stopped mid-stream —
@@ -153,6 +168,7 @@ impl Default for WorkItem {
             depends_on: Vec::new(),
             depends_on_shallow: false,
             created_by: String::new(),
+            automation: String::new(),
             git_start_commit: String::new(),
             context: Vec::new(),
             testfiles: Vec::new(),

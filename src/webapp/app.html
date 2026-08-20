@@ -744,7 +744,7 @@ function literalContextLines(){
 function mk(over) {
   return Object.assign({
     workid: uuid(), title:'', type:'code', state:'todo', source:'user',
-    priority:5, risk:0, codepath:'./src', codepath_ignore:[], depends_on:[],
+    priority:5, risk:0, codepath:'./src', codepath_ignore:[], depends_on:[], automation:'',
     context:[], testfiles:[],
     prework:[], mainwork:'', postwork:[], output:'', attempts:0, lasterror:'',
     tests:null,
@@ -1059,6 +1059,7 @@ function renderRows(){
             ${item.sched && item.sched.kind ? `<span class="chip mono" style="background:var(--s-scheduled-bg);color:#fff" title="Schedule — last fired: ${esc(item.sched.last_fired || 'never')}">⏱ ${esc(schedDesc(item.sched))}</span>` : ''}
             ${item.source_schedule ? `<span class="chip" style="background:var(--s-scheduled-bg);color:#fff" title="Born from schedule ${esc(item.source_schedule)}">SCHED RUN</span>` : ''}
             ${item.exec === 'shell' ? `<span class="chip mono" style="background:var(--s-paused-bg);color:#fff" title="exec: shell — the engine runs the steps as shell commands; no LLM">⚙ shell</span>` : ''}
+            ${item.automation === 'auto' ? `<span class="chip" style="background:var(--s-complete-bg);color:#fff" title="Fully automated lineage — items this one creates are born QUEUED (inherited by descendants); guards still land in ToDo">AUTO</span>` : ''}
             <span class="chip kv mono" title="Attempts">A:${item.attempts}</span>
             <span class="chip meta mono" title="Stored UTC: ${esc(item.times.added)}">Requested: <b>${esc(fmtTs(item.times.added))}</b></span>
             <span class="chip meta mono">ID: <b>${esc(shortId(item))}</b></span>
@@ -1311,6 +1312,14 @@ function openForm(mode, source, priorState){
       <span class="flabel">Source</span>
       <div class="inline"><select id="f_source">${srcOpts}</select>
         <span style="color:var(--text-dim);font-size:12px">who requested this work — <b>scheduler</b> makes this a schedule template</span></div>
+      <span class="flabel">Automation</span>
+      <div class="inline">
+        <select id="f_automation" title="How work items created BY this one are born — inherited down the whole chain of agent handoffs. Guards (reject, non-convergence, failed dependencies) still land items in ToDo regardless.">
+          <option value="" ${d.automation!=='auto'?'selected':''}>review each stage — created items born ToDo (default)</option>
+          <option value="auto" ${d.automation==='auto'?'selected':''}>fully automated — created items born Queued</option>
+        </select>
+        <span style="color:var(--text-dim);font-size:12px">applies to items this one CREATES (plan → code/testwriter → …); the engine enforces it, agent prompts can't override</span>
+      </div>
       <span class="flabel" id="f_schedlabel" style="display:none">Schedule</span>
       <div id="f_schedrow" style="display:none">
         <div class="inline">
@@ -1465,6 +1474,7 @@ function saveDraft(targetState){
   d.testfiles = $('f_testfiles').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.mainwork = $('f_mainwork').value;
   d.exec = $('f_exec').value;
+  d.automation = $('f_automation').value;
   if ($('f_source').value === 'scheduler') {
     d.sched = { kind: $('f_sk').value, every_min: +$('f_severy').value || 0,
       at: $('f_sat').value.trim(), day: $('f_sday').value, tz: $('f_stz').value.trim(),
@@ -1481,7 +1491,7 @@ function saveDraft(targetState){
         source: d.source, codepath: d.codepath, codepath_ignore: d.codepath_ignore,
         depends_on: d.depends_on, context: d.context, testfiles: d.testfiles,
         prework: d.prework, postwork: d.postwork, mainwork: d.mainwork,
-        exec: d.exec, sched: d.sched };
+        exec: d.exec, sched: d.sched, automation: d.automation };
       const stateAction = targetState === 'queued' ? 'queue' : targetState === 'todo' ? 'todo'
         : targetState === 'scheduled' ? 'schedule' : 'pause';
       api(`/api/workitems/${draft.base}`, { method: 'PATCH', body: JSON.stringify(fields) })
