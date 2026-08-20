@@ -885,31 +885,45 @@ function renderBulkBar(){
   if (!bulkMode) { bar.style.display = 'none'; return; }
   bar.style.display = '';
   const n = bulkSel.size;
+  const del = bulkTarget === 'delete';
   bar.innerHTML = `
     <b>${n} selected</b>
     <label>Move to:
       <select id="bulkState">
         ${['queued','todo','paused','complete'].map(s =>
           `<option value="${s}" ${bulkTarget===s?'selected':''}>${STATES[s].label}</option>`).join('')}
+        <option value="delete" ${del?'selected':''}>🗑 Delete (permanent)</option>
       </select></label>
-    <button class="btn primary" data-bulkact="go" ${n?'':'disabled'}>Move ${n} workitem${n===1?'':'s'}</button>
+    <button class="btn ${del?'danger':'primary'}" data-bulkact="go" ${n?'':'disabled'}>${del?'Delete':'Move'} ${n} workitem${n===1?'':'s'}</button>
     <button class="btn" data-bulkact="clear" ${n?'':'disabled'}>Uncheck all</button>
     <button class="btn" data-bulkact="exit">Done</button>
     <span class="hint">${esc(bulkResult)}</span>`;
-  $('bulkState').addEventListener('change', e => { bulkTarget = e.target.value; });
+  // Re-render so the Go button flips label/danger style with the selection.
+  $('bulkState').addEventListener('change', e => { bulkTarget = e.target.value; renderBulkBar(); });
 }
 
 function confirmBulkMove(){
   const n = bulkSel.size;
   if (!n) return;
-  openLb('Move work items?', `
-    <p style="margin-top:0">Move <b>${n}</b> selected work item${n===1?'':'s'} to
-    <b>${STATES[bulkTarget].label}</b>?</p>
-    <p style="color:var(--text-dim);font-size:12.5px">Archived, in-progress, and scheduled items cannot be
-    moved and stay checked so you can see which they were. Moving to Queued makes items immediately
-    eligible for dispatch.</p>`,
-    `<button class="btn" data-lbclose>Cancel</button>
-     <button class="btn primary" id="bulkConfirm">Move ${n} workitem${n===1?'':'s'}</button>`);
+  if (bulkTarget === 'delete') {
+    openLb('Delete work items?', `
+      <p style="margin-top:0">This <b>permanently deletes ${n}</b> selected work item${n===1?'':'s'}
+      from the queue. <b>The engine keeps no copy</b> — there is no undo.</p>
+      <p style="color:var(--text-dim);font-size:12.5px">Archived and in-progress items cannot be deleted
+      and stay checked so you can see which they were. Scheduled templates ARE deleted (their schedule
+      is gone with them).</p>`,
+      `<button class="btn" data-lbclose>Cancel</button>
+       <button class="btn danger" id="bulkConfirm">Delete ${n} workitem${n===1?'':'s'}</button>`);
+  } else {
+    openLb('Move work items?', `
+      <p style="margin-top:0">Move <b>${n}</b> selected work item${n===1?'':'s'} to
+      <b>${STATES[bulkTarget].label}</b>?</p>
+      <p style="color:var(--text-dim);font-size:12.5px">Archived, in-progress, and scheduled items cannot be
+      moved and stay checked so you can see which they were. Moving to Queued makes items immediately
+      eligible for dispatch.</p>`,
+      `<button class="btn" data-lbclose>Cancel</button>
+       <button class="btn primary" id="bulkConfirm">Move ${n} workitem${n===1?'':'s'}</button>`);
+  }
   $('bulkConfirm').addEventListener('click', bulkMove);
 }
 
@@ -918,16 +932,22 @@ function confirmBulkMove(){
    (network/5xx; stays checked, shown only when nonzero). */
 async function bulkMove(){
   const target = bulkTarget;
-  const action = { queued:'queue', todo:'todo', paused:'pause', complete:'complete' }[target];
+  const del = target === 'delete';
+  const action = del ? 'delete' : { queued:'queue', todo:'todo', paused:'pause', complete:'complete' }[target];
   let ok = 0, cannot = 0, fail = 0;
   for (const id of [...bulkSel]) {
     const item = items.find(i => i.workid === id);
     if (!item) { bulkSel.delete(id); continue; }
-    if (item.times.closed || item.state === 'in-progress' || item.state === 'scheduled') { cannot++; continue; }
-    if (item.state === target) { ok++; bulkSel.delete(id); continue; }
+    // Archived items are immutable and the engine owns in-progress items in
+    // every mode; scheduled templates block state MOVES but may be deleted.
+    if (item.times.closed || item.state === 'in-progress' || (!del && item.state === 'scheduled')) { cannot++; continue; }
+    if (!del && item.state === target) { ok++; bulkSel.delete(id); continue; }
     if (!LIVE) {
-      item.state = target;
-      if (target === 'complete') item.times.closed = nowIso();
+      if (del) { items = items.filter(i => i.workid !== id); openIds.delete(id); }
+      else {
+        item.state = target;
+        if (target === 'complete') item.times.closed = nowIso();
+      }
       ok++; bulkSel.delete(id); continue;
     }
     try {
@@ -940,7 +960,9 @@ async function bulkMove(){
       else fail++;
     } catch (e) { fail++; }
   }
-  bulkResult = `Moved to ${STATES[target].label}: ${ok} · Cannot move: ${cannot}` + (fail ? ` · FAILED: ${fail}` : '');
+  bulkResult = del
+    ? `Deleted: ${ok} · Cannot delete: ${cannot}` + (fail ? ` · FAILED: ${fail}` : '')
+    : `Moved to ${STATES[target].label}: ${ok} · Cannot move: ${cannot}` + (fail ? ` · FAILED: ${fail}` : '');
   closeLb();
   if (LIVE) { await loadAll(); } else { render(); }
   renderBulkBar();
