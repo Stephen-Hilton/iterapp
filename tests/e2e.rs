@@ -505,14 +505,45 @@ fn api_crud_history_markers_and_settings() {
     assert!(markers.contains("\"svc-api\""));
     assert!(markers.contains("bizreq.iter.md"));
 
-    // usecase create lands in globalsettings.usecase_default_path
-    // (default {codepath}/usecases/), named <slug>.usecase.iter.md
+    // usecase create is FOLDERED (folder-owns-its-files, same layout the
+    // usecase agent writes): <usecase_default_path>/<slug>/<slug>.usecase.iter.md
+    // declaring testgroup:/test_dir:, plus a starter testgroup with one
+    // empty-testlist E2E group (the sweep births the authoring item from it).
     let uc = http(port, "POST", "/api/usecases", Some(r#"{"name":"Pay Flow","description":"d","participants":["1 svc"]}"#));
     assert!(uc.contains("201"), "{}", uc);
+    let uc_file = dest.join("usecases/pay-flow/pay-flow.usecase.iter.md");
+    assert!(uc_file.is_file(), "created use-case must be foldered under <code_root>/usecases/");
+    let uc_text = std::fs::read_to_string(&uc_file).unwrap();
     assert!(
-        dest.join("usecases/pay-flow.usecase.iter.md").is_file(),
-        "created use-case must land under <code_root>/usecases/"
+        uc_text.contains("testgroup: test/testgroup.iter.md") && uc_text.contains("test_dir: test"),
+        "tests declared from day one: {}",
+        uc_text
     );
+    let tg_text = std::fs::read_to_string(dest.join("usecases/pay-flow/test/testgroup.iter.md")).unwrap();
+    assert!(tg_text.contains("pay-flow-e2e") && tg_text.contains("\"testlist\":[]"), "starter group, empty testlist: {}", tg_text);
+
+    // update keeps the frontmatter keys the form doesn't own
+    let upd = http(
+        port,
+        "PUT",
+        "/api/usecases",
+        Some(&format!(
+            r#"{{"file":"{}","name":"Pay Flow","description":"d2","participants":["1 svc"],"body":"story"}}"#,
+            uc_file.display()
+        )),
+    );
+    assert!(upd.contains("200"), "{}", upd);
+    let uc_text = std::fs::read_to_string(&uc_file).unwrap();
+    assert!(
+        uc_text.contains("d2") && uc_text.contains("testgroup: test/testgroup.iter.md") && uc_text.contains("test_dir: test"),
+        "an edit must not strip testgroup/test_dir: {}",
+        uc_text
+    );
+
+    // deleting a foldered use-case removes the whole folder, tests included
+    let del = http(port, "POST", "/api/usecases/delete", Some(&format!(r#"{{"file":"{}"}}"#, uc_file.display())));
+    assert!(del.contains("200") && del.contains("\"folder\":true"), "{}", del);
+    assert!(!dest.join("usecases/pay-flow").exists(), "the whole folder goes");
 
     // config roundtrip
     let put = http(port, "PUT", "/api/config", Some(r#"{"engine":{"tick_interval_sec":2},"globalsettings":{}}"#));

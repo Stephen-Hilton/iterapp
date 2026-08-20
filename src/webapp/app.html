@@ -2793,7 +2793,7 @@ function ucForm(idx){
 async function ucDelete(idx){
   const u = USECASES[idx];
   if (!u) return;
-  if (!confirm(`Delete use-case "${u.name}"?\n\nThe marker file will be removed:\n${u.file}`)) return;
+  if (!confirm(`Delete use-case "${u.name}"?\n\n${u.file}\n\nA foldered use-case (<name>/<name>.usecase.iter.md) loses its WHOLE folder — E2E tests and run history included. A flat file is removed alone.`)) return;
   if (!LIVE) { toast('Mock mode — nothing deleted'); return; }
   try {
     await api('/api/usecases/delete', { method: 'POST', body: JSON.stringify({ file: u.file }) });

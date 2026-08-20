@@ -1023,9 +1023,18 @@ repoint the participants at your real nodes, or delete it.)
 }
 
 /// Shape a use-case marker file from its parts. Participants are "step key" lines.
-fn usecase_file_text(name: &str, description: &str, participants: &[String], body: &str) -> String {
+fn usecase_file_text(name: &str, description: &str, participants: &[String], body: &str, extra: &[(String, String)]) -> String {
     let clean = |s: &str| s.replace(['"', '\n', '\r'], " ").trim().to_string();
-    let mut t = format!("---\nname: \"{}\"\ndescription: \"{}\"\nparticipants:\n", clean(name), clean(description));
+    let mut t = format!("---\nname: \"{}\"\ndescription: \"{}\"\n", clean(name), clean(description));
+    for (k, v) in extra {
+        // Quote prose values containing ": " so strict-YAML readers keep loading.
+        if v.contains(": ") {
+            t.push_str(&format!("{}: \"{}\"\n", k, clean(v)));
+        } else {
+            t.push_str(&format!("{}: {}\n", k, v));
+        }
+    }
+    t.push_str("participants:\n");
     for p in participants {
         let p = p.trim();
         if !p.is_empty() {
@@ -1060,10 +1069,16 @@ fn usecase_path(project: &Path, raw: &str) -> Result<PathBuf, String> {
 }
 
 /// POST /api/usecases (create), PUT /api/usecases (update: body carries `file`),
-/// POST /api/usecases/delete. Use-cases are ordinary marker files; created ones land
-/// in `globalsettings.usecase_default_path` (default `{codepath}/usecases/` —
-/// keep it inside the project or code root, or update/delete will refuse the path),
-/// updates rewrite the file wherever it already lives.
+/// POST /api/usecases/delete. Created use-cases are FOLDERED — the same
+/// folder-owns-its-files law C4 objects follow and the usecase agent writes:
+/// `<usecase_default_path>/<slug>/<slug>.usecase.iter.md` declaring
+/// `testgroup:`/`test_dir:`, plus a starter testgroup.iter.md holding one
+/// empty-testlist E2E group (the sweep turns empty testlists into testwriter
+/// authoring items, so E2E coverage follows automatically). Updates rewrite
+/// the file wherever it lives, carrying through frontmatter keys the form
+/// doesn't own (testgroup, test_dir, test_loop, …). Deleting a FOLDERED
+/// use-case (`<name>/<name>.usecase.iter.md`) removes the whole folder, tests
+/// included; a flat file is removed alone.
 fn api_usecases(req: &Req, project: &Path, action: &str) -> Resp {
     let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
         return err_resp(400, "body must be a JSON object");
@@ -1076,10 +1091,26 @@ fn api_usecases(req: &Req, project: &Path, action: &str) -> Resp {
         .unwrap_or_default();
     match action {
         "delete" => match usecase_path(project, &s("file")) {
-            Ok(path) => match std::fs::remove_file(&path) {
-                Ok(()) => json_resp(200, json!({ "deleted": path.to_string_lossy() })),
-                Err(e) => err_resp(500, &format!("cannot delete: {}", e)),
-            },
+            Ok(path) => {
+                // The foldered signature: the file's own directory is named
+                // after it (`<name>/<name>.usecase.iter.md`).
+                let fname = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                let stem = fname.strip_suffix(".usecase.iter.md").unwrap_or("");
+                let folder = path
+                    .parent()
+                    .filter(|d| !stem.is_empty() && d.file_name().map(|n| n.to_string_lossy() == stem).unwrap_or(false));
+                let result = match folder {
+                    Some(dir) => std::fs::remove_dir_all(dir).map(|()| dir.to_path_buf()),
+                    None => std::fs::remove_file(&path).map(|()| path.clone()),
+                };
+                match result {
+                    Ok(removed) => json_resp(
+                        200,
+                        json!({ "deleted": removed.to_string_lossy(), "folder": folder.is_some() }),
+                    ),
+                    Err(e) => err_resp(500, &format!("cannot delete: {}", e)),
+                }
+            }
             Err(e) => err_resp(400, &e),
         },
         "create" | "update" => {
@@ -1087,13 +1118,27 @@ fn api_usecases(req: &Req, project: &Path, action: &str) -> Resp {
             if name.trim().is_empty() {
                 return err_resp(400, "a use-case needs a name");
             }
+            let cfg = config::load(project);
+            // Frontmatter keys beyond the form's own fields ride through an
+            // update untouched (testgroup/test_dir/test_loop must survive an
+            // edit); a create declares its tests from day one.
+            let mut extra: Vec<(String, String)> = Vec::new();
             // Participants are optional: the FILENAME (*usecase.iter.md) classifies
             // the file; participant lines only thread it through the tree.
             let path = if action == "update" {
-                match usecase_path(project, &s("file")) {
+                let path = match usecase_path(project, &s("file")) {
                     Ok(p) => p,
                     Err(e) => return err_resp(400, &e),
+                };
+                if let Ok(prev) = std::fs::read_to_string(&path) {
+                    let (front, _, _) = markers::frontmatter(&prev);
+                    extra = front
+                        .into_iter()
+                        .filter(|(k, _)| !matches!(k.as_str(), "name" | "description" | "participants"))
+                        .collect();
+                    extra.sort();
                 }
+                path
             } else {
                 let slug: String = name
                     .to_lowercase()
@@ -1101,18 +1146,42 @@ fn api_usecases(req: &Req, project: &Path, action: &str) -> Resp {
                     .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
                     .collect();
                 let slug = slug.trim_matches('-').to_string();
-                let dir = config::usecase_dir(project, &config::load(project));
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    return err_resp(500, &format!("cannot create {}: {}", dir.display(), e));
-                }
+                let slug = if slug.is_empty() { "new".to_string() } else { slug };
+                let folder = config::usecase_dir(project, &cfg).join(&slug);
                 // The filename IS the role: created use-cases are *.usecase.iter.md.
-                let p = dir.join(format!("{}.usecase.iter.md", if slug.is_empty() { "new" } else { &slug }));
+                let p = folder.join(format!("{}.usecase.iter.md", slug));
                 if p.exists() {
                     return err_resp(409, &format!("{} already exists — edit it instead", p.display()));
                 }
+                let test_dir = cfg.globalsettings.test_dir.clone();
+                if let Err(e) = std::fs::create_dir_all(folder.join(&test_dir)) {
+                    return err_resp(500, &format!("cannot create {}: {}", folder.display(), e));
+                }
+                // Starter testgroup: one empty-testlist E2E group — enough for
+                // the sweep to birth the testwriter authoring item.
+                let tg_path = folder.join(&test_dir).join("testgroup.iter.md");
+                if !tg_path.exists() {
+                    let group = crate::testgroups::TestGroup {
+                        label: format!("{}-e2e", slug),
+                        desc: format!(
+                            "End-to-end journey tests for use-case \"{}\": scripts that walk the actual user journey through the real participants",
+                            name.trim()
+                        ),
+                        auto_fix: false,
+                        ..Default::default()
+                    };
+                    let header = format!("# {} — E2E journey test groups\n\nDefinitions only; the testwriter authors the scripts and fills the testlist.\n", name.trim());
+                    if let Err(e) = std::fs::write(&tg_path, crate::testgroups::update(&header, &[group])) {
+                        return err_resp(500, &format!("cannot write {}: {}", tg_path.display(), e));
+                    }
+                }
+                extra = vec![
+                    ("testgroup".into(), format!("{}/testgroup.iter.md", test_dir)),
+                    ("test_dir".into(), test_dir),
+                ];
                 p
             };
-            match std::fs::write(&path, usecase_file_text(&name, &description, &participants, &s("body"))) {
+            match std::fs::write(&path, usecase_file_text(&name, &description, &participants, &s("body"), &extra)) {
                 Ok(()) => json_resp(if action == "create" { 201 } else { 200 }, json!({ "file": path.to_string_lossy() })),
                 Err(e) => err_resp(500, &format!("cannot write {}: {}", path.display(), e)),
             }
