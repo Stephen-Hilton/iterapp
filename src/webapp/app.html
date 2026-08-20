@@ -402,6 +402,19 @@
   .lvlchip:hover { border-color: var(--text-dim); }
   .lvlchip.active { border-color: var(--thread); box-shadow: 0 0 0 1px var(--thread); }
   .legendbar .lhint { color: var(--text-dim); font-size: 11.5px; }
+  /* Bulk state change (pinned bar + per-row checkboxes) */
+  .bulkbar {
+    position: sticky; top: 8px; z-index: 60; display: flex; align-items: center;
+    gap: 10px; flex-wrap: wrap; background: var(--surface);
+    border: 1px solid var(--s-queued-bg); border-radius: 9px; padding: 8px 14px;
+    margin: 0 0 10px; box-shadow: var(--row-shadow); font-size: 13px;
+  }
+  .bulkbar .hint { color: var(--text-dim); font-size: 12.5px; }
+  /* .rowhead is a 3-column grid (stateicon | rowmid | actions); bulk mode adds
+     a leading checkbox column so the existing columns keep their shape. */
+  .rowhead.bulk { grid-template-columns: 34px 46px 1fr auto; }
+  .rowhead input[data-bulksel] { width: 16px; height: 16px; margin: auto; accent-color: var(--s-queued-bg); cursor: pointer; }
+
   .ptree { background: var(--surface); border: 1px solid var(--border); border-radius: 9px; box-shadow: var(--row-shadow); overflow: hidden; }
   .prow {
     display: flex; align-items: center; gap: 8px; padding: 4px 12px 4px 8px;
@@ -533,9 +546,12 @@
           <option value="source">Requested By</option>
         </select>
       </label>
+      <button class="btn" id="bulkBtn">Select Multiple Workitems for State Change</button>
       <button class="btn" id="collapseAll">Collapse All</button>
       <button class="btn primary" id="newItem">New WorkItem</button>
     </div>
+
+    <div class="bulkbar" id="bulkBar" style="display:none"></div>
 
     <div class="rows" id="rows"></div>
     </div><!-- /view-workitems -->
@@ -850,6 +866,87 @@ let openIds = new Set(LIVE ? [] : [items[1].workid]);
 let engineRunning = true;
 let sortBy = 'state';
 
+/* ------------------------------------------------- bulk state change */
+let bulkMode = false;
+let bulkSel = new Set();
+let bulkTarget = 'queued';
+let bulkResult = '';
+
+function setBulkMode(on){
+  bulkMode = on;
+  if (!on) bulkSel.clear();
+  bulkResult = '';
+  $('bulkBtn').textContent = on ? 'Exit Multi-Select' : 'Select Multiple Workitems for State Change';
+  renderBulkBar(); render();
+}
+
+function renderBulkBar(){
+  const bar = $('bulkBar');
+  if (!bulkMode) { bar.style.display = 'none'; return; }
+  bar.style.display = '';
+  const n = bulkSel.size;
+  bar.innerHTML = `
+    <b>${n} selected</b>
+    <label>Move to:
+      <select id="bulkState">
+        ${['queued','todo','paused','complete'].map(s =>
+          `<option value="${s}" ${bulkTarget===s?'selected':''}>${STATES[s].label}</option>`).join('')}
+      </select></label>
+    <button class="btn primary" data-bulkact="go" ${n?'':'disabled'}>Move ${n} workitem${n===1?'':'s'}</button>
+    <button class="btn" data-bulkact="clear" ${n?'':'disabled'}>Uncheck all</button>
+    <button class="btn" data-bulkact="exit">Done</button>
+    <span class="hint">${esc(bulkResult)}</span>`;
+  $('bulkState').addEventListener('change', e => { bulkTarget = e.target.value; });
+}
+
+function confirmBulkMove(){
+  const n = bulkSel.size;
+  if (!n) return;
+  openLb('Move work items?', `
+    <p style="margin-top:0">Move <b>${n}</b> selected work item${n===1?'':'s'} to
+    <b>${STATES[bulkTarget].label}</b>?</p>
+    <p style="color:var(--text-dim);font-size:12.5px">Archived, in-progress, and scheduled items cannot be
+    moved and stay checked so you can see which they were. Moving to Queued makes items immediately
+    eligible for dispatch.</p>`,
+    `<button class="btn" data-lbclose>Cancel</button>
+     <button class="btn primary" id="bulkConfirm">Move ${n} workitem${n===1?'':'s'}</button>`);
+  $('bulkConfirm').addEventListener('click', bulkMove);
+}
+
+/* Per-item results: moved (unchecked), cannot-move (rule refusal — archived /
+   engine-owned / template, or a server 4xx; stays checked), failed
+   (network/5xx; stays checked, shown only when nonzero). */
+async function bulkMove(){
+  const target = bulkTarget;
+  const action = { queued:'queue', todo:'todo', paused:'pause', complete:'complete' }[target];
+  let ok = 0, cannot = 0, fail = 0;
+  for (const id of [...bulkSel]) {
+    const item = items.find(i => i.workid === id);
+    if (!item) { bulkSel.delete(id); continue; }
+    if (item.times.closed || item.state === 'in-progress' || item.state === 'scheduled') { cannot++; continue; }
+    if (item.state === target) { ok++; bulkSel.delete(id); continue; }
+    if (!LIVE) {
+      item.state = target;
+      if (target === 'complete') item.times.closed = nowIso();
+      ok++; bulkSel.delete(id); continue;
+    }
+    try {
+      const r = await fetch(`/api/workitems/${id}/action`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      if (r.ok) { ok++; bulkSel.delete(id); }
+      else if (r.status < 500) cannot++;
+      else fail++;
+    } catch (e) { fail++; }
+  }
+  bulkResult = `Moved to ${STATES[target].label}: ${ok} · Cannot move: ${cannot}` + (fail ? ` · FAILED: ${fail}` : '');
+  closeLb();
+  if (LIVE) { await loadAll(); } else { render(); }
+  renderBulkBar();
+  toast(bulkResult);
+}
+
 /* ------------------------------------------------------------- live loading */
 
 async function loadAll(){
@@ -1042,8 +1139,9 @@ function renderRows(){
     const open = openIds.has(item.workid);
     return `
     <div class="item ${open?'open':''}" data-id="${item.workid}">
-      <div class="rowhead" data-rowclick="${item.workid}" role="button" tabindex="0"
+      <div class="rowhead ${bulkMode?'bulk':''}" data-rowclick="${item.workid}" role="button" tabindex="0"
            aria-expanded="${open}" aria-label="Toggle detail for: ${esc(item.title)}">
+        ${bulkMode ? `<input type="checkbox" data-bulksel="${item.workid}" ${bulkSel.has(item.workid)?'checked':''} aria-label="Select for bulk state change">` : ''}
         <div class="stateicon" style="background:${st.bg};color:${st.fg}">${st.icon}</div>
         <div class="rowmid">
           <div class="title">${esc(item.title)}</div>
@@ -1118,6 +1216,9 @@ function actionButtons(item){
   if (s === 'todo' || s === 'paused') b.push(['queue','Queue']);
   if ((s === 'todo' || s === 'paused') && item.sched && item.sched.kind) b.push(['schedule','Resume Schedule']);
   if (s === 'failed') b.push(['queue','Requeue (Retry)']);
+  // paused/queued/failed can always go back to the ToDo review bucket — the
+  // ToDo → Pause & Edit → ToDo round-trip must work from the menu too.
+  if (s === 'paused' || s === 'queued' || s === 'failed') b.push(['todo','Move to ToDo']);
   if (s !== 'complete') { b.push(['complete','Complete']); b.push(['pauseedit','Pause &amp; Edit']); }
   if (s === 'complete') b.push(['followup','Create Follow-up Request']);
   b.push(['clone','Clone']);
@@ -1663,7 +1764,21 @@ document.addEventListener('click', (e) => {
   if (!e.target.closest('.actmenu') && !e.target.closest('[data-actions]')) {
     document.querySelectorAll('.actmenu.open').forEach(m => m.classList.remove('open'));
   }
+  // Bulk checkbox: record the selection and DON'T toggle the row detail.
+  if (e.target.dataset && e.target.dataset.bulksel !== undefined) {
+    const id = e.target.dataset.bulksel;
+    if (e.target.checked) bulkSel.add(id); else bulkSel.delete(id);
+    renderBulkBar();
+    return;
+  }
   if (!t) return;
+
+  if (t.dataset.bulkact) {
+    if (t.dataset.bulkact === 'exit') setBulkMode(false);
+    else if (t.dataset.bulkact === 'clear') { bulkSel.clear(); renderBulkBar(); render(); }
+    else if (t.dataset.bulkact === 'go') confirmBulkMove();
+    return;
+  }
 
   if (t.dataset.filter) {
     const f = t.dataset.filter;
@@ -1728,6 +1843,7 @@ document.addEventListener('keydown', (e) => {
 
 $('overlay').addEventListener('click', (e) => { if (e.target === $('overlay')) { draft = null; closeLb(); } });
 $('sortBy').addEventListener('change', (e) => { sortBy = e.target.value; render(); });
+$('bulkBtn').addEventListener('click', () => setBulkMode(!bulkMode));
 
 /* ================================================================== views */
 
@@ -2382,6 +2498,12 @@ async function loadProjects(){
   return scan;
 }
 
+/* Resolve a marker reference from a data attribute: PATH first (unique — two
+   top-level markers can share key ""), key as a fallback for older callers. */
+function markerByRef(v){
+  return MARKERS.find(x => x.path === v) || MARKERS.find(x => x.key === v) || null;
+}
+
 function ifaceTouches(m, id){
   return (m.uses || []).includes(id) || (m.provides || []).includes(id);
 }
@@ -2461,31 +2583,26 @@ async function renderProjects(){
             ? (m.provides.includes(projIface) ? 'prov' : 'uses') : '');
       const dim = threaded && !step;
       const indent = projOrder === 'hierarchy' ? m.depth * 22 : 0;
-      const open = openMarker === m.key;
-      const ifaceOf = (u) => INTERFACES.some(i => i.id === u);
+      const open = openMarker === m.path;
       const tl = effTestLoop(m);
       return `
-      <div class="prow ${dim?'dimmed':''} ${step?'participant':''}" data-marker="${esc(m.key)}"
+      <div class="prow ${dim?'dimmed':''} ${step?'participant':''}" data-marker="${esc(m.path)}"
            role="button" tabindex="0" style="padding-left:${8+indent}px">
         <span class="lvltag" style="background:var(--lvl-${m.level}-bg, var(--surface2));color:var(--lvl-${m.level}-fg, var(--text))">${esc(m.level)}</span>
         <span class="pname">${esc(m.name)}</span>
         ${tlBadge(tl)}
         <span class="pdesc">${esc(m.desc)}</span>
-        <span class="uses">
-          ${m.provides.map(u => `<span class="useb prov ${ifaceOf(u)?'linked':''}" title="provides interface">▲ ${esc(u)}</span>`).join('')}
-          ${m.uses.map(u => `<span class="useb ${ifaceOf(u)?'linked':''}" title="${ifaceOf(u)?'uses declared interface':'uses (no interface declared)'}">${esc(u)}</span>`).join('')}
-        </span>
         ${step ? `<span class="step">${esc(step)}</span>` : ''}
       </div>
       ${open ? `<div class="pdetail">
         ${c4DetailRows(m)}
         <div class="dlabel">Use-cases</div><div>${USECASES.filter(u=>u.steps[m.key]).map(u=>`${esc(u.name)} <b class="mono">(${u.steps[m.key]})</b>`).join('<br>') || '<span style="color:var(--text-dim)">not a participant</span>'}</div>
         <div class="actions">
-          <button class="btn primary" data-mkworkitem="${esc(m.key)}">Create WorkItem here</button>
-          <button class="btn" data-reqlb="bizreq" data-node="${esc(m.key)}">Biz Requirements</button>
-          <button class="btn" data-reqlb="techreq" data-node="${esc(m.key)}">Tech Requirements</button>
-          <button class="btn" data-testlb data-node="${esc(m.key)}">Testing</button>
-          <button class="btn" data-viewmarker="${esc(m.key)}">View Marker File</button>
+          <button class="btn primary" data-mkworkitem="${esc(m.path)}">Create WorkItem here</button>
+          <button class="btn" data-reqlb="bizreq" data-node="${esc(m.path)}">Biz Requirements</button>
+          <button class="btn" data-reqlb="techreq" data-node="${esc(m.path)}">Tech Requirements</button>
+          <button class="btn" data-testlb data-node="${esc(m.path)}">Testing</button>
+          <button class="btn" data-viewmarker="${esc(m.path)}">View Marker File</button>
           ${tlButtons(m.path, m.test_loop, tl.state === 'omitted')}
         </div>
       </div>` : ''}`;
@@ -2670,7 +2787,7 @@ function projClick(e){
   if (tla) { tlApply(tla.dataset.tlact, tla.dataset.tlref); return true; }
   const mk_ = e.target.closest('[data-mkworkitem]');
   if (mk_) {
-    const m = MARKERS.find(x => x.key === mk_.dataset.mkworkitem);
+    const m = markerByRef(mk_.dataset.mkworkitem);
     // Expand the default_context TEMPLATE from Project Settings — placeholders
     // resolve here; literal lines (and {codepath} lines) pass through for the engine.
     const ctx = [];
@@ -2722,7 +2839,7 @@ function projClick(e){
   }
   const vm = e.target.closest('[data-viewmarker]');
   if (vm) {
-    const m = MARKERS.find(x => x.key === vm.dataset.viewmarker);
+    const m = markerByRef(vm.dataset.viewmarker);
     if (m.body) {
       // LIVE (or any marker whose body we hold): show the real file content.
       const front = `---\nname: ${m.name}\nlevel: ${m.level}\ndescription: "${m.desc}"` +
@@ -2811,7 +2928,7 @@ function c4DetailRows(m){
     <div class="dlabel">Short desc</div><div>${esc(m.desc) || '<span style="color:var(--text-dim)">—</span>'}</div>
     <div class="dlabel">Long desc</div>
     <div><div class="longdesc ${ld?'':'tbd'}">${esc(ld || 'TBD — this marker has no Long Description yet. Click Edit to write one: plain language, no jargon, acronyms defined on first use ("three letter acronym (TLA)").')}</div>
-      <button class="btn" style="margin-top:6px" data-editlong="${esc(m.key)}">Edit Long Description</button></div>
+      <button class="btn" style="margin-top:6px" data-editlong="${esc(m.path)}">Edit Long Description</button></div>
     <div class="dlabel">Marker</div><div class="mono">${esc(m.path)}</div>
     <div class="dlabel">CodePath</div><div class="mono">${esc(absCodepath(m.dir))}</div>
     <div class="dlabel">Uses / Provides</div><div>${upBoxesHtml(m)}</div>`;
@@ -2873,8 +2990,8 @@ function navIface(id){
 
 /* ------------------------------------------------ long description editor */
 
-async function editLongDesc(key){
-  const m = MARKERS.find(x => x.key === key);
+async function editLongDesc(ref){
+  const m = markerByRef(ref);
   if (!m) return;
   if (!LIVE) { toast('Mock mode — open via iter start to edit'); return; }
   let file;
@@ -2902,8 +3019,8 @@ async function editLongDesc(key){
 
 /* ------------------------------------- requirements lightbox (local+global) */
 
-async function reqLb(key, kind){
-  const m = MARKERS.find(x => x.key === key);
+async function reqLb(ref, kind){
+  const m = markerByRef(ref);
   if (!m) return;
   const label = kind === 'bizreq' ? 'Business Requirements' : 'Technical Requirements';
   // The marker file may declare where its requirement files live; fall back to
@@ -2950,8 +3067,8 @@ function tgResultColor(r){
     : r === 'error' ? 'var(--s-paused-bg)' : 'var(--border)';
 }
 
-async function testingLb(key){
-  tg.node = key === null ? null : MARKERS.find(x => x.key === key) || null;
+async function testingLb(ref){
+  tg.node = ref === null || ref === undefined ? null : markerByRef(ref);
   if (!LIVE) { toast('Mock mode — open via iter start for live test data'); return; }
   let data;
   try { data = await api('/api/testgroups'); } catch (e) { toast('Testgroups: ' + e.message); return; }
