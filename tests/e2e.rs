@@ -1091,3 +1091,98 @@ fn add_resolves_suffixes_and_refuses_cycles() {
     assert!(err.contains("cycle") && err.contains("111111111111") && err.contains("000000000000"), "{}", err);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Stopping an in-progress ("errantly started") item (workitem_stop.md): the
+/// stop flag kills the running session mid-turn, the item lands in `todo` with
+/// the STOPPED note and its partial state, and `git_start_commit` records the
+/// pre-run HEAD — the undo point the webapp's confirmation offers. The stub
+/// sleeps 60s, so if the kill doesn't work the engine run times out red.
+#[test]
+fn stop_in_progress_item_lands_in_todo_with_git_undo_point() {
+    let (root, stub) = setup_project("stopitem", 3, 200);
+
+    // Make the project a git repo with one commit — "a git commit prior to starting".
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root.to_str().unwrap())
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "baseline"]);
+    let head = git(&["rev-parse", "HEAD"]);
+
+    // Teach the stub a slow turn, so there is a mid-stream to stop.
+    let stub_text = std::fs::read_to_string(&stub).unwrap().replace(
+        "case \"$args\" in\n  *FAIL_TRIGGER*)",
+        "case \"$args\" in\n  *SLOW_TRIGGER*) sleep 60;;\nesac\ncase \"$args\" in\n  *FAIL_TRIGGER*)",
+    );
+    assert!(stub_text.contains("SLOW_TRIGGER"), "stub rewrite must apply");
+    std::fs::write(&stub, stub_text).unwrap();
+
+    seed(&root, &workitem_json("stop-me", "code", "errantly started", "./src", "SLOW_TRIGGER", "", ""));
+
+    let mut child = Command::new(BIN)
+        .args(["run", "--project", root.to_str().unwrap(), "--until-idle"])
+        .env("ITER_CLAUDE_BIN", &stub)
+        .env("HOME", &root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("engine spawns");
+
+    // Wait for the item to be picked up, then deliver the stop.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(Instant::now() < deadline, "item never reached in-progress");
+        if open_items(&root).iter().any(|i| i["workid"] == "stop-me" && i["state"] == "in-progress") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::fs::write(root.join(".iter/.engine/stopitem-stop-me.signal"), "stop requested\n").unwrap();
+
+    // The kill acts mid-turn: the engine must reach idle long before the 60s
+    // sleep would end. Break the kill and this times out red.
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                assert!(status.success(), "engine must exit cleanly after the stop");
+                break;
+            }
+            None => {
+                if Instant::now() > exit_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("engine did not reach idle after the stop — mid-turn kill broken?");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    assert!(closed_items(&root).is_empty(), "a stopped item must not close");
+    let open = open_items(&root);
+    let item = open.iter().find(|i| i["workid"] == "stop-me").expect("item stays open");
+    assert_eq!(item["state"], "todo", "stopped work returns to todo for human review");
+    let note = item["lasterror"].as_str().unwrap();
+    assert!(note.contains("STOPPED by user"), "note explains the stop: {}", note);
+    assert_eq!(
+        item["git_start_commit"].as_str().unwrap(),
+        head,
+        "the pre-run HEAD is the recorded undo point"
+    );
+    assert!(
+        !root.join(".iter/.engine/stopitem-stop-me.signal").exists(),
+        "the stop flag is consumed"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

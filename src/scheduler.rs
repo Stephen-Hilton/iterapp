@@ -131,6 +131,23 @@ fn take_reject(project_root: &Path, workid: &str) -> Option<String> {
     Some(if reason.is_empty() { "rejected (no reason recorded)".to_string() } else { reason.to_string() })
 }
 
+/// User-stop flag written by the webapp's Stop action on an IN-PROGRESS item
+/// ("errantly started" work). The runner polls for it mid-turn and kills the
+/// session; the worker consumes it and moves the item to `todo` — partially
+/// completed work needs human review, never an automatic retry.
+pub fn stopitem_path(project_root: &Path, workid: &str) -> PathBuf {
+    config::engine_dir(project_root).join(format!("stopitem-{}.signal", workid))
+}
+
+fn take_stopitem(project_root: &Path, workid: &str) -> bool {
+    let path = stopitem_path(project_root, workid);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        return true;
+    }
+    false
+}
+
 fn take_critfail(project_root: &Path, workid: &str) -> Option<String> {
     let path = critfail_path(project_root, workid);
     let reason = std::fs::read_to_string(&path).ok()?;
@@ -594,6 +611,11 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
         if item.state != workitems::STATE_QUEUED && item.state != workitems::STATE_FAILED {
             return None; // someone changed it between our read and the lock
         }
+        // Stale user-stop flags (crashed/failed prior attempt) die at claim,
+        // INSIDE the record lock: a legit stop can only be written after the
+        // in-progress state is visible on disk, which is strictly after this
+        // removal — so no fresh stop can ever be lost here.
+        let _ = std::fs::remove_file(stopitem_path(&shared.project_root, &item.workid));
         item.state = workitems::STATE_IN_PROGRESS.into();
         item.attempts += 1;
         item.times.start = workitems::now_iso();
@@ -693,12 +715,19 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
         }
     };
 
+    // Undo point for a mid-stream user stop.
+    record_git_baseline(&shared, &item.workid, &codepath);
+
     let turns = build_turns(&shared, &agent, &item, &codepath, &tag);
     let mut session = Session::new(agent.clone(), codepath.clone(), shared.project_root.clone());
     // The workid lets an `iter critreview` subprocess flag THIS item as failed
     // deterministically (fail-flag file) instead of trusting the agent to stop.
     session.envs.push(("ITER_WORKID".to_string(), item.workid.clone()));
-    // Stale flags from a killed prior attempt.
+    // A user stop kills the session mid-turn (runner polls this path).
+    session.stop_flag = Some(stopitem_path(&shared.project_root, &item.workid));
+    // Stale flags from a killed prior attempt. (Stale STOP flags are removed
+    // at claim time in pick_next, under the record lock — doing it here would
+    // race a stop the user sent the moment the item showed in-progress.)
     let _ = std::fs::remove_file(critfail_path(&shared.project_root, &item.workid));
     let _ = std::fs::remove_file(reject_path(&shared.project_root, &item.workid));
     let mut outputs: Vec<String> = Vec::new();
@@ -712,10 +741,23 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
             drop(lock);
             return;
         }
+        // User stop between turns (the mid-turn case is the runner's kill).
+        if take_stopitem(&shared.project_root, &item.workid) {
+            logging::warn(&tag, &format!("user stop: halting {} → todo", short(&item.workid)));
+            stop_item(&shared, &item.workid, outputs.join("\n"));
+            drop(lock);
+            return;
+        }
         // A `.sh` prepostwork step: the engine runs it directly (no LLM); its
         // output lands in the item output and prefaces the next LLM turn.
         if let Some(cmd) = &step.shell {
-            match run_shell_command(cmd, &codepath, &session.envs, cfg.engine.shell_timeout_sec) {
+            match run_shell_command(
+                cmd,
+                &codepath,
+                &session.envs,
+                cfg.engine.shell_timeout_sec,
+                session.stop_flag.as_deref(),
+            ) {
                 Ok(out) => {
                     logging::info(&tag, &format!("{} done (engine-run)", step.turn.label));
                     outputs.push(format!("[{}] $ {}\n{}", step.turn.label, cmd, out));
@@ -724,6 +766,12 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
                     continue;
                 }
                 Err(e) => {
+                    if take_stopitem(&shared.project_root, &item.workid) || e == crate::runner::STOPPED_BY_USER {
+                        logging::warn(&tag, &format!("user stop: halting {} → todo", short(&item.workid)));
+                        stop_item(&shared, &item.workid, outputs.join("\n"));
+                        drop(lock);
+                        return;
+                    }
                     let msg = format!("{} failed: {}", step.turn.label, e);
                     logging::error(&tag, &msg);
                     fail_item(&shared, &item, &msg, outputs.join("\n"), &tag);
@@ -779,6 +827,15 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
         match turn_result {
             Ok(_) => {}
             Err(e) => {
+                // User stop first: the runner's mid-turn kill surfaces as this
+                // error (and the flag may still be on disk — consume it either
+                // way). Routed to todo, never the failed/retry path.
+                if take_stopitem(&shared.project_root, &item.workid) || e == crate::runner::STOPPED_BY_USER {
+                    logging::warn(&tag, &format!("user stop: halting {} → todo", short(&item.workid)));
+                    stop_item(&shared, &item.workid, outputs.join("\n"));
+                    drop(lock);
+                    return;
+                }
                 // Account limits fail every turn that would follow. Billing/account
                 // states drain the engine (nothing resets on its own); time-window
                 // limits enter a hold that auto-resumes at the reset.
@@ -816,6 +873,11 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
         }
     }
 
+    // A stop that lands after the final turn finished changed nothing —
+    // consume the flag so it cannot ambush a later run.
+    if take_stopitem(&shared.project_root, &item.workid) {
+        logging::info(&tag, "user stop arrived after the final turn; item completed anyway");
+    }
     close_complete(&shared, &item, outputs.join("\n"), &tag);
     drop(lock);
 }
@@ -899,6 +961,11 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
         ("ITER_WORKID".into(), item.workid.clone()),
     ];
 
+    // Undo point, mirroring the agent path (stale stop flags already died at
+    // claim time in pick_next, under the record lock).
+    record_git_baseline(&shared, &item.workid, &codepath);
+    let stop_flag = stopitem_path(&shared.project_root, &item.workid);
+
     let mut steps: Vec<(String, String)> = Vec::new();
     for (i, p) in item.prework.iter().enumerate() {
         steps.push((format!("prework[{}]", i + 1), p.clone()));
@@ -915,7 +982,13 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
             drop(lock);
             return;
         }
-        match run_shell_command(cmd, &codepath, &envs, cfg.engine.shell_timeout_sec) {
+        if take_stopitem(&shared.project_root, &item.workid) {
+            logging::warn(&tag, &format!("user stop: halting {} → todo", short(&item.workid)));
+            stop_item(&shared, &item.workid, outputs.join("\n"));
+            drop(lock);
+            return;
+        }
+        match run_shell_command(cmd, &codepath, &envs, cfg.engine.shell_timeout_sec, Some(&stop_flag)) {
             Ok(out) => {
                 logging::info(&tag, &format!("{} done", label));
                 outputs.push(format!("[{}] $ {}\n{}", label, cmd, out));
@@ -926,6 +999,12 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
                 }
             }
             Err(e) => {
+                if take_stopitem(&shared.project_root, &item.workid) || e == crate::runner::STOPPED_BY_USER {
+                    logging::warn(&tag, &format!("user stop: halting {} → todo", short(&item.workid)));
+                    stop_item(&shared, &item.workid, outputs.join("\n"));
+                    drop(lock);
+                    return;
+                }
                 let msg = format!("{} failed: {}", label, e);
                 logging::error(&tag, &msg);
                 fail_item(&shared, &item, &msg, outputs.join("\n"), &tag);
@@ -933,6 +1012,9 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
                 return;
             }
         }
+    }
+    if take_stopitem(&shared.project_root, &item.workid) {
+        logging::info(&tag, "user stop arrived after the final step; item completed anyway");
     }
     close_complete(&shared, &item, outputs.join("\n"), &tag);
     drop(lock);
@@ -942,7 +1024,13 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
 /// from a chatty command.
 const SHELL_OUTPUT_TAIL_CHARS: usize = 65536;
 
-fn run_shell_command(cmd: &str, cwd: &Path, envs: &[(String, String)], timeout_sec: u64) -> Result<String, String> {
+fn run_shell_command(
+    cmd: &str,
+    cwd: &Path,
+    envs: &[(String, String)],
+    timeout_sec: u64,
+    stop_flag: Option<&Path>,
+) -> Result<String, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new("sh")
@@ -974,6 +1062,12 @@ fn run_shell_command(cmd: &str, cwd: &Path, envs: &[(String, String)], timeout_s
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) => {
+                // User stop: kill the command mid-run, same as an agent turn.
+                if stop_flag.is_some_and(|f| f.exists()) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(crate::runner::STOPPED_BY_USER.to_string());
+                }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1028,6 +1122,45 @@ fn fill_empty_stamps(times: &mut workitems::Times) {
             *stamp = closed.clone();
         }
     }
+}
+
+/// HEAD of the item's codepath repo at run start, recorded on the item as
+/// `git_start_commit` — the undo point the webapp offers when a run is stopped
+/// mid-stream (`git reset --hard <sha>`). Left untouched when the codepath is
+/// not inside a git repo (no commit prior to starting → no undo hint).
+fn record_git_baseline(shared: &Shared, workid: &str, codepath: &Path) {
+    let out = std::process::Command::new("git")
+        .args(["-C", &codepath.to_string_lossy(), "rev-parse", "HEAD"])
+        .output();
+    let Ok(out) = out else { return };
+    if !out.status.success() {
+        return;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        return;
+    }
+    let _q = shared.queue_mutex.lock().unwrap();
+    let _ = shared.queue().mutate(workid, |it| it.git_start_commit = sha.clone());
+}
+
+/// User-stop outcome: like `iter reject`, the item returns to `todo` — the
+/// stopped work was judged errantly started, so a human re-evaluates; retries
+/// would just restart what the user halted. Turns completed so far are kept in
+/// output; the note warns the work may be partial.
+fn stop_item(shared: &Shared, workid: &str, partial_output: String) {
+    let _q = shared.queue_mutex.lock().unwrap();
+    let queue = shared.queue();
+    let _ = queue.mutate(workid, |it| {
+        it.state = workitems::STATE_TODO.into();
+        it.lasterror = "STOPPED by user mid-run — work may be partially completed; \
+                        git_start_commit is the undo point"
+            .into();
+        if !partial_output.is_empty() {
+            it.output = partial_output.clone();
+        }
+        it.times.start = String::new();
+    });
 }
 
 /// `iter reject` outcome: the item returns to `todo` (the human-review bucket —

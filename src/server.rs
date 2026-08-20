@@ -581,6 +581,25 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
     let action = body.get("action").and_then(|a| a.as_str()).unwrap_or("");
     let queue = queue_for(project);
 
+    // Stop an IN-PROGRESS ("errantly started") item: the engine owns it, so
+    // the stop is delivered as a file flag — the runner polls it mid-turn and
+    // kills the session; the worker moves the item to `todo` with partial
+    // output kept. The webapp confirms with the user before calling this
+    // (mid-stream stop, partially completed work, git undo hint).
+    if action == "stop" {
+        let Some(item) = queue.load().into_iter().find(|i| i.workid == id) else {
+            return err_resp(404, "no such open work item");
+        };
+        if item.state != workitems::STATE_IN_PROGRESS {
+            return err_resp(409, &format!("only in-progress items can be stopped (state: {})", item.state));
+        }
+        let flag = crate::scheduler::stopitem_path(project, &item.workid);
+        return match std::fs::write(&flag, format!("{} stop requested via webapp\n", workitems::now_iso())) {
+            Ok(()) => json_resp(200, json!({ "state": "stopping", "git_start_commit": item.git_start_commit })),
+            Err(e) => err_resp(500, &format!("cannot write stop flag: {}", e)),
+        };
+    }
+
     // Engine-owned semantics (not a UI convention): "queueing" a SCHEDULED item
     // means clone-and-queue a run of it — the template itself never queues.
     // itersched::fire dedups under the record lock, so this happens before (not
@@ -647,7 +666,7 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
                 items.push(copy);
                 Ok(json!({ "state": "todo", "workid": workid }))
             }
-            _ => Err((400, "action must be queue|todo|pause|schedule|complete|delete|clone".to_string())),
+            _ => Err((400, "action must be queue|todo|pause|schedule|complete|delete|clone|stop".to_string())),
         }
     });
     match result {

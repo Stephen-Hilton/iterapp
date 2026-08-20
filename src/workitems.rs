@@ -116,6 +116,12 @@ pub struct WorkItem {
     /// makes transitive dependency satisfaction possible.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub created_by: String,
+    /// Engine-recorded at each run start: HEAD of the item's codepath repo the
+    /// moment work began (empty if the codepath is not in a git repo). The
+    /// undo point offered when a run is stopped mid-stream —
+    /// `git reset --hard <this>` discards everything the run did.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub git_start_commit: String,
     pub context: Vec<String>,
     pub testfiles: Vec<String>,
     pub prework: Vec<String>,
@@ -147,6 +153,7 @@ impl Default for WorkItem {
             depends_on: Vec::new(),
             depends_on_shallow: false,
             created_by: String::new(),
+            git_start_commit: String::new(),
             context: Vec::new(),
             testfiles: Vec::new(),
             prework: Vec::new(),

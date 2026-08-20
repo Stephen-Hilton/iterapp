@@ -39,7 +39,16 @@ pub struct Session {
     /// `iter critreview` critic subprocess the agent spawned. False (the critic
     /// itself): stay in the calling agent's group so the engine's kill reaches it.
     pub own_group: bool,
+    /// User-stop flag file (scheduler::stopitem_path): while a turn runs, the
+    /// wait loop polls for this path and kills the session the moment it
+    /// appears, so "stop this in-progress item" acts mid-turn, not at the next
+    /// turn boundary. None outside engine runs (critic, probe).
+    pub stop_flag: Option<PathBuf>,
 }
+
+/// The error a user-stop kill produces; the scheduler routes it to `todo`
+/// instead of the failed/retry path.
+pub const STOPPED_BY_USER: &str = "stopped by user (mid-turn kill)";
 
 impl Session {
     pub fn new(agent: AgentDef, cwd: PathBuf, project_root: PathBuf) -> Session {
@@ -77,7 +86,7 @@ impl Session {
                 agent.max_work_timeout_sec.saturating_mul(1000).to_string(),
             ),
         ];
-        Session { agent, cwd, session_id: String::new(), bin: claude_bin(), envs, own_group: true }
+        Session { agent, cwd, session_id: String::new(), bin: claude_bin(), envs, own_group: true, stop_flag: None }
     }
 
     /// Submit one turn, wait for it to finish (subject to the agent's work timeout),
@@ -96,7 +105,15 @@ impl Session {
         for flag in self.agent.model_flags.split_whitespace() {
             args.push(flag.to_string());
         }
-        let stdout = run_with_timeout(&self.bin, &args, &self.cwd, self.agent.max_work_timeout_sec, &self.envs, self.own_group)?;
+        let stdout = run_with_timeout(
+            &self.bin,
+            &args,
+            &self.cwd,
+            self.agent.max_work_timeout_sec,
+            &self.envs,
+            self.own_group,
+            self.stop_flag.as_deref(),
+        )?;
         let (sid, outcome) = parse_output(&stdout);
         if !sid.is_empty() {
             self.session_id = sid;
@@ -143,6 +160,7 @@ fn parse_output(stdout: &str) -> (String, TurnOutcome) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_with_timeout(
     bin: &str,
     args: &[String],
@@ -150,6 +168,7 @@ fn run_with_timeout(
     timeout_sec: u64,
     envs: &[(String, String)],
     own_group: bool,
+    stop_flag: Option<&Path>,
 ) -> Result<String, String> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
@@ -171,32 +190,47 @@ fn run_with_timeout(
         let _ = tx.send(child.wait_with_output());
     });
 
-    match rx.recv_timeout(Duration::from_secs(timeout_sec)) {
-        Ok(Ok(output)) => {
-            if output.status.success() {
-                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-            } else {
-                // claude -p reports usage-limit errors on stdout and exits 1 with an
-                // empty stderr; fall back so spend::is_usage_limit_error can see them.
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let detail = if stderr.is_empty() {
-                    String::from_utf8_lossy(&output.stdout).trim().to_string()
-                } else {
-                    stderr
-                };
-                Err(format!("exit {}: {}", output.status.code().unwrap_or(-1), detail))
-            }
+    // Group leaders get a group kill (negative pid) so the whole tree dies —
+    // the agent, its shells, and any critic subprocess they spawned.
+    let kill_tree = || {
+        if own_group && cfg!(unix) {
+            let _ = Command::new("sh").arg("-c").arg(format!("kill -9 -{}", pid)).status();
+        } else {
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
         }
-        Ok(Err(e)) => Err(format!("wait failed: {}", e)),
-        Err(_) => {
-            // Group leaders get a group kill (negative pid) so the whole tree dies —
-            // the agent, its shells, and any critic subprocess they spawned.
-            if own_group && cfg!(unix) {
-                let _ = Command::new("sh").arg("-c").arg(format!("kill -9 -{}", pid)).status();
-            } else {
-                let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+    };
+
+    // Wait in short slices instead of one blocking recv, so a user stop
+    // (flag file appearing) kills the turn within ~200ms, not at its end.
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_sec);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Ok(output)) => {
+                return if output.status.success() {
+                    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+                } else {
+                    // claude -p reports usage-limit errors on stdout and exits 1 with an
+                    // empty stderr; fall back so spend::is_usage_limit_error can see them.
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let detail = if stderr.is_empty() {
+                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    } else {
+                        stderr
+                    };
+                    Err(format!("exit {}: {}", output.status.code().unwrap_or(-1), detail))
+                };
             }
-            Err(format!("timed out after {}s (killed)", timeout_sec))
+            Ok(Err(e)) => return Err(format!("wait failed: {}", e)),
+            Err(_) => {
+                if stop_flag.is_some_and(|f| f.exists()) {
+                    kill_tree();
+                    return Err(STOPPED_BY_USER.to_string());
+                }
+                if std::time::Instant::now() >= deadline {
+                    kill_tree();
+                    return Err(format!("timed out after {}s (killed)", timeout_sec));
+                }
+            }
         }
     }
 }
@@ -234,6 +268,7 @@ mod tests {
             10,
             &[],
             false,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("usage limit reached"), "got: {}", err);
@@ -249,6 +284,7 @@ mod tests {
             10,
             &[],
             false,
+            None,
         )
         .unwrap_err();
         assert_eq!(err, "exit 1: real error");
@@ -257,9 +293,23 @@ mod tests {
     #[test]
     fn timeout_kills_hung_process() {
         let start = std::time::Instant::now();
-        let err = run_with_timeout("sleep", &["30".to_string()], Path::new("/tmp"), 1, &[], true).unwrap_err();
+        let err = run_with_timeout("sleep", &["30".to_string()], Path::new("/tmp"), 1, &[], true, None).unwrap_err();
         assert!(err.contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    // The user-stop flag kills the turn within the poll cadence, long before
+    // the work timeout — delete the flag check and this test times out red.
+    #[test]
+    fn stop_flag_kills_turn_mid_stream() {
+        let flag = std::env::temp_dir().join(format!("iterloop-stopflag-{}", std::process::id()));
+        std::fs::write(&flag, "stop").unwrap();
+        let start = std::time::Instant::now();
+        let err =
+            run_with_timeout("sleep", &["30".to_string()], Path::new("/tmp"), 25, &[], true, Some(&flag)).unwrap_err();
+        assert_eq!(err, STOPPED_BY_USER);
+        assert!(start.elapsed() < Duration::from_secs(5), "kill must not wait for the timeout");
+        let _ = std::fs::remove_file(&flag);
     }
 
     #[test]

@@ -783,6 +783,7 @@ let items = [
     times:{ added:'2026-08-11T00:00:00Z', start:'2026-08-11T00:01:00Z', preworkdone:'2026-08-11T00:01:00Z', mainworkdone:'2026-08-11T00:03:40Z', postworkdone:'2026-08-11T00:03:40Z', closed:'2026-08-11T00:03:41Z' } }),
   mk({ title:'Implement --lang flag slice 1: greeting table and lookup for en/es/fr',
     type:'code', state:'in-progress', source:'agent: plan', priority:4, risk:3, codepath:'./src',
+    git_start_commit:'a41f20c9e1d24b7f30c1e5a8d9b2c4f6e8a0d1b3',
     prework:['git-pull'], postwork:['git-commit','git-push'],
     mainwork:'Slice 1 of the BR-5 localization plan: add a --lang <code> flag with a greeting table for en, es, fr inside greet.sh (TR-1: stay one POSIX script). Unknown code exits 2 with one stderr line listing supported codes. Default remains English. Acceptance: ./src/greet.sh --lang es Ada prints "¡Hola, Ada!".',
     output:'', attempts:1,
@@ -1092,11 +1093,13 @@ function renderRows(){
 function actionButtons(item){
   const s = item.state;
   if (s === 'in-progress') {
-    // The engine is loosely coupled to the queue: while an agent is running this item,
-    // queue-side state changes wouldn't alter engine behavior — so only Clone is real.
+    // The engine is loosely coupled to the queue: while an agent is running this
+    // item, queue-side state changes wouldn't alter engine behavior — so Clone,
+    // and Stop (delivered to the engine as a file flag it polls mid-turn).
     return `<button data-act="clone" data-id="${item.workid}" role="menuitem">Clone</button>
+      <button class="danger" data-act="stopitem" data-id="${item.workid}" role="menuitem">Stop (halt mid-run)…</button>
       <div class="sep"></div>
-      <span class="note">Agent is running — the engine owns this item until it finishes.</span>`;
+      <span class="note">Agent is running — Stop kills its session and returns the item to ToDo.</span>`;
   }
   if (s === 'scheduled') {
     // Engine-owned semantics: queueing a schedule clones a run into the queue;
@@ -1519,6 +1522,26 @@ async function postAction(id, action){
   return api(`/api/workitems/${id}/action`, { method: 'POST', body: JSON.stringify({ action }) });
 }
 
+function confirmStop(item, onConfirm){
+  // git_start_commit is stamped by the engine at run start — HEAD of the
+  // item's codepath repo the moment work began. If it exists, offer the exact
+  // command that undoes everything this run did.
+  const undo = item.git_start_commit
+    ? `<p>You can undo any changes with the git command:</p>
+       <pre class="mono" style="background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:8px 12px;overflow-x:auto">cd ${esc(absCodepath(item.codepath))}
+git reset --hard ${esc(item.git_start_commit)}</pre>`
+    : '';
+  openLb('Stop this work item?', `
+    <p style="margin-top:0"><b>This stops work mid-stream, and may result in partially
+    completed work.</b></p>
+    <p>The agent session for <b>${esc(item.title)}</b> <span class="mono">(${shortId(item)})</span>
+    is killed immediately and the item returns to <b>ToDo</b> for review (partial output kept).</p>
+    ${undo}`,
+    `<button class="btn" data-lbclose>Cancel</button>
+     <button class="btn danger" id="confirmStop">Stop work item</button>`);
+  $('confirmStop').addEventListener('click', onConfirm);
+}
+
 function doAction(act, id){
   const item = items.find(i => i.workid === id);
   if (!item) return;
@@ -1527,6 +1550,14 @@ function doAction(act, id){
     // happens on save). Everything else is a server action + reload.
     if (act === 'clone') { openForm('clone', item); return; }
     if (act === 'followup') { openForm('followup', item); return; }
+    if (act === 'stopitem') {
+      confirmStop(item, () => {
+        postAction(id, 'stop')
+          .then(() => { closeLb(); toast(`Stop requested — the engine is halting ${shortId(item)}`); return loadAll(); })
+          .catch(e => toast('Stop failed: ' + e.message));
+      });
+      return;
+    }
     if (act === 'delete') {
       openLb('Delete work item?', `
         <p style="margin-top:0">This permanently removes <b>${esc(item.title)}</b>
@@ -1557,6 +1588,14 @@ function doAction(act, id){
     return;
   }
   switch (act) {
+    case 'stopitem':
+      confirmStop(item, () => {
+        item.state = 'todo';
+        item.lasterror = 'STOPPED by user mid-run — work may be partially completed; git_start_commit is the undo point';
+        item.times.start = '';
+        closeLb(); render(); toast(`Stopped ${shortId(item)}`);
+      });
+      return;
     case 'queue':
       if (item.state === 'scheduled') {
         // mock of the engine's clone-and-queue semantics
