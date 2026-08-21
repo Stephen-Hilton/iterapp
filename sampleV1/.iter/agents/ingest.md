@@ -61,8 +61,7 @@ context — it will not appear in the project structure at all.
   serving object's marker, never here. NEVER who provides/consumes it —
   marker provides:/uses: keys carry that. Test: a stranger could implement
   either side from this file alone, and nothing changes if a component is
-  rebuilt or redeployed differently. Model:
-  sampleV1/interfaces/ledger-command/ledger-command.interface.iter.md.
+  rebuilt or redeployed differently. Model: sample/greet-msg.interface.iter.md.
 
 - `*.bizreq.iter.md` / `*.techreq.iter.md` need no frontmatter (they are plain
   context), but the node and interface markers above are not optional.

@@ -1,0 +1,23 @@
+# iterapp test run
+# script: t2-refusal-passthrough.sh
+# time: 2026-08-21T22:13:52Z
+# exit: 0
+
+--- stdout ---
+ok   refused 'delete 3' exits 2
+ok   refused 'delete 3' says one sentence on stderr
+ok   refused 'delete 3' says it plainly
+ok   refused 'add 4.50 coffee' exits 2
+ok   refused 'add 4.50 coffee' says one sentence on stderr
+ok   refused 'add 4.50 coffee' says it plainly
+ok   refused 'add 450' exits 2
+ok   refused 'add 450' says one sentence on stderr
+ok   refused 'add 450' says it plainly
+ok   refused '(no arguments)' exits 2
+ok   refused '(no arguments)' says one sentence on stderr
+ok   refused '(no arguments)' says it plainly
+ok   nothing was recorded by any refusal
+ok   a refusal prints nothing on stdout
+ITER_RESULT pass=14 fail=0 total=14
+
+--- stderr ---

@@ -1,0 +1,15 @@
+# iterapp test run
+# script: t2-append-only.sh
+# time: 2026-08-21T22:13:52Z
+# exit: 0
+
+--- stdout ---
+ok   earlier lines survive verbatim
+ok   the file only grew
+ok   no earlier position was reused
+ok   an absent log is created, not an error
+ok   append without a memo exits 2
+ok   a refused append records nothing
+ITER_RESULT pass=6 fail=0 total=6
+
+--- stderr ---

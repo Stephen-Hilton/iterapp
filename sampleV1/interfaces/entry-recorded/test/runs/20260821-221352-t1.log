@@ -1,0 +1,16 @@
+# iterapp test run
+# script: t1-invariants.sh
+# time: 2026-08-21T22:13:52Z
+# exit: 0
+
+--- stdout ---
+ok   example 1
+ok   example 2
+ok   example 3
+ok   seq rises by one with no gaps
+ok   balance is the running sum of every amount so far
+ok   the notice's movement is already in the log
+ok   one line per notice announced
+ITER_RESULT pass=7 fail=0 total=7
+
+--- stderr ---

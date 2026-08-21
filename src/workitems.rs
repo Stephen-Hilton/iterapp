@@ -532,17 +532,43 @@ mod tests {
         dir
     }
 
+    /// The shipped reference project's seed queue (sampleV1/), covering the
+    /// three ways an item gets into a real queue: added by a user, born from a
+    /// test sweep, and a schedule template waiting to be cloned.
     #[test]
     fn parses_sample_seed_queue() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sample");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sampleV1");
         let cfg = Config::default();
         let queue = Queue::new(&root, &cfg);
         let items = queue.load();
-        assert_eq!(items.len(), 3, "expected 3 seed items (no test items — the sweep runs tests)");
-        let code = items.iter().find(|i| i.item_type == "code").unwrap();
-        assert_eq!(code.state, STATE_QUEUED);
-        assert_eq!(code.prework, vec!["git-pull"]);
-        assert!(!code.times.added.is_empty());
+        assert_eq!(items.len(), 6, "3 user items, 2 sweep-born, 1 schedule template");
+
+        let user: Vec<_> = items.iter().filter(|i| i.source == "user").collect();
+        assert_eq!(user.len(), 3);
+        assert!(user.iter().all(|i| i.state == STATE_QUEUED));
+        assert!(user.iter().all(|i| !i.times.added.is_empty()));
+
+        // The sweep's authoring items land in todo — new-test authoring is gated.
+        let swept: Vec<_> = items.iter().filter(|i| i.source == "testsweep").collect();
+        assert_eq!(swept.len(), 2);
+        assert!(swept.iter().all(|i| i.item_type == "testwriter" && i.state == STATE_TODO));
+        assert!(swept.iter().all(|i| !i.source_testgroup.is_empty()), "dedup key rides along");
+
+        // The Test Loop: a shell-executed schedule template, never picked by the
+        // loop itself — itersched clones it on cadence.
+        let sched = items.iter().find(|i| i.state == STATE_SCHEDULED).expect("a schedule template");
+        assert_eq!(sched.title, "Test Loop");
+        assert_eq!(sched.exec, EXEC_SHELL);
+        assert_eq!(sched.sched.kind, "every");
+        assert_eq!(sched.sched.every_min, 120);
+        assert!(sched.mainwork.contains("testsweep"));
+        assert_eq!(sched.codepath_ignore, vec!["**"], "run-only: carves out everything, so it locks nothing");
+
+        // The dependency gate is seeded too.
+        let dependent = items.iter().find(|i| !i.depends_on.is_empty()).expect("a gated item");
+        assert!(dependent.depends_on_shallow);
+
+        assert_eq!(queue.load_closed().len(), 1, "one closed item seeds the archive");
     }
 
     #[test]

@@ -1,0 +1,23 @@
+# iterapp test run
+# script: t1-worked-examples.sh
+# time: 2026-08-21T22:13:52Z
+# exit: 0
+
+--- stdout ---
+ok   argv=[add -450 coffee]
+ok   argv=[add 125000 paycheck for March]
+ok   argv=[total]
+ok   argv=[report]
+ok   argv=[delete 3]
+ok   argv=[add 450]
+ok   argv=[add 4.50 coffee]
+ok   argv=[]
+ok   refusal code 'UNKNOWN_ACTION' is in the vocabulary
+ok   refusal code 'MISSING_ARGUMENT' is in the vocabulary
+ok   refusal code 'MISSING_ARGUMENT' is in the vocabulary
+ok   refusal code 'AMOUNT_NOT_INTEGER' is in the vocabulary
+ok   refusal code 'MISSING_ARGUMENT' is in the vocabulary
+ok   refusal code 'UNKNOWN_ACTION' is in the vocabulary
+ITER_RESULT pass=14 fail=0 total=14
+
+--- stderr ---

@@ -1,0 +1,17 @@
+# iterapp test run
+# script: t1-decisions.sh
+# time: 2026-08-21T22:13:52Z
+# exit: 0
+
+--- stdout ---
+ok   add, negative amount
+ok   add, positive amount and multi-word memo
+ok   add exits 0
+ok   total
+ok   total exits 0
+ok   report
+ok   report exits 0
+ok   deterministic
+ITER_RESULT pass=8 fail=0 total=8
+
+--- stderr ---

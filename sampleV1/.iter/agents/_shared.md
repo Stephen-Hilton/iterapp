@@ -190,11 +190,8 @@ frontmatter; without it the node has no name/level on the Projects map.
   cents, timestamps as ISO-8601 strings, enums as closed vocabularies named in
   comments. A function call is logically request → reply, so a library surface
   is written as kwargs-object → return-object messages. Tag a fence (```json)
-  only when the block strictly parses; pseudo-examples stay untagged. Models:
-  `sampleV1/interfaces/ledger-command/` (request-reply) and
-  `sampleV1/interfaces/entry-recorded/` (event — note the different fixed
-  sections `kind:` demands; `iter validate --file <f> --template` prints the
-  right skeleton for the kind).
+  only when the block strictly parses; pseudo-examples stay untagged. Model:
+  `sample/greet-msg.interface.iter.md`.
 
   **The two-clause test — the file is right when:** (1) a stranger could
   implement EITHER side from this file alone, and (2) nothing in it would

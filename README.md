@@ -57,12 +57,25 @@ both useful for scripting and demos.
 
 ## Try it on the bundled sample
 
-`sample/` is a tiny toy project (a POSIX `greet.sh` with real tests) pre-seeded with
-work items. Copy it somewhere and point the engine at it:
+`sampleV1/` is a small but complete reference project — **Sample Ledger**, a POSIX-shell
+money log — scaffolded by the current engine and exercising every surface: seven C4
+objects across all four levels (project / context / container / component), two interface
+contracts, two use-cases, thirteen testgroups with ninety real assertions, a seeded queue
+(user items, sweep-born items, a dependency gate) and a "Test Loop" schedule template.
+Copy it somewhere and point the engine at it:
 
 ```bash
-cp -R sample /tmp/demo
-./target/debug/iter run --project /tmp/demo --until-idle
+cp -R sampleV1 /tmp/demo
+./target/release/iter run --project /tmp/demo --until-idle
+```
+
+Or read it without running anything:
+
+```bash
+./target/release/iter markers   --project sampleV1   # the C4 scan, as JSON
+./target/release/iter validate  --project sampleV1   # every *.iter.md, role-aware
+./target/release/iter testsweep --project sampleV1   # run the declared testgroups
+./target/release/iter status    --project sampleV1   # the seeded queue
 ```
 
 ## Fake runner (no tokens)
@@ -78,7 +91,7 @@ use this; see `setup_project` there for a reference stub.
 - `src/.iter/` — the shipped template: agent definitions, prepostwork steps, source
   instructions, engine config
 - `src/features/iterloop.md` — the specification and build plan
-- `sample/` — mock target project used by tests and demos
+- `sampleV1/` — the reference target project used by tests and demos
 - `tests/e2e.rs` — end-to-end tests against the real binary with the fake runner
 
 ## Notes

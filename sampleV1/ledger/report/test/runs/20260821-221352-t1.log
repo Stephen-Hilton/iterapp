@@ -1,0 +1,18 @@
+# iterapp test run
+# script: t1-render.sh
+# time: 2026-08-21T22:13:52Z
+# exit: 0
+
+--- stdout ---
+ok   absent log: total is 0
+ok   absent log: total exits 0
+ok   absent log: report is TOTAL 0
+ok   empty log: total is 0
+ok   empty log: report is TOTAL 0
+ok   total sums every movement
+ok   report lists movements in recorded order, then the total
+ok   reading never changes the log
+ok   an unknown request exits 2
+ITER_RESULT pass=9 fail=0 total=9
+
+--- stderr ---

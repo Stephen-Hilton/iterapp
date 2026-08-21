@@ -1,0 +1,17 @@
+# iterapp test run
+# script: t1-wiring.sh
+# time: 2026-08-21T22:15:22Z
+# exit: 0
+
+--- stdout ---
+ok   empty log: total is zero, not an error
+ok   empty log: total exits 0
+ok   empty log: report is just the total
+ok   add confirms with amount, memo and new total
+ok   a second add carries the running total forward
+ok   total after two movements
+ok   report lists movements in order, then the total
+ok   works from an unrelated working directory
+ITER_RESULT pass=8 fail=0 total=8
+
+--- stderr ---

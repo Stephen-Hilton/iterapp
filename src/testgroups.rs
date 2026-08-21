@@ -146,14 +146,21 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 mod tests {
     use super::*;
 
+    /// Read straight out of the shipped reference project (sampleV1/): the
+    /// Command Parser declares two groups in one file, which is also the shape
+    /// that exposed the sweep's same-file write race.
     #[test]
     fn parses_sample_testgroups() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sample/test/testgroup.iter.md");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("sampleV1/ledger/cli/parse/test/testgroup.iter.md");
         let content = std::fs::read_to_string(path).unwrap();
         let groups = parse(&content);
-        assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0].label, "default greeting");
-        assert_eq!(groups[2].testlist[0].shell, "testscript03.sh");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].label, "parser decisions");
+        assert_eq!(groups[0].testlist[0].shell, "t1-decisions.sh");
+        assert_eq!(groups[1].label, "parser refusals");
+        assert_eq!(groups[1].testlist[0].shell, "t2-refusals.sh");
+        assert!(groups[0].is_green(), "the shipped sample ships green");
     }
 
     #[test]

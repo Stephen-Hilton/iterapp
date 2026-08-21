@@ -1,0 +1,17 @@
+# iterapp test run
+# script: t1-append.sh
+# time: 2026-08-21T22:13:52Z
+# exit: 0
+
+--- stdout ---
+ok   empty log: next position is 1
+ok   empty log: balance is 0
+ok   first notice
+ok   second notice: seq rises by one, balance accumulates
+ok   third notice: balance can return to zero
+ok   next position after three movements
+ok   balance agrees with the last notice
+ok   the log holds one line per movement
+ITER_RESULT pass=8 fail=0 total=8
+
+--- stderr ---

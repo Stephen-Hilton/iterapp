@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn global_req_paths_default_to_codepath_reqs() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sample");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sampleV1");
         let cfg = Config::default();
         let code = code_root(&root, &cfg);
         assert_eq!(global_bizreq(&root, &cfg), code.join("reqs/bizreq.iter.md"));
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn global_req_paths_honor_settings() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sample");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sampleV1");
         let mut cfg = Config::default();
         cfg.globalsettings.global_bizreq_path = "docs/biz.md".into();
         cfg.globalsettings.global_techreq_path = "/abs/tech.md".into();
@@ -305,12 +305,12 @@ mod tests {
 
     #[test]
     fn global_req_files_lists_only_existing() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sample");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sampleV1");
         let mut cfg = Config::default();
-        cfg.globalsettings.global_bizreq_path = "{codepath}/bizreq.md".into();
-        cfg.globalsettings.global_techreq_path = "{codepath}/missing-techreq.md".into();
+        cfg.globalsettings.global_bizreq_path = "{codepath}/reqs/bizreq.iter.md".into();
+        cfg.globalsettings.global_techreq_path = "{codepath}/reqs/missing-techreq.iter.md".into();
         let files = global_req_files(&root, &cfg);
         assert_eq!(files.len(), 1, "only the existing file surfaces: {:?}", files);
-        assert!(files[0].ends_with("bizreq.md"));
+        assert!(files[0].ends_with("bizreq.iter.md"));
     }
 }

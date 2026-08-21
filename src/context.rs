@@ -55,11 +55,18 @@ pub fn resolve(patterns: &[String], codepath: &Path, project_root: &Path, reqs: 
 mod tests {
     use super::*;
 
+    /// The shipped reference project (sampleV1/), scaffolded by the current
+    /// engine — the fixture these tests read is a real iterapp project, so a
+    /// change that breaks real projects breaks the suite too.
+    fn sample() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("sampleV1")
+    }
+
     #[test]
     fn resolves_sample_context() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sample");
+        let root = sample();
         let reqs = crate::config::reqs_dir(&root, &crate::config::Config::default());
-        let patterns = vec!["./bizreq.md".to_string(), "./*req.md".to_string(), "./missing.md".to_string()];
+        let patterns = vec!["./reqs/bizreq.iter.md".to_string(), "./reqs/*req.iter.md".to_string(), "./missing.md".to_string()];
         let (files, warnings) = resolve(&patterns, &root, &root, &reqs);
         assert_eq!(files.len(), 2, "bizreq + techreq, deduped: {:?}", files);
         assert_eq!(warnings.len(), 1);
@@ -68,10 +75,10 @@ mod tests {
 
     #[test]
     fn codepath_substitution() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sample");
-        let codepath = root.join("test");
+        let root = sample();
+        let codepath = root.join("ledger/cli/parse/test");
         let patterns = vec!["{codepath}/testgroup.iter.md".to_string()];
-        let (files, warnings) = resolve(&patterns, &codepath, &root, &root.join(".iter/reqs"));
+        let (files, warnings) = resolve(&patterns, &codepath, &root, &root.join("reqs"));
         assert_eq!(files.len(), 1);
         assert!(warnings.is_empty());
     }

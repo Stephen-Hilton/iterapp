@@ -461,8 +461,22 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
         }
     }
 
-    // Run candidates through the deterministic runner, a few groups at a time.
-    let work: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(candidates));
+    // Run candidates through the deterministic runner, a few at a time. The unit
+    // of work is a testgroup FILE, not a group: `run_group` records a result by
+    // rewriting the whole file, so two groups of the SAME file running in
+    // parallel would each write back content read before the other's update and
+    // the first result would vanish — the group would look like it never ran.
+    // Bucketing by file keeps every file single-writer while different files
+    // still run concurrently (the common case — most files hold one group).
+    let mut buckets: Vec<(PathBuf, Vec<Candidate>)> = Vec::new();
+    for cand in candidates {
+        let key = cand.tg_file.canonicalize().unwrap_or_else(|_| cand.tg_file.clone());
+        match buckets.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, group)) => group.push(cand),
+            None => buckets.push((key, vec![cand])),
+        }
+    }
+    let work: Arc<Mutex<Vec<(PathBuf, Vec<Candidate>)>>> = Arc::new(Mutex::new(buckets));
     let results: Arc<Mutex<Vec<(Candidate, Result<GroupRunResult, String>)>>> = Arc::new(Mutex::new(Vec::new()));
     let workers = opts.concurrency.max(1);
     std::thread::scope(|scope| {
@@ -471,9 +485,11 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
             let results = Arc::clone(&results);
             scope.spawn(move || loop {
                 let next = work.lock().unwrap().pop();
-                let Some(cand) = next else { break };
-                let run = runtests::run_group(&cand.tg_file, &cand.group.label, None, opts.group_timeout_min);
-                results.lock().unwrap().push((cand, run));
+                let Some((_, bucket)) = next else { break };
+                for cand in bucket {
+                    let run = runtests::run_group(&cand.tg_file, &cand.group.label, None, opts.group_timeout_min);
+                    results.lock().unwrap().push((cand, run));
+                }
             });
         }
     });
@@ -1041,6 +1057,43 @@ mod tests {
         let report2 = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report2.items_created, 0);
         assert_eq!(Queue::new(&root, &cfg).load().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two groups in ONE testgroup.iter.md, swept concurrently. `run_group`
+    /// records a result by rewriting the whole file, so if both ran in parallel
+    /// the later write — built from content read before the earlier one landed —
+    /// would erase the first group's lastrun/result/counts, and that group would
+    /// look like it had never run. The sweep buckets by file to prevent it.
+    #[test]
+    fn sibling_groups_in_one_file_both_record_their_run() {
+        let (root, test_dir) = setup("siblings");
+        write_marker(&root, "test/testgroup.iter.md", "test");
+        for (file, body) in [("a.sh", "exit 0\n"), ("b.sh", "exit 0\n")] {
+            std::fs::write(test_dir.join(file), body).unwrap();
+        }
+        let entry = |f: &str| TestEntry { id: f.trim_end_matches(".sh").into(), name: f.into(), desc: String::new(), shell: f.into() };
+        let groups = [
+            TestGroup { label: "A".into(), testlist: vec![entry("a.sh")], ..Default::default() },
+            TestGroup { label: "B".into(), testlist: vec![entry("b.sh")], ..Default::default() },
+        ];
+        let tg_file = test_dir.join("testgroup.iter.md");
+        std::fs::write(&tg_file, testgroups::update("# tests\n", &groups)).unwrap();
+
+        let cfg = Config::default();
+        // Concurrency high enough that both groups would run at once if the
+        // sweep still handed out groups rather than files.
+        let report = sweep(&root, &cfg, &SweepOptions { concurrency: 4, ..SweepOptions::default() });
+        assert_eq!(report.ran, 2);
+        assert_eq!(report.green, 2);
+
+        let recorded = testgroups::parse(&std::fs::read_to_string(&tg_file).unwrap());
+        assert_eq!(recorded.len(), 2, "both groups survive the rewrite");
+        for g in &recorded {
+            assert_eq!(g.result, "passed", "group {} lost its result", g.label);
+            assert!(!g.lastrun.is_empty(), "group {} lost its lastrun", g.label);
+            assert_eq!(g.counts, "1/1", "group {} lost its counts", g.label);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
