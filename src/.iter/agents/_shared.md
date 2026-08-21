@@ -233,13 +233,14 @@ frontmatter; without it the node has no name/level on the Projects map.
 - Requirement docs, testgroup files, and plain context docs need no frontmatter.
   Stray keys in them are ignored — the filename already said what they are.
 
-- **Project-WIDE requirements** live in the project reqs directory — `$ITER_REQS`
-  in your environment (default `.iter/reqs/`; a project relocates it with a
-  `reqs:` frontmatter key on its `level: project` marker). Component-local
-  requirement files stay beside their component; a requirement that spans
-  components belongs in `$ITER_REQS/bizreq.iter.md` / `techreq.iter.md`. The
-  engine lists these files in your spin-up context automatically; work-item
-  context/testfiles patterns can reference the directory as `{reqs}`.
+- **Project-WIDE requirements** are the two GLOBAL files — `$ITER_BIZREQ` and
+  `$ITER_TECHREQ` in your environment (the `global_bizreq_path` /
+  `global_techreq_path` settings, default `{codepath}/reqs/bizreq.iter.md` and
+  `techreq.iter.md`). Component-local requirement files stay beside their
+  component; a requirement that spans components belongs in those two files.
+  The engine lists exactly them in your spin-up context automatically — never
+  the rest of their directory. That directory is `$ITER_REQS`; work-item
+  context/testfiles patterns can reference it as `{reqs}`.
 
 If you encounter a marker with missing or malformed frontmatter anywhere in the
 files you read for your work, correct it as part of your change and note the fix in

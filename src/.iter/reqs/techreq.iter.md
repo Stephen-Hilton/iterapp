@@ -5,13 +5,13 @@ non-functional requirements that apply across the WHOLE project. Component-local
 requirements stay beside their component (`<component>/*.techreq.iter.md`);
 anything that spans components belongs here.
 
-This directory (`.iter/reqs/`) is iterapp's default project-wide reqs location. To
-relocate it, add a `reqs:` key to the project-level marker's frontmatter (the
-`level: project` `*.iter.md` at the code root), e.g. `reqs: docs/requirements` —
-relative paths resolve against the code root, `~` works. Agents get the resolved
-directory as `$ITER_REQS`; work-item context patterns can reference it as `{reqs}`
-(e.g. `{reqs}/*.iter.md`). Files in this directory are surfaced to every agent
-automatically.
+This file's location is the `global_techreq_path` setting in
+`.iter/.engine/config.json` (default `{codepath}/reqs/techreq.iter.md`, where
+`{codepath}` is the resolved code root). Agents get the resolved path as
+`$ITER_TECHREQ` and its directory as `$ITER_REQS`; work-item context patterns can
+reference that directory as `{reqs}`. The engine surfaces this file and the global
+bizreq to every agent automatically — exactly these two files, never a directory
+scan, so other docs beside them stay out of agent context.
 
 This file needs no frontmatter — it is a plain context doc, never a map node.
 

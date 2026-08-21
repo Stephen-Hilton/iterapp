@@ -20,8 +20,6 @@ pub const TEMPLATE: &[(&str, &str)] = &[
     (".iter/prepostwork/git-push.md", include_str!(".iter/prepostwork/git-push.md")),
     (".iter/prepostwork/iterloop-stop.md", include_str!(".iter/prepostwork/iterloop-stop.md")),
     (".iter/prepostwork/iterloop-wait-for-stop.md", include_str!(".iter/prepostwork/iterloop-wait-for-stop.md")),
-    (".iter/reqs/bizreq.iter.md", include_str!(".iter/reqs/bizreq.iter.md")),
-    (".iter/reqs/techreq.iter.md", include_str!(".iter/reqs/techreq.iter.md")),
     (".iter/source/agent.md", include_str!(".iter/source/agent.md")),
     (".iter/source/error.md", include_str!(".iter/source/error.md")),
     (".iter/source/user.md", include_str!(".iter/source/user.md")),
@@ -32,6 +30,29 @@ pub const TEMPLATE: &[(&str, &str)] = &[
     (".iter/.engine/workitems.jsonl", include_str!(".iter/.engine/workitems.jsonl")),
     (".iter/.engine/workitems_closed.jsonl", include_str!(".iter/.engine/workitems_closed.jsonl")),
 ];
+
+/// The GLOBAL requirement stubs live outside the static template: they heal at
+/// their CONFIGURED paths (globalsettings.global_bizreq_path / global_techreq_path,
+/// default `{codepath}/reqs/`), not at a fixed `.iter/` slot — so a project that
+/// keeps its real requirements elsewhere never grows a shadowing stub copy.
+/// Never overwrites; returns how many were created.
+pub fn ensure_global_reqs(project_root: &Path, cfg: &crate::config::Config) -> std::io::Result<usize> {
+    let stubs = [
+        (crate::config::global_bizreq(project_root, cfg), include_str!(".iter/reqs/bizreq.iter.md")),
+        (crate::config::global_techreq(project_root, cfg), include_str!(".iter/reqs/techreq.iter.md")),
+    ];
+    let mut created = 0;
+    for (path, content) in stubs {
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, content)?;
+            created += 1;
+        }
+    }
+    Ok(created)
+}
 
 /// Create any template file missing under `root`. Returns how many were added.
 pub fn ensure_project(root: &Path) -> std::io::Result<usize> {
@@ -73,6 +94,22 @@ mod tests {
         assert!(code.contains("max_agent_count"));
         // Second pass adds nothing.
         assert_eq!(ensure_project(&root).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_reqs_heal_at_configured_paths() {
+        let root = tmpdir("greqs");
+        let mut cfg = crate::config::Config::default();
+        cfg.globalsettings.global_bizreq_path = "{codepath}/reqs/bizreq.iter.md".into();
+        cfg.globalsettings.global_techreq_path = "docs/techreq.iter.md".into();
+        assert_eq!(ensure_global_reqs(&root, &cfg).unwrap(), 2);
+        assert!(root.join("reqs/bizreq.iter.md").is_file());
+        assert!(root.join("docs/techreq.iter.md").is_file());
+        // Second pass adds nothing; real content is never overwritten.
+        std::fs::write(root.join("reqs/bizreq.iter.md"), "BR-1: the real thing").unwrap();
+        assert_eq!(ensure_global_reqs(&root, &cfg).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(root.join("reqs/bizreq.iter.md")).unwrap(), "BR-1: the real thing");
         let _ = std::fs::remove_dir_all(&root);
     }
 

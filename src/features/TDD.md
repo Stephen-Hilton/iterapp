@@ -289,7 +289,8 @@ patch a few other requirements. Much of the markerfile data becomes 1st-class
 data points in the UI (textboxes, buttons opening breakdown lightboxes). All
 interfaces allow **edits** (whole-section replace on save) so they serve
 maintenance, not just reading — the ONLY exceptions are the global
-`bizreq.iter.md` and `techreq.iter.md` (`src/.iter/reqs/`), which are
+`bizreq.iter.md` and `techreq.iter.md` (the `global_bizreq_path` /
+`global_techreq_path` settings, default `{codepath}/reqs/`), which are
 read-only in the UI, **with their file location visible** so out-of-band
 edits are easy to find.
 
@@ -309,8 +310,8 @@ Per C4 Object, collapsed/expanded detail section:
     agent-written long descriptions at creation (plan.md instruction), never
     TBD. The UI does not write stubs on render.
 - **biz requirements** lightbox (wide, two sections, adjustable boundary):
-  top = local `bizreq.iter.md` (editable); bottom = global
-  `src/.iter/reqs/bizreq.iter.md` (read-only, path shown).
+  top = local `bizreq.iter.md` (editable); bottom = the global bizreq file
+  (`global_bizreq_path` setting; read-only, path shown).
 - **tech requirements** lightbox: same shape, `techreq.iter.md` pair.
 - **uses/provides**: two horizontally tiled listboxes ("uses" / "provides")
   of references; clicking a name opens its detail (similar lightbox for a C4

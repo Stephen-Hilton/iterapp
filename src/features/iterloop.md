@@ -239,15 +239,19 @@ existence check, `{codepath}` / `{reqs}` / `~` substitution) and hands the resul
 file list into the built prompt. The agent then reads the files itself as part of spin-up —
 the engine does not inline file contents into the prompt.
 
-**Project-wide requirements (first-class, added 2026-08-15):** the global
-`bizreq.iter.md` / `techreq.iter.md` live in the project reqs directory — default
-`.iter/reqs/` (scaffolded by the template), relocatable per project via a `reqs:`
-frontmatter key on the `level: project` marker at the code root (relative values
-resolve against the code root, `~` ok). The engine auto-lists the directory's markdown
-files in every work item's spin-up prompt (deduped against explicit context), exports
-the resolved path to agent sessions as `ITER_REQS`, and substitutes `{reqs}` in
-context/testfiles patterns. Component-local requirement files are unchanged — they
-stay beside their component.
+**Project-wide requirements (first-class, added 2026-08-15; settings-based since
+2026-08-20):** the global `bizreq.iter.md` / `techreq.iter.md` locations are the
+`global_bizreq_path` / `global_techreq_path` settings in `globalsettings` — default
+`{codepath}/reqs/bizreq.iter.md` / `techreq.iter.md` (`{codepath}` = resolved code
+root; `~` and engine-home-relative values work; stubs healed on boot/init). The
+engine auto-lists EXACTLY those two files in every work item's spin-up prompt
+(deduped against explicit context) — never a directory scan, so stray docs beside
+them can't balloon agent context. It exports the resolved paths to agent sessions
+as `ITER_BIZREQ` / `ITER_TECHREQ`, their directory as `ITER_REQS`, and substitutes
+`{reqs}` (that directory) in context/testfiles patterns. The former `reqs:`
+frontmatter override on the project marker is gone — its silent fallback to
+engine-home stubs is exactly the failure the settings replace. Component-local
+requirement files are unchanged — they stay beside their component.
 
 **The path rule** (one rule, everywhere): every path may be a glob; relative paths
 start at the **project root** (the directory holding `.iter/`); `~` = home;

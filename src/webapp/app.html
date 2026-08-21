@@ -609,7 +609,8 @@ const agentDefaults = (t) => {
 };
 let PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // replaced by /api/meta in LIVE mode
 let HOME = '/Users/stephen.hilton';                              // replaced by /api/meta in LIVE mode
-let REQS_DIR = '';   // project-wide reqs dir (global bizreq/techreq) — replaced by /api/meta in LIVE mode
+let GLOBAL_BIZREQ = '';   // the global bizreq file (globalsettings.global_bizreq_path, resolved) — replaced by /api/meta in LIVE mode
+let GLOBAL_TECHREQ = '';  // the global techreq file (globalsettings.global_techreq_path, resolved) — replaced by /api/meta in LIVE mode
 
 /* codepath is entered relative but always resolved and shown absolute */
 function normPath(p){
@@ -637,7 +638,9 @@ function resolveLine(line, codepathAbs){
   };
   if (placeholders[line]) return placeholders[line];
   let p = line.split('{codepath}').join(codepathAbs || '(codepath)');
-  p = p.split('{reqs}').join(REQS_DIR || '(project-wide reqs dir)');
+  // {reqs} = the dir holding the global bizreq (global_bizreq_path setting)
+  const reqsDir = GLOBAL_BIZREQ ? GLOBAL_BIZREQ.slice(0, GLOBAL_BIZREQ.lastIndexOf('/')) : '';
+  p = p.split('{reqs}').join(reqsDir || '(project-wide reqs dir)');
   if (p === '~') p = HOME;
   else if (p.startsWith('~/')) p = HOME + '/' + p.slice(2);
   if (!p.startsWith('/') && !p.startsWith('(')) p = PROJECT_ROOT + '/' + p;
@@ -985,7 +988,8 @@ async function loadAll(){
     meta.prepostwork.forEach(p => PREPOST.push(typeof p === 'string' ? { name: p, exec: 'agent' } : p));
     PROJECT_ROOT = meta.code_root || meta.project_root;
     if (meta.home) HOME = meta.home;
-    if (meta.reqs_dir) REQS_DIR = meta.reqs_dir;
+    if (meta.global_bizreq) GLOBAL_BIZREQ = meta.global_bizreq;
+    if (meta.global_techreq) GLOBAL_TECHREQ = meta.global_techreq;
     if (Array.isArray(meta.default_context) && meta.default_context.length) {
       DEFAULT_CONTEXT = meta.default_context;
     }
@@ -2049,6 +2053,8 @@ const CONFIG = {
     test_dir: ['test', 'the per-component test directory name — testwriter items lock <component>/<test_dir>, code items list it in codepath_ignore; exported to agents as ITER_TEST_DIR'],
     usecase_default_path: ['{codepath}/usecases/', 'where NEW use-case files are created ({codepath} = the resolved code root) — creation only; the scanner finds *usecase.iter.md anywhere'],
     interface_default_path: ['{codepath}/interfaces/', 'where NEW interface files are created (<id>.interface.iter.md, one file per id — shared contracts, 1:M with C4 objects) — creation only; the scanner finds *interface.iter.md anywhere; exported to agents as ITER_INTERFACE_DIR'],
+    global_bizreq_path: ['{codepath}/reqs/bizreq.iter.md', 'the GLOBAL business-requirements file surfaced to every agent ({codepath} = the resolved code root) — exactly this file, never its directory; exported to agents as ITER_BIZREQ'],
+    global_techreq_path: ['{codepath}/reqs/techreq.iter.md', 'the GLOBAL technical-requirements file surfaced to every agent ({codepath} = the resolved code root) — exactly this file, never its directory; exported to agents as ITER_TECHREQ'],
     log_default_path: ['./logs/{YYYYMMDD-hh}.log', 'engine log file pattern'],
     log_level: ['info', 'debug | info | warn | error'],
     log_max_size_mb: [10, 'rotate log at this size'],
@@ -2151,6 +2157,8 @@ function settingsLayout(){
         ['scan_roots','marker_glob','testgroups_glob'].map(psi)],
       ['Creation defaults', 'Where NEW iter files land, and the context new work items start with',
         [psi('default_context'), cfg('globalsettings','usecase_default_path'), cfg('globalsettings','interface_default_path')]],
+      ['Global requirements', 'The two project-wide requirement files every agent is pointed at automatically — exactly these files, never a directory scan, so stray docs beside them can’t balloon agent context',
+        ['global_bizreq_path','global_techreq_path'].map(k => cfg('globalsettings', k))],
       ['Display and layout', 'Timestamp display, and the code root every relative path resolves against',
         [cfg('globalsettings','user_timezone'), cfg('globalsettings','code_root')]],
     ]],
@@ -2207,8 +2215,9 @@ async function renderSettings(){
       <span class="mono">{ancestor_markers}</span> = markers of that node’s parent chain up to the project root ·
       <span class="mono">{interfaces}</span> = the contract files for everything in the node’s uses:/provides: ·
       <span class="mono">{codepath}</span> = the node’s directory (anchors a glob to the work item’s own tree) ·
-      <span class="mono">{reqs}</span> = the project-wide reqs dir — global bizreq/techreq home (default <span class="mono">.iter/reqs/</span>,
-      relocated by a <span class="mono">reqs:</span> key on the project-level marker; its files are auto-surfaced to every agent).
+      <span class="mono">{reqs}</span> = the directory holding the global bizreq/techreq files
+      (<span class="mono">global_bizreq_path</span> / <span class="mono">global_techreq_path</span> settings, default <span class="mono">{codepath}/reqs/</span>;
+      exactly those two files are auto-surfaced to every agent — never the whole directory).
     </div>`;
   // The Test group's one-click setup: a "Test Loop" scheduled workitem replaces
   // the old in-engine sweep loop and its config.json section. The knobs travel as
@@ -3049,7 +3058,7 @@ async function reqLb(ref, kind){
   // the conventional name beside the marker.
   const declared = kind === 'bizreq' ? m.bizreq : m.techreq;
   const localPath = absCodepath(m.dir) + '/' + (declared || kind + '.iter.md');
-  const globalPath = (REQS_DIR || '(reqs dir unknown)') + '/' + kind + '.iter.md';
+  const globalPath = (kind === 'bizreq' ? GLOBAL_BIZREQ : GLOBAL_TECHREQ) || '(global path unknown — mock mode)';
   let local = { content: '', exists: false };
   let globalTxt = '';
   if (LIVE) {

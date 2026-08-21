@@ -412,7 +412,8 @@ fn api_meta(project: &Path) -> Resp {
         .unwrap_or_default();
     prepost.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     let settings = project_settings(project);
-    let code_root = config::code_root(project, &config::load(project));
+    let cfg = config::load(project);
+    let code_root = config::code_root(project, &cfg);
     json_resp(
         200,
         json!({
@@ -420,7 +421,8 @@ fn api_meta(project: &Path) -> Resp {
             "prepostwork": prepost,
             "project_root": project.canonicalize().unwrap_or_else(|_| project.to_path_buf()).to_string_lossy(),
             "code_root": code_root.to_string_lossy(),
-            "reqs_dir": context::reqs_dir(project, &code_root).to_string_lossy(),
+            "global_bizreq": config::global_bizreq(project, &cfg).to_string_lossy(),
+            "global_techreq": config::global_techreq(project, &cfg).to_string_lossy(),
             "project_name": settings["project_name"],
             "url_slug": settings["url_slug"],
             "default_context": settings["default_context"],
@@ -731,13 +733,14 @@ fn api_logs(project: &Path, id: &str) -> Resp {
 
 fn api_tests(project: &Path, id: &str) -> Resp {
     let Some((item, _)) = find_item(project, id) else { return err_resp(404, "no such work item") };
-    let code_root = config::code_root(project, &config::load(project));
+    let cfg = config::load(project);
+    let code_root = config::code_root(project, &cfg);
     let codepath = if Path::new(&item.codepath).is_absolute() {
         PathBuf::from(&item.codepath)
     } else {
         code_root.join(&item.codepath)
     };
-    let reqs = context::reqs_dir(project, &code_root);
+    let reqs = config::reqs_dir(project, &cfg);
     let (files, _warnings) = context::resolve(&item.testfiles, &codepath, &code_root, &reqs);
     let groups: Vec<Value> = files
         .iter()
@@ -1000,9 +1003,10 @@ repoint the participants at your real nodes, or delete it.)
    built `iter` onto the box. Deploy with a fresh inode (`rm` + `cp`, or
    `cp` + `mv`) — never overwrite a live executable in place.
 2. **Scaffold.** `iter init .` (or just `iter start` — missing pieces heal on
-   boot) creates `.iter/`: agent personas in `agents/`, pre/post steps in
-   `prepostwork/`, engine config in `.engine/config.json`, and the project-wide
-   requirements home in `reqs/`.
+   boot) creates `.iter/` (agent personas in `agents/`, pre/post steps in
+   `prepostwork/`, engine config in `.engine/config.json`) and stubs the two
+   global requirement files at their configured paths (`global_bizreq_path` /
+   `global_techreq_path`, default `reqs/` at the code root).
 3. **Describe the project.** Drop a `level: project` marker (`*.iter.md`) at the
    code root so the Projects map has a top; add component markers as you go.
    Fill `reqs/bizreq.iter.md` and `reqs/techreq.iter.md` with the requirements
@@ -1204,9 +1208,19 @@ fn body_str<'a>(body: &'a Value, key: &str) -> &'a str {
     body.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
+/// True when `path` IS one of the two GLOBAL requirement files (settings
+/// global_bizreq_path / global_techreq_path) — exactly those files, not their
+/// directory; neighbors in the same folder stay ordinary editable docs.
+fn is_global_req(project: &Path, path: &Path) -> bool {
+    let cfg = config::load(project);
+    [config::global_bizreq(project, &cfg), config::global_techreq(project, &cfg)]
+        .iter()
+        .any(|g| g.canonicalize().unwrap_or_else(|_| g.clone()) == path)
+}
+
 /// POST /api/file/read {path} → {path, content, readonly}. Read-only surface for
 /// the UI's lightboxes: markdown (markers, requirements), run logs, and test
-/// scripts. Files under the project-wide reqs dir are flagged readonly — the
+/// scripts. The two global requirement files are flagged readonly — the
 /// global bizreq/techreq are never edited through the UI.
 fn api_file_read(req: &Req, project: &Path) -> Resp {
     let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
@@ -1229,14 +1243,13 @@ fn api_file_read(req: &Req, project: &Path) -> Resp {
         Ok(t) => t,
         Err(e) => return err_resp(500, &format!("cannot read: {}", e)),
     };
-    let reqs = context::reqs_dir(project, &config::code_root(project, &config::load(project)));
-    let readonly = path.starts_with(&reqs) || !name.ends_with(".md");
+    let readonly = is_global_req(project, &path) || !name.ends_with(".md");
     json_resp(200, json!({ "path": path.to_string_lossy(), "content": content, "readonly": readonly }))
 }
 
 /// PUT /api/file {path, content} — markdown only, inside the project/code root,
-/// and NEVER under the project-wide reqs dir (the global bizreq/techreq are
-/// read-only by design; edit them on disk deliberately). The file may be new
+/// and NEVER one of the two global requirement files (the global bizreq/techreq
+/// are read-only by design; edit them on disk deliberately). The file may be new
 /// (e.g. a component's first local bizreq.iter.md): the parent must exist.
 fn api_file_write(req: &Req, project: &Path) -> Resp {
     let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
@@ -1262,8 +1275,7 @@ fn api_file_write(req: &Req, project: &Path) -> Resp {
     if !path_contained(project, &path) {
         return err_resp(400, "path is outside the project");
     }
-    let reqs = context::reqs_dir(project, &config::code_root(project, &config::load(project)));
-    if path.starts_with(&reqs) {
+    if is_global_req(project, &path) {
         return err_resp(403, &format!("global requirements are read-only in the UI — edit {} on disk deliberately", path.display()));
     }
     let tmp = path.with_extension("md.tmp");

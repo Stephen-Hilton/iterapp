@@ -31,7 +31,7 @@ set for the target component:
      where this C4 object's testgroup.iter.md and test scripts live; without
      the key its tests never run in the sweep).
    - `bizreq.iter.md`, `techreq.iter.md`, `<name>.interface.iter.md` — local to the
-     component (project-wide requirements stay in `$ITER_REQS`).
+     component (project-wide requirements stay in `$ITER_BIZREQ` / `$ITER_TECHREQ`).
    - `testgroup.iter.md` in `<component>/$ITER_TEST_DIR/` — **test group
      DEFINITIONS only, no tests**: for each group, prose describing exactly what
      it must prove (golden paths, expected errors, edge cases), plus the

@@ -56,14 +56,24 @@ impl Session {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "iter".to_string());
         let cfg = crate::config::load(&project_root);
-        let code_root = crate::config::code_root(&project_root, &cfg);
-        let reqs_dir = crate::context::reqs_dir(&project_root, &code_root);
         let envs = vec![
             ("ITER_BIN".to_string(), iter_bin),
             ("ITER_PROJECT".to_string(), project_root.to_string_lossy().into_owned()),
-            // The project-wide requirements dir (global bizreq/techreq home), so
-            // agents can read or write it without re-deriving the override chain.
-            ("ITER_REQS".to_string(), reqs_dir.to_string_lossy().into_owned()),
+            // The GLOBAL requirement files (globalsettings.global_bizreq_path /
+            // global_techreq_path, resolved) plus their home dir, so agents read
+            // or write them without re-deriving the settings.
+            (
+                "ITER_BIZREQ".to_string(),
+                crate::config::global_bizreq(&project_root, &cfg).to_string_lossy().into_owned(),
+            ),
+            (
+                "ITER_TECHREQ".to_string(),
+                crate::config::global_techreq(&project_root, &cfg).to_string_lossy().into_owned(),
+            ),
+            (
+                "ITER_REQS".to_string(),
+                crate::config::reqs_dir(&project_root, &cfg).to_string_lossy().into_owned(),
+            ),
             // The per-component test directory name (globalsettings.test_dir), so
             // agents scope test work without guessing the convention.
             ("ITER_TEST_DIR".to_string(), cfg.globalsettings.test_dir.clone()),

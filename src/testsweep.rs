@@ -340,7 +340,7 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
                     mainwork: format!(
                         "The {declaring_kind} {marker} declares `testgroup: {tg}` but that file does not exist.\n\
                          Create it, and author the tests it should register:\n\
-                         1. Read the declaring file, the local bizreq/techreq (and the global ones in $ITER_REQS), and the code.\n\
+                         1. Read the declaring file, the local bizreq/techreq (and the global $ITER_BIZREQ / $ITER_TECHREQ), and the code.\n\
                          2. If the CODE this should exercise is missing too, this is a plan-sized gap, not a testwriter task: \
                          escalate — create a plan work item carrying what you found (\"$ITER_BIN\" add --project \"$ITER_PROJECT\" \
                          --type plan --title \"plan: build out {name}\" --source-testgroup \"{declared}\" \
@@ -385,8 +385,8 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
                     context: vec![tg_file.to_string_lossy().into_owned(), unit.declaring_path.clone()],
                     mainwork: format!(
                         "Testgroup \"{label}\" in {tg_file} has no tests registered.\n\
-                         Author them: read the {declaring_kind} {marker}, the local bizreq/techreq (and the global ones in \
-                         $ITER_REQS), and the code; write test scripts honoring the shell-script contract (exit 0 \
+                         Author them: read the {declaring_kind} {marker}, the local bizreq/techreq (and the global \
+                         $ITER_BIZREQ / $ITER_TECHREQ), and the code; write test scripts honoring the shell-script contract (exit 0 \
                          as-expected / 1 unexpected / other = script error; last line `ITER_RESULT pass=X fail=Y total=Z`) \
                          and register each in the group's testlist. If the code this group should exercise does not \
                          exist yet, escalate to a plan work item (`iter add --type plan --source-testgroup \"{label}\" …`) \

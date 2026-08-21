@@ -54,12 +54,10 @@ pub struct Node {
     pub name: String,
     pub level: String,
     pub description: String,
-    pub parent: String, // explicit frontmatter override; "" = derive by directory
+    // No `parent:` key: ancestry is the key-prefix chain, always (features/webapp.md).
+    // A marker that writes one is ignored like any other unknown frontmatter key.
     pub uses: Vec<String>,     // interface ids or plain resource names (consumer end)
     pub provides: Vec<String>, // interface ids this node serves (provider end)
-    /// Project-wide reqs dir override — meaningful on the project-level marker only
-    /// (see context::reqs_dir). "" = default `.iter/reqs/`.
-    pub reqs: String,
     /// This C4 object's testgroup.iter.md, relative to the marker file's directory
     /// (`testgroup:` frontmatter key). MANDATORY for the test sweep: the marker file
     /// defines the C4 object, so test ownership is declared here, never inferred
@@ -251,10 +249,8 @@ pub fn scan(project_root: &Path, roots: &[PathBuf], marker_glob: &str) -> Scan {
                         name,
                         level: front.get("level").cloned().unwrap_or_default(),
                         description: front.get("description").cloned().unwrap_or_default(),
-                        parent: front.get("parent").cloned().unwrap_or_default(),
                         uses: front.get("uses").map(|v| parse_list(v)).unwrap_or_default(),
                         provides: front.get("provides").map(|v| parse_list(v)).unwrap_or_default(),
-                        reqs: front.get("reqs").cloned().unwrap_or_default(),
                         testgroup: front.get("testgroup").cloned().unwrap_or_default(),
                         test_dir: front.get("test_dir").cloned().unwrap_or_default(),
                         test_loop: front.get("test_loop").cloned().unwrap_or_default(),

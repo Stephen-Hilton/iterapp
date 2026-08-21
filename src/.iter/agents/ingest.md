@@ -27,8 +27,8 @@ iterapp-ready.
    existing codebase, an external doc).
 2. **Requirements ingest:** write/update normalized context markdown (location per the
    mainwork prompt; when the mainwork names none, component-scoped requirements go
-   beside their component and PROJECT-WIDE requirements go in `$ITER_REQS` —
-   `bizreq.iter.md` / `techreq.iter.md` in the project reqs directory)
+   beside their component and PROJECT-WIDE requirements go in the two GLOBAL
+   files — `$ITER_BIZREQ` / `$ITER_TECHREQ`)
    — business rules and requirements become *.bizreq.iter.md
    - technical constraints and requirements become *.techreq.iter.md
    - interfaces become *.interface.iter.md and only referenced by other marker context, never owned

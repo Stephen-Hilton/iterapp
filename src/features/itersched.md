@@ -41,9 +41,9 @@ engine run prework lines, mainwork, and postwork lines as `sh -c` commands in
 the codepath — no LLM, no agent slot (own cap `engine.max_shell_workers`, per-
 command budget `engine.shell_timeout_sec`), same lifecycle otherwise (codepath
 lock, attempts/backoff, output capture, close-out). Shell items get the same
-env contract as agents (ITER_BIN/ITER_PROJECT/ITER_REQS/ITER_TEST_DIR/
-ITER_INTERFACE_DIR/ITER_WORKID), so `"$ITER_BIN" runtests --group X` just
-works.
+env contract as agents (ITER_BIN/ITER_PROJECT/ITER_BIZREQ/ITER_TECHREQ/
+ITER_REQS/ITER_TEST_DIR/ITER_INTERFACE_DIR/ITER_WORKID), so
+`"$ITER_BIN" runtests --group X` just works.
 
 Additionally, `.iter/prepostwork/*.sh` files are engine-run shell steps INSIDE
 agent items: resolved at their position, output captured and prefixed to the

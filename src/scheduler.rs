@@ -950,11 +950,12 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
     let iter_bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "iter".to_string());
-    let reqs_dir = crate::context::reqs_dir(&shared.project_root, &code_root);
     let envs: Vec<(String, String)> = vec![
         ("ITER_BIN".into(), iter_bin),
         ("ITER_PROJECT".into(), shared.project_root.to_string_lossy().into_owned()),
-        ("ITER_REQS".into(), reqs_dir.to_string_lossy().into_owned()),
+        ("ITER_BIZREQ".into(), config::global_bizreq(&shared.project_root, &cfg).to_string_lossy().into_owned()),
+        ("ITER_TECHREQ".into(), config::global_techreq(&shared.project_root, &cfg).to_string_lossy().into_owned()),
+        ("ITER_REQS".into(), config::reqs_dir(&shared.project_root, &cfg).to_string_lossy().into_owned()),
         ("ITER_TEST_DIR".into(), cfg.globalsettings.test_dir.clone()),
         ("ITER_INTERFACE_DIR".into(), config::interface_dir(&shared.project_root, &cfg).to_string_lossy().into_owned()),
         ("ITER_USECASE_DIR".into(), config::usecase_dir(&shared.project_root, &cfg).to_string_lossy().into_owned()),
@@ -1328,8 +1329,9 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
     // Spin-up context is prepended to the FIRST turn so the whole run is one session.
     // Relative context/testfile patterns resolve against code_root, like codepaths;
     // agent/source/prepostwork definitions stay with the engine home (.iter/).
-    let code_root = config::code_root(&shared.project_root, &shared.cfg());
-    let reqs_dir = context::reqs_dir(&shared.project_root, &code_root);
+    let cfg = shared.cfg();
+    let code_root = config::code_root(&shared.project_root, &cfg);
+    let reqs_dir = config::reqs_dir(&shared.project_root, &cfg);
     let (context_files, warnings) = context::resolve(&item.context, codepath, &code_root, &reqs_dir);
     for w in &warnings {
         logging::warn(tag, w);
@@ -1348,15 +1350,17 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
         codepath.display()
     ));
     spinup.push_str(&previous_attempt_section(item));
-    // Project-wide requirements are surfaced to EVERY work item — that is what makes
-    // the reqs dir first-class. Files already attached as context aren't repeated.
-    let reqs_files: Vec<_> =
-        context::reqs_files(&reqs_dir).into_iter().filter(|f| !context_files.contains(f)).collect();
+    // The GLOBAL requirements are surfaced to EVERY work item — exactly the two
+    // files the settings name (global_bizreq_path / global_techreq_path), never a
+    // directory scan. Files already attached as context aren't repeated.
+    let reqs_files: Vec<_> = config::global_req_files(&shared.project_root, &cfg)
+        .into_iter()
+        .filter(|f| !context_files.contains(f))
+        .collect();
     if !reqs_files.is_empty() {
-        spinup.push_str(&format!(
-            "\n# Project-wide requirements ($ITER_REQS = {})\nGlobal requirements for the whole project — read what applies before starting:\n",
-            reqs_dir.display()
-        ));
+        spinup.push_str(
+            "\n# Project-wide requirements ($ITER_BIZREQ / $ITER_TECHREQ)\nGlobal requirements for the whole project — read what applies before starting:\n",
+        );
         for f in &reqs_files {
             spinup.push_str(&format!("- {}\n", f.display()));
         }

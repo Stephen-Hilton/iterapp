@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use workitems::{Queue, WorkItem};
 
 #[derive(Parser)]
-#[command(name = "iter", version, about = "iterapp: the iterloop engine and webapp in one executable")]
+#[command(name = "iter", version = env!("ITER_VERSION"), about = "iterapp: the iterloop engine and webapp in one executable")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -332,6 +332,12 @@ fn boot(project: &Path) -> bool {
         }
     }
     let cfg = config::load(project);
+    // The global requirement stubs heal at their CONFIGURED paths (settings
+    // global_bizreq_path/global_techreq_path), so this runs after config loads.
+    match template::ensure_global_reqs(project, &cfg) {
+        Ok(0) | Err(_) => {} // creation failure is not fatal — the engine runs without stubs
+        Ok(n) => println!("created {} global requirement stub(s)", n),
+    }
     let log_file = if cfg.globalsettings.log_default_path.is_empty() {
         None
     } else {
@@ -379,6 +385,7 @@ fn cmd_start(project: PathBuf, port: Option<u16>) -> i32 {
     let name = settings["project_name"].as_str().unwrap_or("project").to_string();
     registry::register(&project, &name, &slug, port);
     println!();
+    println!("  iter version:    {}", env!("ITER_VERSION"));
     println!("  iterapp webapp:  http://localhost:{}/", port);
     println!("                   http://{}.localhost:{}/", slug, port);
     println!();
@@ -1305,10 +1312,11 @@ fn cmd_init(dest: PathBuf, from: Option<PathBuf>) -> i32 {
     };
     match result {
         Ok(n) => {
+            let reqs_added = template::ensure_global_reqs(&dest, &config::load(&dest)).unwrap_or(0);
             println!(
                 "initialized {} — {} file(s) added{} (existing files untouched)",
                 dest.join(".iter").display(),
-                n,
+                n + reqs_added,
                 external.as_ref().map(|d| format!(" from {}", d.display())).unwrap_or_default()
             );
             0

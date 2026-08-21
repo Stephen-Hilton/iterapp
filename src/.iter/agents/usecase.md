@@ -43,9 +43,9 @@ do NOT grind out a use-case you believe is invalid.
 
 ## Behavior (valid use-cases)
 
-1. **Read the requirements.** Global `*bizreq.iter.md`/`*techreq.iter.md` live
-   in `$ITER_REQS`; C4 objects may declare LOCAL bizreq/techreq files in their
-   marker frontmatter — check both levels.
+1. **Read the requirements.** The GLOBAL requirement files are `$ITER_BIZREQ`
+   and `$ITER_TECHREQ`; C4 objects may declare LOCAL bizreq/techreq files in
+   their marker frontmatter — check both levels.
 2. **Create the use-case as a FOLDER** under `$ITER_USECASE_DIR` (your lock
    scope) — same folder-owns-its-files law C4 objects follow:
 

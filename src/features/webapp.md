@@ -206,7 +206,6 @@ A node exists because a marker file exists near the code it describes, e.g.
 name: Evidence Vault
 level: component          # free-form label; project/context/container/component suggested, not enforced
 description: "10-word summary shown in the hierarchy row"
-parent: core-intake       # OPTIONAL — overrides the default (nearest ancestor marker by directory)
 uses: [postgres, vault]   # shared resources / interfaces, shown as badges
 ---
 Free markdown body: THE context handed to agents working under this node —
@@ -214,9 +213,12 @@ requirements, interfaces, constraints. The marker IS the context file.
 ```
 
 - **Hierarchy is derived, not declared**: nearest-ancestor-marker by directory nesting
-  builds the tree; `parent:` overrides for cross-cutting nodes. This keeps the data
-  distributed AND decouples structure from a strict C4 hierarchy — nest contexts in
-  contexts, skip levels, invent levels; the page renders whatever depth exists.
+  builds the tree — there is no parent-override key, and none is planned. Cross-cutting
+  relationships are edges, not parentage: they go through interfaces (`uses:` /
+  `provides:`) and use-case `participants:`, both of which already cross the tree
+  freely. This keeps the data distributed AND decouples structure from a strict C4
+  hierarchy — nest contexts in contexts, skip levels, invent levels; the page renders
+  whatever depth exists.
 - **Levels are free-form, C4 by default** (locked 2026-08-11): out of the box the
   vocabulary is `project / context / container / component` — zero configuration, and
   that's the whole story for most users. Advanced users may define custom levels
@@ -292,10 +294,10 @@ form-open time, and every line supports the same globs as any work-item context:
 | Entry | Expands to |
 |---|---|
 | `{marker}` | the clicked node's own `.iter.md` file |
-| `{ancestor_markers}` | the marker files of that node's parent chain, walking up to the project root (directory-derived, `parent:` overrides respected) — e.g. from `core/intake/evidence-vault`: the `core/intake`, `core`, and project-root markers |
+| `{ancestor_markers}` | the marker files of that node's parent chain, walking up to the project root — strictly directory-derived: chop the node's key at each `/` and take whatever marker sits at that key, so a directory with no marker contributes nothing. E.g. from `core/intake/evidence-vault`: the `core/intake`, `core`, and project-root markers |
 | `{interfaces}` | the contract marker files for every interface in the node's `uses:` + `provides:` |
 | `{codepath}` | the node's directory, absolute — use to scope a glob to the work item's own tree |
-| `{reqs}` | the project-wide reqs directory (resolved by the engine): the first-class home of the global `bizreq.iter.md`/`techreq.iter.md`. Default `.iter/reqs/`; relocated per project by a `reqs:` frontmatter key on the `level: project` marker (relative to the code root, `~` ok). Its files are auto-surfaced in every work item's spin-up and exported to agents as `$ITER_REQS`, so `{reqs}` globs are for narrowing, not for basic attachment |
+| `{reqs}` | the directory holding the global `bizreq.iter.md`/`techreq.iter.md` (the `global_bizreq_path` / `global_techreq_path` settings, default `{codepath}/reqs/`), resolved by the engine and exported to agents as `$ITER_REQS`. Exactly those two files are auto-surfaced in every work item's spin-up (as `$ITER_BIZREQ` / `$ITER_TECHREQ`) — never the whole directory — so `{reqs}` globs are for deliberately attaching MORE of that directory |
 | any glob/path | passed through as a normal context entry |
 
 Worked example — *"attach this node's marker, everything above it, and every

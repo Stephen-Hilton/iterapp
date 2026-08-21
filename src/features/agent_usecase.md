@@ -68,8 +68,8 @@ experience of simply logging in, so they don't belong in the use-case.
 - **C4 traversal is deterministic**: `iter markers` dumps the scanned tree as
   JSON — the same scan (scan_roots + marker_glob, ~ expanded) the webapp,
   sweep, and validate share. Agents never re-implement discovery with shell
-  globbing. Requirements checks read BOTH the global `*bizreq.iter.md` /
-  `*techreq.iter.md` (in `$ITER_REQS`, auto-surfaced to every item) AND the C4
+  globbing. Requirements checks read BOTH the global requirement files
+  (`$ITER_BIZREQ` / `$ITER_TECHREQ`, auto-surfaced to every item) AND the C4
   object's local ones (declared in its marker frontmatter).
 - **Priorities inverted project-wide** (same decision, same day): LOWER =
   sooner, P0 most urgent, default 5. `iter invert-priorities` migrates an
