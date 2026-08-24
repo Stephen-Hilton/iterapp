@@ -178,10 +178,18 @@ pub fn run(project_root: &Path, dry: bool) -> i32 {
     let gs = &v1_engine["globalsettings"];
     let code_root_raw = gs["code_root"].as_str().unwrap_or(".").trim();
     let topdir = {
-        let p = if code_root_raw.is_empty() || code_root_raw == "." {
+        // V1 code_root commonly used `~` (pdy-dev: "~/dev/pdy-dev") — expand it
+        // before deciding absolute vs engine-home-relative.
+        let mut raw_s = code_root_raw.to_string();
+        if let Some(rest) = raw_s.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                raw_s = format!("{}/{}", home.to_string_lossy(), rest);
+            }
+        }
+        let p = if raw_s.is_empty() || raw_s == "." {
             root.clone()
         } else {
-            let raw = PathBuf::from(code_root_raw);
+            let raw = PathBuf::from(&raw_s);
             if raw.is_absolute() { raw } else { root.join(raw) }
         };
         p.canonicalize().unwrap_or(p)
