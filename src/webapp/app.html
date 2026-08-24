@@ -2922,13 +2922,12 @@ function projClick(e){
   const vm = e.target.closest('[data-viewmarker]');
   if (vm) {
     const m = markerByRef(vm.dataset.viewmarker);
-    if (m.body) {
-      // LIVE (or any marker whose body we hold): show the real file content.
-      const front = `---\nname: "${m.name}"\nlevel: ${m.level}\ndescription: "${m.desc}"` +
-        (m.provides.length ? `\n# outputs: [${m.provides.join(', ')}]` : '') +
-        (m.uses.length ? `\n# inputs: [${m.uses.join(', ')}]` : '') + '\n---\n\n';
-      openLb('Node — ' + m.path,
-        `<div class="textblock mono" style="max-height:66vh">${esc(front + m.body)}</div>`);
+    if (LIVE) {
+      // The REAL file, verbatim — frontmatter (children links included) and body.
+      api('/api/file/read', { method:'POST', body: JSON.stringify({ path: m.path }) })
+        .then(f => openLb('Node — ' + f.path,
+          `<div class="textblock mono" style="max-height:66vh">${esc(f.content)}</div>`))
+        .catch(err => toast('Read failed: ' + err.message));
       return true;
     }
     openLb('Node — ' + m.path, `<div class="textblock mono" style="max-height:60vh">${esc(
