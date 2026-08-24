@@ -132,7 +132,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            if matches!(name.as_str(), ".git" | "target" | "node_modules") {
+            if matches!(name.as_str(), ".git" | "target" | "node_modules" | ".iter") {
                 continue;
             }
             collect_files(&path, out);

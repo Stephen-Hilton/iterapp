@@ -169,7 +169,9 @@ fn rglob_variants(pattern: &str) -> Vec<String> {
 }
 
 fn is_noise(p: &Path) -> bool {
-    p.components().any(|c| matches!(c.as_os_str().to_str(), Some(".git" | "target" | "node_modules")))
+    // .iter is the engine home — internal state, personas, temp files; V2
+    // never creates node files inside it, so scans never look there.
+    p.components().any(|c| matches!(c.as_os_str().to_str(), Some(".git" | "target" | "node_modules" | ".iter")))
 }
 
 #[cfg(test)]
