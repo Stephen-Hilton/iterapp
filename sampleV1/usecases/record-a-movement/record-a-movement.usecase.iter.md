@@ -1,6 +1,7 @@
 ---
 name: "Record a movement"
 description: "Someone spends or receives money and writes it down, then sees where that leaves them."
+teststate: inherit
 children:
   codenodes:  ["{topdir}/ledger/cli/cli.code.iter.md", "{topdir}/ledger/cli/parse/parse.code.iter.md", "{topdir}/ledger/cli/store/store.code.iter.md"]
   testgroups: ["{thisfiledir}/test/testgroup.iter.md"]

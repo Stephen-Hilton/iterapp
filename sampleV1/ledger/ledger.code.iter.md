@@ -3,10 +3,13 @@ name: "Ledger System"
 level: context
 description: "The running program a person interacts with, and the one file it keeps its records in."
 owner: bespoke
+teststate: inherit
 children:
   codedirs:   ["{thisfiledir}/"]
   codenodes:  ["{thisfiledir}/cli/cli.code.iter.md", "{thisfiledir}/report/report.code.iter.md"]
-  bizreqs:   ["{thisfiledir}/*.bizreq.iter.md"]
+  inputs:     []
+  outputs:    []
+  bizreqs:    ["{thisfiledir}/*.bizreq.iter.md"]
   techreqs:   ["{thisfiledir}/*.techreq.iter.md"]
   testgroups: ["{thisfiledir}/test/*.testgroup.iter.md"]
 ---

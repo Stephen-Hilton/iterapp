@@ -6,7 +6,10 @@ owner: bespoke
 teststate: omit
 children:
   codedirs:   ["{thisfiledir}/"]
-  bizreqs:   ["{thisfiledir}/*.bizreq.iter.md"]
+  codenodes:  []
+  inputs:     []
+  outputs:    []
+  bizreqs:    ["{thisfiledir}/*.bizreq.iter.md"]
   techreqs:   ["{thisfiledir}/*.techreq.iter.md"]
   testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---

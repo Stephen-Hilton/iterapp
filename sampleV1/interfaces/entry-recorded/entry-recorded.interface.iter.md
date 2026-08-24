@@ -3,6 +3,7 @@ name: "entry-recorded"
 kind: event
 description: "The notice that one money movement has been written down for good, and what it was."
 owner: bespoke
+teststate: inherit
 children:
   bizreqs:    ["{thisfiledir}/{thisfilestem}/*.bizreq.iter.md"]
   techreqs:   ["{thisfiledir}/{thisfilestem}/*.techreq.iter.md"]

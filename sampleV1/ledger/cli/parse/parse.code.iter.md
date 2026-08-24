@@ -3,10 +3,13 @@ name: "Command Parser"
 level: component
 description: "Decides what a person meant by what they typed, and checks the arguments before anyone acts on them."
 owner: bespoke
+teststate: inherit
 children:
   codedirs:   ["{thisfiledir}/"]
+  codenodes:  []
+  inputs:     []
   outputs:    ["{topdir}/interfaces/ledger-command/ledger-command.interface.iter.md"]
-  bizreqs:   ["{thisfiledir}/*.bizreq.iter.md"]
+  bizreqs:    ["{thisfiledir}/*.bizreq.iter.md"]
   techreqs:   ["{thisfiledir}/*.techreq.iter.md"]
   testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---

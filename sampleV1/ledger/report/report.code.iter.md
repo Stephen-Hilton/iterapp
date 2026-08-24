@@ -3,11 +3,13 @@ name: "Report Renderer"
 level: container
 description: "Reads the log back out and turns it into something a person can read."
 owner: bespoke
+teststate: inherit
 children:
   codedirs:   ["{thisfiledir}/"]
   codenodes:  ["{thisfiledir}/export/export.code.iter.md"]
   inputs:     ["{topdir}/interfaces/entry-recorded/entry-recorded.interface.iter.md"]
-  bizreqs:   ["{thisfiledir}/*.bizreq.iter.md"]
+  outputs:    []
+  bizreqs:    ["{thisfiledir}/*.bizreq.iter.md"]
   techreqs:   ["{thisfiledir}/*.techreq.iter.md"]
   testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---

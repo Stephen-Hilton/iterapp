@@ -131,11 +131,13 @@ fn render_list(items: &[String]) -> String {
     format!("[{}]", parts.join(", "))
 }
 
+/// structureV2 encourages writing defaults out explicitly, so migrated files
+/// ALWAYS carry the key — an unset V1 flag becomes `teststate: inherit`.
 fn teststate_line(front: &HashMap<String, String>) -> String {
     match front.get("test_loop").map(|s| s.trim()) {
         Some("blocked") => "teststate: block\n".into(),
         Some(v @ ("omit" | "include")) => format!("teststate: {}\n", v),
-        _ => String::new(),
+        _ => "teststate: inherit\n".into(),
     }
 }
 
@@ -417,66 +419,67 @@ pub fn run(project_root: &Path, dry: bool) -> i32 {
             Some(l) if !l.is_empty() => l.to_string(),
             _ => "component".to_string(),
         };
-        let mut children = String::from("children:\n  codedirs:   [\"{thisfiledir}/\"]\n");
-        let kids = direct_children(&m.dir);
-        if !kids.is_empty() {
-            let entries: Vec<String> = kids
-                .iter()
-                .map(|k| new_code_path(k))
-                .filter_map(|k| {
-                    k.strip_prefix(&m.dir).ok().map(|r| format!("{{thisfiledir}}/{}", r.display()))
-                })
+        // The FULL canonical children mapping, every sub-key written out (the
+        // spec's "write the defaults explicitly" encouragement) — empty lists
+        // where V1 declared nothing, so the shape matches the spec example.
+        let codenodes_entries: Vec<String> = direct_children(&m.dir)
+            .iter()
+            .map(|k| new_code_path(k))
+            .filter_map(|k| {
+                k.strip_prefix(&m.dir).ok().map(|r| format!("{{thisfiledir}}/{}", r.display()))
+            })
+            .collect();
+        let mut iface_entries = |v1key: &str| -> Vec<String> {
+            let Some(raw) = m.front.get(v1key) else { return Vec::new() };
+            let ids: Vec<&str> = raw
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
                 .collect();
-            children.push_str(&format!("  codenodes:  {}\n", render_list(&entries)));
-        }
-        for (v1key, v2key) in [("uses", "inputs"), ("provides", "outputs")] {
-            if let Some(raw) = m.front.get(v1key) {
-                let ids: Vec<&str> = raw
-                    .trim()
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let mut entries = Vec::new();
-                for id in &ids {
-                    match iface_id_to_path.get(*id) {
-                        Some(p) => entries.push(
-                            p.strip_prefix(&topdir)
-                                .map(|r| format!("{{topdir}}/{}", r.display()))
-                                .unwrap_or_else(|_| p.to_string_lossy().into_owned()),
-                        ),
-                        None => mig.log(format!(
-                            "NOTE {}: {} id \"{}\" matches no interface file — left out; Ingest should relink",
-                            m.path.display(),
-                            v1key,
-                            id
-                        )),
-                    }
-                }
-                if !entries.is_empty() {
-                    children.push_str(&format!("  {}:{}{}\n", v2key, if v2key.len() < 7 { "     " } else { "    " }, render_list(&entries)));
+            let mut entries = Vec::new();
+            for id in &ids {
+                match iface_id_to_path.get(*id) {
+                    Some(p) => entries.push(
+                        p.strip_prefix(&topdir)
+                            .map(|r| format!("{{topdir}}/{}", r.display()))
+                            .unwrap_or_else(|_| p.to_string_lossy().into_owned()),
+                    ),
+                    None => mig.log(format!(
+                        "NOTE {}: {} id \"{}\" matches no interface file — left out; Ingest should relink",
+                        m.path.display(),
+                        v1key,
+                        id
+                    )),
                 }
             }
-        }
-        for (v1key, v2key, default_glob) in [
-            ("bizreq", "bizreqs", "{thisfiledir}/*.bizreq.iter.md"),
-            ("techreq", "techreqs", "{thisfiledir}/*.techreq.iter.md"),
-        ] {
-            let entry = match m.front.get(v1key).filter(|v| !v.trim().is_empty()) {
-                Some(v) => format!("{{thisfiledir}}/{}", v.trim()),
-                None => default_glob.to_string(),
-            };
-            children.push_str(&format!("  {}:   {}\n", v2key, render_list(&[entry])));
-        }
-        let tg_entry = match m.front.get("testgroup").filter(|v| !v.trim().is_empty() && v.trim() != "none") {
-            Some(v) => Some(format!("{{thisfiledir}}/{}", v.trim())),
-            None => None,
+            entries
         };
-        match tg_entry {
-            Some(e) => children.push_str(&format!("  testgroups: {}\n", render_list(&[e]))),
-            None => children.push_str("  testgroups: [\"{thisfiledir}/test/*.testgroup.iter.md\"]\n"),
+        let inputs_entries = iface_entries("uses");
+        let outputs_entries = iface_entries("provides");
+        let req_entry = |v1key: &str, default_glob: &str| -> Vec<String> {
+            match m.front.get(v1key).filter(|v| !v.trim().is_empty()) {
+                Some(v) => vec![format!("{{thisfiledir}}/{}", v.trim())],
+                None => vec![default_glob.to_string()],
+            }
+        };
+        let tg_entries = match m.front.get("testgroup").filter(|v| !v.trim().is_empty() && v.trim() != "none") {
+            Some(v) => vec![format!("{{thisfiledir}}/{}", v.trim())],
+            None => vec!["{thisfiledir}/test/*.testgroup.iter.md".to_string()],
+        };
+        let mut children = String::from("children:\n");
+        for (key, entries) in [
+            ("codedirs:  ", vec!["{thisfiledir}/".to_string()]),
+            ("codenodes: ", codenodes_entries),
+            ("inputs:    ", inputs_entries),
+            ("outputs:   ", outputs_entries),
+            ("bizreqs:   ", req_entry("bizreq", "{thisfiledir}/*.bizreq.iter.md")),
+            ("techreqs:  ", req_entry("techreq", "{thisfiledir}/*.techreq.iter.md")),
+            ("testgroups:", tg_entries),
+        ] {
+            children.push_str(&format!("  {} {}\n", key, render_list(&entries)));
         }
         let content = format!(
             "---\nname: {}\nlevel: {}\ndescription: {}\nowner: bespoke\n{}{}---\n{}",

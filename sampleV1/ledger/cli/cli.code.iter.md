@@ -3,11 +3,13 @@ name: "Ledger CLI"
 level: container
 description: "The command a person types: it works out what was asked for and makes it happen."
 owner: bespoke
+teststate: inherit
 children:
   codedirs:   ["{thisfiledir}/"]
   codenodes:  ["{thisfiledir}/parse/parse.code.iter.md", "{thisfiledir}/store/store.code.iter.md"]
   inputs:     ["{topdir}/interfaces/ledger-command/ledger-command.interface.iter.md", "{topdir}/interfaces/entry-recorded/entry-recorded.interface.iter.md"]
-  bizreqs:   ["{thisfiledir}/cli.bizreq.iter.md"]
+  outputs:    []
+  bizreqs:    ["{thisfiledir}/cli.bizreq.iter.md"]
   techreqs:   ["{thisfiledir}/cli.techreq.iter.md"]
   testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---

@@ -3,6 +3,7 @@ name: "ledger-command"
 kind: request-reply
 description: "What a person typed, turned into a decided command with its arguments already checked."
 owner: bespoke
+teststate: inherit
 children:
   bizreqs:    ["{thisfiledir}/{thisfilestem}/*.bizreq.iter.md"]
   techreqs:   ["{thisfiledir}/{thisfilestem}/*.techreq.iter.md"]

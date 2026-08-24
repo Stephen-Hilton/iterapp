@@ -41,8 +41,8 @@ test.describe('projects view (the structureV2 DAG)', () => {
     // "View Node File" shows the REAL file — the children mapping included,
     // never a synthesized frontmatter fragment (the V1 lightbox regression).
     await page.locator('[data-viewmarker]').first().click();
-    await expect(page.locator('.textblock')).toContainText('children:');
-    await expect(page.locator('.textblock')).toContainText('testgroups:');
+    await expect(page.locator('#lbBody .textblock')).toContainText('children:');
+    await expect(page.locator('#lbBody .textblock')).toContainText('testgroups:');
     await page.keyboard.press('Escape');
   });
 
