@@ -1,3 +1,10 @@
+---
+name: "test testgroup"
+description: "testgroup for test"
+children:
+  testpaths: ["{thisfiledir}/*.sh"]
+---
+
 # ledger-command — test groups
 
 The contract lists eight worked examples and calls them normative. This group

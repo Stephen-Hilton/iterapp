@@ -1,3 +1,10 @@
+---
+name: "cli bizreq"
+description: "bizreq for cli"
+children:
+  reqpaths: []
+---
+
 # Ledger CLI — business requirements
 
 - **CLI-BIZ-001** — A person invokes everything the same way: the program name,

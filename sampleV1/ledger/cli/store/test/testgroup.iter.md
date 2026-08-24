@@ -1,3 +1,10 @@
+---
+name: "test testgroup"
+description: "testgroup for test"
+children:
+  testpaths: ["{thisfiledir}/*.sh"]
+---
+
 # Entry Store — test groups
 
 The Store is the only part of the project that writes, which makes it the only

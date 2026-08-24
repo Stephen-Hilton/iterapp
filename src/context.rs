@@ -1,25 +1,29 @@
 use std::path::{Path, PathBuf};
 
 /// Resolve a work item's context patterns into concrete files, deterministically.
-/// Substitutes `{codepath}`, `{reqs}`, and `~`, resolves relative patterns against
-/// the project root, expands globs. Returns (files, warnings) — a pattern that
-/// matches nothing is a warning, never an error.
-pub fn resolve(patterns: &[String], codepath: &Path, project_root: &Path, reqs: &Path) -> (Vec<PathBuf>, Vec<String>) {
+/// Substitutes `{codepath}` (the item's resolved primary codepath), `{topdir}`
+/// (the project's top directory — structureV2's one head), and `~`; resolves
+/// relative patterns against `{topdir}`; expands globs. Returns
+/// (files, warnings) — a pattern that matches nothing is a warning, never an error.
+pub fn resolve(patterns: &[String], codepath: &Path, topdir: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
     for pattern in patterns {
         let mut p = pattern
             .replace("{codepath}", &codepath.to_string_lossy())
-            .replace("{reqs}", &reqs.to_string_lossy());
+            .replace("{topdir}", &topdir.to_string_lossy());
         if let Some(rest) = p.strip_prefix("~/") {
             if let Some(home) = std::env::var_os("HOME") {
                 p = format!("{}/{}", home.to_string_lossy(), rest);
             }
         }
+        while p.contains("//") {
+            p = p.replace("//", "/");
+        }
         let abs = if Path::new(&p).is_absolute() {
             p.clone()
         } else {
-            project_root.join(&p).to_string_lossy().into_owned()
+            topdir.join(&p).to_string_lossy().into_owned()
         };
         if abs.contains('*') || abs.contains('?') || abs.contains('[') {
             match glob::glob(&abs) {
@@ -55,51 +59,37 @@ pub fn resolve(patterns: &[String], codepath: &Path, project_root: &Path, reqs: 
 mod tests {
     use super::*;
 
-    /// The shipped reference project (sampleV1/), scaffolded by the current
-    /// engine — the fixture these tests read is a real iterapp project, so a
-    /// change that breaks real projects breaks the suite too.
-    fn sample() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("sampleV1")
-    }
-
-    #[test]
-    fn resolves_sample_context() {
-        let root = sample();
-        let reqs = crate::config::reqs_dir(&root, &crate::config::Config::default());
-        let patterns = vec!["./reqs/bizreq.iter.md".to_string(), "./reqs/*req.iter.md".to_string(), "./missing.md".to_string()];
-        let (files, warnings) = resolve(&patterns, &root, &root, &reqs);
-        assert_eq!(files.len(), 2, "bizreq + techreq, deduped: {:?}", files);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("missing.md"));
-    }
-
-    #[test]
-    fn codepath_substitution() {
-        let root = sample();
-        let codepath = root.join("ledger/cli/parse/test");
-        let patterns = vec!["{codepath}/testgroup.iter.md".to_string()];
-        let (files, warnings) = resolve(&patterns, &codepath, &root, &root.join("reqs"));
-        assert_eq!(files.len(), 1);
-        assert!(warnings.is_empty());
-    }
-
     fn tmpdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("iter-reqs-{}-{}", name, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("iter-ctx-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     #[test]
-    fn reqs_placeholder_resolves() {
-        let dir = tmpdir("placeholder");
-        let reqs = dir.join("reqs");
-        std::fs::create_dir_all(&reqs).unwrap();
-        std::fs::write(reqs.join("bizreq.iter.md"), "BR-1").unwrap();
-        std::fs::write(reqs.join("techreq.iter.md"), "TR-1").unwrap();
-        let (files, warnings) = resolve(&["{reqs}/*.iter.md".to_string()], &dir, &dir, &reqs);
-        assert_eq!(files.len(), 2, "{{reqs}} glob resolves: {:?}", warnings);
-        assert!(warnings.is_empty());
+    fn resolves_relative_globs_against_topdir() {
+        let dir = tmpdir("rel");
+        std::fs::create_dir_all(dir.join("reqs")).unwrap();
+        std::fs::write(dir.join("reqs/a.bizreq.iter.md"), "BR").unwrap();
+        std::fs::write(dir.join("reqs/b.techreq.iter.md"), "TR").unwrap();
+        let patterns = vec!["./reqs/a.bizreq.iter.md".to_string(), "./reqs/*req.iter.md".to_string(), "./missing.md".to_string()];
+        let (files, warnings) = resolve(&patterns, &dir, &dir);
+        assert_eq!(files.len(), 2, "both reqs, deduped: {:?}", files);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("missing.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codepath_and_topdir_placeholders() {
+        let dir = tmpdir("ph");
+        std::fs::create_dir_all(dir.join("comp/test")).unwrap();
+        std::fs::write(dir.join("comp/test/x.testgroup.iter.md"), "tg").unwrap();
+        std::fs::write(dir.join("main.iter.md"), "m").unwrap();
+        let codepath = dir.join("comp");
+        let (files, warnings) =
+            resolve(&["{codepath}/test/x.testgroup.iter.md".to_string(), "{topdir}/main.iter.md".to_string()], &codepath, &dir);
+        assert_eq!(files.len(), 2, "{:?}", warnings);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

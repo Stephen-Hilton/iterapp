@@ -1,0 +1,12 @@
+{
+  "name": "iterapp-e2e",
+  "private": true,
+  "description": "Playwright end-to-end tests for the iterapp webapp (run: npm test; needs `cargo build` first)",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}

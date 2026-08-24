@@ -59,20 +59,20 @@ impl Session {
         let envs = vec![
             ("ITER_BIN".to_string(), iter_bin),
             ("ITER_PROJECT".to_string(), project_root.to_string_lossy().into_owned()),
-            // The GLOBAL requirement files (globalsettings.global_bizreq_path /
-            // global_techreq_path, resolved) plus their home dir, so agents read
-            // or write them without re-deriving the settings.
+            // The project head (structureV2): main.iter.md, and every file the
+            // project pins into agent context (globalcontextfiles, resolved) —
+            // colon-joined, so agents read them without re-deriving settings.
             (
-                "ITER_BIZREQ".to_string(),
-                crate::config::global_bizreq(&project_root, &cfg).to_string_lossy().into_owned(),
+                "ITER_MAINFILE".to_string(),
+                crate::project::Project::load(&project_root).mainfile.to_string_lossy().into_owned(),
             ),
             (
-                "ITER_TECHREQ".to_string(),
-                crate::config::global_techreq(&project_root, &cfg).to_string_lossy().into_owned(),
-            ),
-            (
-                "ITER_REQS".to_string(),
-                crate::config::reqs_dir(&project_root, &cfg).to_string_lossy().into_owned(),
+                "ITER_CONTEXT_FILES".to_string(),
+                crate::config::global_context_files(&project_root)
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(":"),
             ),
             // The per-component test directory name (globalsettings.test_dir), so
             // agents scope test work without guessing the convention.

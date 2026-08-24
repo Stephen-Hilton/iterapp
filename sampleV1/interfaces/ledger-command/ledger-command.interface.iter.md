@@ -1,9 +1,12 @@
 ---
-interface: ledger-command
+name: "ledger-command"
 kind: request-reply
 description: "What a person typed, turned into a decided command with its arguments already checked."
-testgroup: test/testgroup.iter.md
-test_dir: test
+owner: bespoke
+children:
+  bizreqs:    ["{thisfiledir}/{thisfilestem}/*.bizreq.iter.md"]
+  techreqs:   ["{thisfiledir}/{thisfilestem}/*.techreq.iter.md"]
+  testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---
 
 # ledger-command — contract

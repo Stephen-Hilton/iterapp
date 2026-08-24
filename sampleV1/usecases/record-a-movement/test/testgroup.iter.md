@@ -1,3 +1,10 @@
+---
+name: "test testgroup"
+description: "testgroup for test"
+children:
+  testpaths: ["{thisfiledir}/*.sh"]
+---
+
 # Record a movement — end-to-end tests
 
 Journey tests, not component tests: everything here goes through the CLI the way

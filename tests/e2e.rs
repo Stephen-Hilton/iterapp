@@ -436,20 +436,28 @@ fn api_crud_history_markers_and_settings() {
         r#"{"engine":{"tick_interval_sec":1,"max_open_workitems":3},"globalsettings":{"log_default_path":""}}"#,
     )
     .unwrap();
-    // An iter-file tree: node, interface, plain doc — roles come from the FILENAMES.
+    // A structureV2 tree: main head, a context node, an interface, a bizreq —
+    // nodetypes come from the FILENAME dot rule; links from children.
     std::fs::create_dir_all(dest.join("svc")).unwrap();
-    std::fs::write(dest.join("root.marker.iter.md"), "---\nname: API Test Project\nlevel: project\n---\n").unwrap();
     std::fs::write(
-        dest.join("svc/svc.marker.iter.md"),
-        "---\nname: Svc\nlevel: component\nuses: [pay-api]\nprovides: [svc-api]\n---\ncontext",
+        dest.join("main.iter.md"),
+        "---\nprojectname: \"API Test Project\"\nprojectdescription: \"d\"\n---\nproject body\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dest.join("svc/svc.code.iter.md"),
+        "---\nname: Svc\nlevel: context\ndescription: d\nchildren:\n  outputs: [\"{thisfiledir}/svc-api.interface.iter.md\"]\n---\ncontext",
     )
     .unwrap();
     std::fs::write(
         dest.join("svc/svc-api.interface.iter.md"),
-        "---\ninterface: svc-api\nkind: http\nendpoint: GET /svc\n---\ncontract",
+        "---\nname: svc-api\nkind: request-reply\nendpoint: GET /svc\ndescription: d\nchildren:\n  testgroups: []\n---\ncontract",
     )
     .unwrap();
-    std::fs::write(dest.join("svc/bizreq.iter.md"), "plain context\n").unwrap();
+    std::fs::write(dest.join("svc/bizreq.iter.md"), "---\nname: svc reqs\ndescription: d\nchildren:\n  reqpaths: []\n---\nBR-1\n").unwrap();
+    // Keep the queue deterministic for the cap assertions: pre-flag the
+    // Orphanage-review schedule as seeded so `iter start` adds nothing.
+    std::fs::write(dest.join(".iter/.engine/orphan_schedule_seeded"), "test").unwrap();
 
     let port = 22000 + (std::process::id() % 20000) as u16;
     let mut child = Command::new(BIN)
@@ -499,44 +507,46 @@ fn api_crud_history_markers_and_settings() {
     assert!(hist.contains("\"days\""), "{}", hist);
     assert!(hist.contains("\"complete\":1"), "today's bucket counts the completion: {}", hist);
 
-    // markers: node + interface + plain sorted by frontmatter role
+    // markers: DAG node + interface + linked bizreq (V2 scan shape)
     let markers = http(port, "GET", "/api/markers", None);
-    assert!(markers.contains("API Test Project"), "{}", markers);
+    assert!(markers.contains("\"Svc\""), "{}", markers);
     assert!(markers.contains("\"svc-api\""));
-    assert!(markers.contains("bizreq.iter.md"));
+    assert!(markers.contains("bizreq.iter.md"), "default bizreqs link claims the file: {}", markers);
+    assert!(markers.contains("\"orphans\""), "the Orphanage rides along: {}", markers);
 
-    // usecase create is FOLDERED (folder-owns-its-files, same layout the
-    // usecase agent writes): <usecase_default_path>/<slug>/<slug>.usecase.iter.md
-    // declaring testgroup:/test_dir:, plus a starter testgroup with one
-    // empty-testlist E2E group (the sweep births the authoring item from it).
-    let uc = http(port, "POST", "/api/usecases", Some(r#"{"name":"Pay Flow","description":"d","participants":["1 svc"]}"#));
+    // usecase create is FOLDERED (folder-owns-its-files):
+    // <globalusecasedir>/<slug>/<slug>.usecase.iter.md with children.codenodes
+    // (the REQUIRED link key) + an explicit testgroups link, plus a starter
+    // testgroup with one empty-testlist E2E group (the sweep births the
+    // authoring item from it).
+    let uc = http(port, "POST", "/api/usecases", Some(r#"{"name":"Pay Flow","description":"d","codenodes":["{topdir}/svc/svc.code.iter.md"]}"#));
     assert!(uc.contains("201"), "{}", uc);
     let uc_file = dest.join("usecases/pay-flow/pay-flow.usecase.iter.md");
-    assert!(uc_file.is_file(), "created use-case must be foldered under <code_root>/usecases/");
+    assert!(uc_file.is_file(), "created use-case must be foldered under <topdir>/usecases/");
     let uc_text = std::fs::read_to_string(&uc_file).unwrap();
     assert!(
-        uc_text.contains("testgroup: test/testgroup.iter.md") && uc_text.contains("test_dir: test"),
-        "tests declared from day one: {}",
+        uc_text.contains("codenodes:") && uc_text.contains("svc.code.iter.md") && uc_text.contains("testgroups:"),
+        "links declared from day one: {}",
         uc_text
     );
-    let tg_text = std::fs::read_to_string(dest.join("usecases/pay-flow/test/testgroup.iter.md")).unwrap();
+    let tg_text = std::fs::read_to_string(dest.join("usecases/pay-flow/test/pay-flow.testgroup.iter.md")).unwrap();
     assert!(tg_text.contains("pay-flow-e2e") && tg_text.contains("\"testlist\":[]"), "starter group, empty testlist: {}", tg_text);
 
-    // update keeps the frontmatter keys the form doesn't own
+    // update keeps the frontmatter keys and links the form doesn't own
     let upd = http(
         port,
         "PUT",
         "/api/usecases",
         Some(&format!(
-            r#"{{"file":"{}","name":"Pay Flow","description":"d2","participants":["1 svc"],"body":"story"}}"#,
+            r#"{{"file":"{}","name":"Pay Flow","description":"d2","codenodes":["{{topdir}}/svc/svc.code.iter.md"],"body":"story"}}"#,
             uc_file.display()
         )),
     );
     assert!(upd.contains("200"), "{}", upd);
     let uc_text = std::fs::read_to_string(&uc_file).unwrap();
     assert!(
-        uc_text.contains("d2") && uc_text.contains("testgroup: test/testgroup.iter.md") && uc_text.contains("test_dir: test"),
-        "an edit must not strip testgroup/test_dir: {}",
+        uc_text.contains("d2") && uc_text.contains("testgroups:") && uc_text.contains("test/"),
+        "an edit must not strip the testgroups link: {}",
         uc_text
     );
 
@@ -551,11 +561,18 @@ fn api_crud_history_markers_and_settings() {
     let got = http(port, "GET", "/api/config", None);
     assert!(got.contains("\"tick_interval_sec\": 2") || got.contains("\"tick_interval_sec\":2"), "{}", got);
 
-    // projectsettings roundtrip
-    let ps = http(port, "PUT", "/api/projectsettings", Some(r#"{"project_name":"Renamed","url_slug":"api-test"}"#));
+    // projectsettings roundtrip: the server half lands in config.iter.json,
+    // the project half in main.iter.md frontmatter.
+    let ps = http(
+        port,
+        "PUT",
+        "/api/projectsettings",
+        Some(r#"{"server":{"mainfile":"{topdir}/main.iter.md","iterglob":"**/*.iter.md","topdir":"{thisfiledir}/../","url_slug":"api-test","default_context":[]},"project":{"projectname":"Renamed"}}"#),
+    );
     assert!(ps.contains("Renamed"), "{}", ps);
     let ps2 = http(port, "GET", "/api/projectsettings", None);
-    assert!(ps2.contains("api-test") && ps2.contains("marker_glob"), "defaults overlay: {}", ps2);
+    assert!(ps2.contains("api-test") && ps2.contains("iterglob"), "head files reflected: {}", ps2);
+    assert!(std::fs::read_to_string(dest.join("main.iter.md")).unwrap().contains("Renamed"), "frontmatter edit landed");
 
     // agents: list, edit roundtrip (body + comments untouched), bad names rejected
     let ag = http(port, "GET", "/api/agents", None);
@@ -824,16 +841,16 @@ fn runtests_claims_and_sweep_lifecycle() {
     let (root, _stub) = setup_project("runtests", 3, 200);
     let test_dir = root.join("comp/test");
     std::fs::create_dir_all(&test_dir).unwrap();
-    // The marker file declares the C4 object's tests — mandatory for the sweep.
+    // The code node's children.testgroups link declares its tests (structureV2).
     std::fs::write(
-        root.join("comp/comp.marker.iter.md"),
-        "---\nname: \"Comp\"\nlevel: component\ndescription: \"e2e\"\ntestgroup: test/testgroup.iter.md\ntest_dir: test\n---\nbody\n",
+        root.join("comp/comp.code.iter.md"),
+        "---\nname: \"Comp\"\nlevel: context\ndescription: \"e2e\"\nchildren:\n  testgroups: [\"{thisfiledir}/test/*.testgroup.iter.md\"]\n---\nbody\n",
     )
     .unwrap();
     std::fs::write(test_dir.join("t1.sh"), "echo 'ITER_RESULT pass=0 fail=1 total=1'\nexit 1\n").unwrap();
     std::fs::write(
-        test_dir.join("testgroup.iter.md"),
-        "# comp tests\n\n<!-- iterapp:testgroups\n{\"label\":\"G\",\"desc\":\"demo\",\"auto_fix\":false,\"lastrun\":\"\",\"result\":\"\",\"counts\":\"\",\"testlist\":[{\"id\":\"t1\",\"name\":\"one\",\"desc\":\"d\",\"shell\":\"t1.sh\"}]}\n-->\n",
+        test_dir.join("comp.testgroup.iter.md"),
+        "---\nname: comp tests\ndescription: d\nchildren:\n  testpaths: [\"{thisfiledir}/*.sh\"]\n---\n# comp tests\n\n<!-- iterapp:testgroups\n{\"label\":\"G\",\"desc\":\"demo\",\"auto_fix\":false,\"lastrun\":\"\",\"result\":\"\",\"counts\":\"\",\"testlist\":[{\"id\":\"t1\",\"name\":\"one\",\"desc\":\"d\",\"shell\":\"t1.sh\"}]}\n-->\n",
     )
     .unwrap();
     let run = |args: &[&str], workid: Option<&str>| {
@@ -850,7 +867,7 @@ fn runtests_claims_and_sweep_lifecycle() {
     assert_eq!(out.status.code(), Some(1), "neutral red exits 1: {}", String::from_utf8_lossy(&out.stdout));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("tests 0/1"), "{}", stdout);
-    let tg = std::fs::read_to_string(test_dir.join("testgroup.iter.md")).unwrap();
+    let tg = std::fs::read_to_string(test_dir.join("comp.testgroup.iter.md")).unwrap();
     assert!(tg.contains("\"result\":\"failed\"") && tg.contains("\"counts\":\"0/1\""), "{}", tg);
     assert!(test_dir.join("runs").read_dir().unwrap().next().is_some(), "run log must exist");
 
@@ -1224,41 +1241,48 @@ fn stop_in_progress_item_lands_in_todo_with_git_undo_point() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The Test-Loop gate end to end (test_loop_flag.md): `iter testloop --omit`
-/// parks a container (flag lands in the marker file; the sweep skips and says
-/// so), `--include` on a child re-enters it, and the blocked contract refuses
-/// with exit 2 — the agent-facing guard proving it can fail.
+/// The teststate gate end to end (structureV2, was test_loop): `iter teststate
+/// --omit` parks a context (flag lands in the node file; the sweep skips and
+/// says so), `--include` on a linked child re-enters it, and the block
+/// contract refuses with exit 2 — the agent-facing guard proving it can fail.
+/// Also proves the V1 `testloop` alias still answers.
 #[test]
-fn testloop_cli_flags_sweep_and_blocked_refusal() {
-    let (root, _stub) = setup_project("testloop", 3, 200);
-    let write_marker = |rel: &str, name: &str, level: &str, extra: &str| {
+fn teststate_cli_flags_sweep_and_blocked_refusal() {
+    let (root, _stub) = setup_project("teststate", 3, 200);
+    let write_node = |rel: &str, name: &str, level: &str, extra: &str, codenodes: &str| {
         let dir = root.join(rel);
         std::fs::create_dir_all(dir.join("test")).unwrap();
         std::fs::write(
-            dir.join(format!("{}.marker.iter.md", name)),
-            format!("---\nname: \"{}\"\nlevel: {}\ntestgroup: test/testgroup.iter.md\ntest_dir: test\n{}---\nbody\n", name, level, extra),
+            dir.join(format!("{}.code.iter.md", name)),
+            format!(
+                "---\nname: \"{}\"\nlevel: {}\ndescription: d\n{}children:\n{}  testgroups: [\"{{thisfiledir}}/test/*.testgroup.iter.md\"]\n---\nbody\n",
+                name, level, extra, codenodes
+            ),
         )
         .unwrap();
         std::fs::write(
-            dir.join("test/testgroup.iter.md"),
+            dir.join(format!("test/{}.testgroup.iter.md", name)),
             "# tests\n```iterapp:testgroups\n{\"label\":\"G-".to_string() + name + "\",\"desc\":\"d\",\"auto_fix\":false,\"testlist\":[]}\n```\n",
         )
         .unwrap();
     };
-    write_marker("ctr", "ctr", "container", "");
-    write_marker("ctr/api", "api", "component", "");
-    write_marker("vend", "vend", "container", "test_loop: blocked\n");
+    write_node("ctr", "ctr", "context", "", "  codenodes: [\"{thisfiledir}/api/*.code.iter.md\"]\n");
+    write_node("ctr/api", "api", "component", "", "");
+    write_node("vend", "vend", "context", "teststate: block\n", "");
 
     let run = |args: &[&str]| {
-        let mut a = vec!["testloop", "--project", root.to_str().unwrap()];
+        let mut a = vec!["teststate", "--project", root.to_str().unwrap()];
         a.extend_from_slice(args);
         Command::new(BIN).args(&a).output().unwrap()
     };
 
-    // Omit the container: the flag lands in the marker file.
-    let out = run(&["--omit", "ctr"]);
+    // Omit the context: the flag lands in the node file (V1 alias exercised).
+    let out = Command::new(BIN)
+        .args(["testloop", "--project", root.to_str().unwrap(), "--omit", "ctr"])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(std::fs::read_to_string(root.join("ctr/ctr.marker.iter.md")).unwrap().contains("test_loop: omit"));
+    assert!(std::fs::read_to_string(root.join("ctr/ctr.code.iter.md")).unwrap().contains("teststate: omit"));
 
     // The sweep skips the omitted subtree and reports it — no silent holes.
     let sweep = Command::new(BIN)
@@ -1267,7 +1291,7 @@ fn testloop_cli_flags_sweep_and_blocked_refusal() {
         .output()
         .unwrap();
     let sweep_out = String::from_utf8_lossy(&sweep.stdout);
-    assert!(sweep_out.contains("3 omitted by test_loop flag"), "ctr + api (carry-down) + vend: {}", sweep_out);
+    assert!(sweep_out.contains("3 omitted by teststate flag"), "ctr + api (carry-down) + vend: {}", sweep_out);
 
     // Include the child: re-entered under the still-omitted parent.
     let out = run(&["--include", "api"]);
@@ -1276,11 +1300,11 @@ fn testloop_cli_flags_sweep_and_blocked_refusal() {
     let text = String::from_utf8_lossy(&list.stdout).into_owned();
     assert!(text.contains("included") && text.contains("OMITTED"), "{}", text);
 
-    // Blocked contract: include refuses (exit 2), the flag survives.
+    // Block contract: include refuses (exit 2), the flag survives.
     let out = run(&["--include", "vend"]);
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("blocked"));
-    assert!(std::fs::read_to_string(root.join("vend/vend.marker.iter.md")).unwrap().contains("test_loop: blocked"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("block"));
+    assert!(std::fs::read_to_string(root.join("vend/vend.code.iter.md")).unwrap().contains("teststate: block"));
     let _ = std::fs::remove_dir_all(&root);
 }
 

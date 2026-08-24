@@ -1,7 +1,12 @@
 ---
-name: "Sample Ledger"
-level: project
-description: "A tiny personal money log: record what came in and what went out, then ask what it adds up to."
+projectname: "Sample Ledger"
+projectdescription: "A tiny personal money log: record what came in and what went out, then ask what it adds up to."
+globalscandirs: ["{topdir}/"]
+globalinterfacedir: "{topdir}/interfaces/"
+globalusecasedir: "{topdir}/usecases/"
+globalcontextfiles: ["{topdir}/reqs/bizreq.iter.md", "{topdir}/reqs/techreq.iter.md"]
+children:
+  codenodes: ["{topdir}/ledger/ledger.code.iter.md"]
 ---
 
 # Long Description

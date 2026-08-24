@@ -243,3 +243,14 @@ Two separate tracks:
 Migration is a **one-time throwaway** — pdy-dev is the only real project on iter, so don't overthink it. No standalone binary needed; performing the migration directly (Claude-driven, with deterministic scripting where easy) is fine. The data must end up safe and representative of its meaning in V2; the tooling doesn't survive.
 
 Migration's primary job is re-establishing links: V1's directory-implied parent/child relationships must become explicit `children` entries. Approach: write deterministic links (obvious 1:1 mappings) directly, queue the fuzzier link decisions as workitems for Ingest agents, then double-check everything. Also rewrites: `marker.iter.md` → `code.iter.md` filenames, filename dot-rule compliance, `test_loop` → `teststate` (`blocked` → `block`), `projects.json`/split-config → `.iter/config.iter.json` + `main.iter.md`.
+
+# Implementation status (2026-08-23)
+
+BUILT. Highlights and the handful of decisions made during the build:
+- Engine: `placeholders.rs` (lazy `{key}` resolver, cartesian lists, rglob with the bare-nodetype variant — `*.testgroup.iter.md` also matches a prefix-less `testgroup.iter.md`), `project.rs` (the two head files), `markers.rs` rewritten as the DAG ingest (explicit-links-only, cycle-edge demotion, Orphanage, effective teststate shipped with every node), `migrate.rs` (`iter migratev2`, throwaway).
+- Root attachment: `context` nodes auto-attach to the head unless another node's `codenodes` references them; main.iter.md may carry its own `children.codenodes` — that is the "containers/components moved up to root" mechanism. A context stranded by a demoted cycle edge re-attaches at root (only the bad EDGE is dropped).
+- A DECLARED glob matching nothing is "no tests yet", never a coverage gap; only explicit non-glob entries that match nothing raise authoring items. Use-cases/interfaces: default glob matching nothing = coverage gap (tests are the point); `testgroups: []` declared empty = deliberate opt-out (replaces `testgroup: none`).
+- Workitems: `codepath` → `codepaths` (option A; legacy scalar still reads, all paths locked, `$ITER_CODEPATHS` exported).
+- New CLI: `iter resolve` (placeholder oracle), `iter orphans [--ensure-todo]` (the daily "Orphanage Review" schedule seeds on `iter start`), `iter teststate` (V1 alias `testloop` kept), `iter migratev2`.
+- Webapp: Orphanage section with quick-link, Settings rewritten around the two head files, use-case editor speaks codenodes, Running Servers list retained. Playwright e2e suite in `e2e/` (`npm test`; needs `cargo build` first).
+- sampleV1/ was migrated in place by `iter migratev2` (its V1 form lives in git history); sampleV2/ is the near-empty greenfield scaffold.

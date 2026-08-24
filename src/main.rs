@@ -6,6 +6,9 @@ mod limits;
 mod locks;
 mod logging;
 mod markers;
+mod migrate;
+mod placeholders;
+mod project;
 mod registry;
 mod runner;
 mod runtests;
@@ -171,45 +174,83 @@ enum Command {
         #[arg(long)]
         reason: String,
     },
-    /// Dump the scanned C4 marker tree as JSON — the same scan the webapp, the
-    /// test sweep, and validate share (scan_roots + marker_glob, ~ expanded).
-    /// The deterministic way for agents to traverse the hierarchy: each node
-    /// carries name, level, dir, declared testgroup/test_dir/bizreq/techreq,
-    /// and uses/provides.
+    /// Dump the scanned structureV2 DAG as JSON — the same scan the webapp,
+    /// the test sweep, and validate share (globalscandirs + iterglob). The
+    /// deterministic way for agents to traverse the structure: nodes carry
+    /// name, level, key, parents, codedirs, resolved children links, and the
+    /// Orphanage rides along.
     Markers {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
-    /// Deterministically edit a use-case file's ordered `participants:` list —
-    /// the engine-owned write path for usecase↔C4 links. Use-case files are
+    /// Resolve a `{placeholder}` pattern against the project (and optionally a
+    /// node, for the file-relative keys). Prints one resolved value per line —
+    /// the engine holds the structure, so agents ask it instead of guessing.
+    Resolve {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Resolve file-relative keys ({thisfiledir}, …) against this node
+        /// (key, name, or declaring-file path suffix)
+        #[arg(long)]
+        node: Option<String>,
+        /// The pattern to resolve, e.g. "{topdir}/some/file.md"
+        pattern: String,
+        /// Also glob the resolved pattern and print matching files
+        #[arg(long)]
+        files: bool,
+    },
+    /// The Orphanage: list every file matching the naming rules that is NOT
+    /// linked into the DAG. --ensure-todo opens ONE TODO work item recommending
+    /// homes (skipped while a previous orphanage TODO is still open) — the
+    /// daily scheduled workitem calls this.
+    Orphans {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Create the orphanage-review TODO work item (deduped)
+        #[arg(long)]
+        ensure_todo: bool,
+    },
+    /// One-time V1 → V2 structure migration (structureV2.md): renames marker →
+    /// code files (dot rule), rewrites frontmatter (children links, teststate,
+    /// level project → main.iter.md), and builds the two head files from
+    /// projects.json. Throwaway — prints every change it makes.
+    Migratev2 {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Report what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Deterministically edit a use-case file's `children.codenodes` links —
+    /// the engine-owned write path for usecase↔code links. Use-case files are
     /// GLOBAL objects, so this works from any agent regardless of lock scope
-    /// (record-level edit, like the testwriter's marker-key registration).
+    /// (record-level edit).
     Usecase {
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        /// The *usecase.iter.md file to edit
+        /// The *.usecase.iter.md file to edit
         #[arg(long)]
         file: PathBuf,
-        /// Participant entry "<step> <object-ref>" (e.g. "2 core/intake") to add;
-        /// an existing entry with the same object-ref is replaced (repeatable)
+        /// A code node link to add: a *.code.iter.md path or pattern (repeatable)
         #[arg(long)]
         add: Vec<String>,
-        /// Object-ref (or full entry) to remove (repeatable)
+        /// A link (exact entry) to remove (repeatable)
         #[arg(long)]
         remove: Vec<String>,
-        /// Print the resulting participants, one per line
+        /// Print the resulting codenodes, one per line
         #[arg(long)]
         list: bool,
     },
-    /// Test-Loop gate editor: park C4 objects / use cases / interfaces out of
-    /// the test sweep (`test_loop:` frontmatter flag) or bring them back —
-    /// the engine-owned write path, usable from any agent regardless of lock
+    /// teststate gate editor: park nodes / use cases / interfaces out of the
+    /// test sweep (`teststate:` frontmatter flag) or bring them back — the
+    /// engine-owned write path, usable from any agent regardless of lock
     /// scope. Omitting a node carries down its whole subtree; `--include` on a
     /// descendant re-enters it (nearest flag wins). `--block` is the hard park
     /// (outside/vendor setup missing): `--include`/`--omit`/`--clear` REFUSE
-    /// to touch a blocked flag (exit 2) — only a human editing the marker
-    /// file lifts it.
-    Testloop {
+    /// to touch a blocked flag (exit 2) — only a human editing the node file
+    /// lifts it. (`testloop` is the V1 alias.)
+    #[command(alias = "testloop")]
+    Teststate {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// Park this object out of the sweep (repeatable). Ref = node key,
@@ -308,8 +349,11 @@ fn main() {
         Command::Reject { project, reason } => cmd_reject(project, reason),
         Command::Usecase { project, file, add, remove, list } => cmd_usecase(project, file, add, remove, list),
         Command::Markers { project } => cmd_markers(project),
-        Command::Testloop { project, omit, include, block, clear, list } => {
-            cmd_testloop(project, omit, include, block, clear, list)
+        Command::Resolve { project, node, pattern, files } => cmd_resolve(project, node, pattern, files),
+        Command::Orphans { project, ensure_todo } => cmd_orphans(project, ensure_todo),
+        Command::Migratev2 { project, dry_run } => migrate::run(&project, dry_run),
+        Command::Teststate { project, omit, include, block, clear, list } => {
+            cmd_teststate(project, omit, include, block, clear, list)
         }
         Command::InvertPriorities { project } => cmd_invert_priorities(project),
         Command::Stubdesc { project } => cmd_stubdesc(project),
@@ -331,13 +375,13 @@ fn boot(project: &Path) -> bool {
             return false;
         }
     }
-    let cfg = config::load(project);
-    // The global requirement stubs heal at their CONFIGURED paths (settings
-    // global_bizreq_path/global_techreq_path), so this runs after config loads.
-    match template::ensure_global_reqs(project, &cfg) {
-        Ok(0) | Err(_) => {} // creation failure is not fatal — the engine runs without stubs
-        Ok(n) => println!("created {} global requirement stub(s)", n),
+    // The two structureV2 head files heal next: .iter/config.iter.json and a
+    // stub main.iter.md at the configured mainfile path.
+    match project::ensure_head_files(project) {
+        Ok(0) | Err(_) => {} // creation failure is not fatal
+        Ok(n) => println!("created {} project head file(s) (config.iter.json / main.iter.md)", n),
     }
+    let cfg = config::load(project);
     let log_file = if cfg.globalsettings.log_default_path.is_empty() {
         None
     } else {
@@ -347,6 +391,44 @@ fn boot(project: &Path) -> bool {
     };
     logging::init(&cfg.globalsettings.log_level, log_file, cfg.globalsettings.log_max_size_mb);
     true
+}
+
+/// Seed the DAILY Orphanage-review schedule once (structureV2): a scheduled
+/// shell workitem running `iter orphans --ensure-todo` — the recommendation
+/// TODO it opens is itself deduped, so the schedule can fire every day
+/// harmlessly. Flag-filed so deleting the schedule is a real delete.
+fn seed_orphan_schedule(project: &Path, cfg: &config::Config) {
+    let flag = config::engine_dir(project).join("orphan_schedule_seeded");
+    if flag.exists() {
+        return;
+    }
+    let mut item = WorkItem {
+        workid: uuid::Uuid::new_v4().to_string(),
+        title: "Orphanage Review".into(),
+        item_type: "plan".into(),
+        state: workitems::STATE_SCHEDULED.into(),
+        source: "user".into(),
+        priority: 8,
+        codepath: ".".into(),
+        codepath_ignore: vec!["**".into()], // run-only: locks nothing
+        exec: workitems::EXEC_SHELL.into(),
+        mainwork: "\"$ITER_BIN\" orphans --project \"$ITER_PROJECT\" --ensure-todo".into(),
+        sched: workitems::Sched { kind: "daily".into(), at: "06:00".into(), ..Default::default() },
+        ..Default::default()
+    };
+    item.times.added = workitems::now_iso();
+    let queue = Queue::new(project, cfg);
+    let seeded = queue.with_lock(|items| {
+        if items.iter().any(|i| i.state == workitems::STATE_SCHEDULED && i.title == "Orphanage Review") {
+            return false;
+        }
+        items.push(item.clone());
+        true
+    });
+    if let Ok(true) = seeded {
+        println!("seeded the daily \"Orphanage Review\" scheduled workitem (edit or pause it in the webapp)");
+    }
+    let _ = std::fs::write(&flag, workitems::now_iso());
 }
 
 fn cmd_run(project: PathBuf, once: bool, until_idle: bool) -> i32 {
@@ -366,6 +448,9 @@ fn cmd_start(project: PathBuf, port: Option<u16>) -> i32 {
     if !boot(&project) {
         return 1;
     }
+    // The daily Orphanage-review schedule seeds on the SERVER path only — a
+    // bare `iter run --until-idle` (tests, one-shot ticks) must still drain.
+    seed_orphan_schedule(&project, &config::load(&project));
     let project = match project.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -835,13 +920,10 @@ fn cmd_runtests(project: PathBuf, group: String, test: Option<String>, broken: b
     }
 }
 
-/// Same scan the webapp's Projects view uses (projects.json scan_roots +
-/// marker_glob), then stub the missing Long Description sections.
+/// Same scan the webapp's Projects view uses, then stub the missing Long
+/// Description sections.
 fn cmd_stubdesc(project: PathBuf) -> i32 {
-    let settings = server::project_settings(&project);
-    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md").to_string();
-    let roots = server::scan_roots(&project);
-    let scan = markers::scan(&project, &roots, &glob);
+    let (_p, scan) = markers::scan_project(&project);
     let stubbed = markers::stub_long_descriptions(&scan);
     println!(
         "{} node marker(s) scanned; {} stubbed with \"# Long Description / TBD\"",
@@ -953,16 +1035,15 @@ fn cmd_reject(project: PathBuf, reason: String) -> i32 {
     }
 }
 
-/// Record-level `participants:` editor for use-case files. Reads the existing
-/// entries through the same frontmatter parser the scan uses, applies removes
-/// then adds (an add replaces an entry with the same object-ref), sorts by the
-/// leading step number, and rewrites only the participants block — the rest of
-/// the frontmatter and the narrative body pass through verbatim.
+/// Record-level `children.codenodes` editor for use-case files (structureV2:
+/// codenodes replaced the V1 participants list). Applies removes then adds
+/// (deduped) and rewrites only the codenodes sub-key — the rest of the
+/// frontmatter and the narrative body pass through verbatim.
 fn cmd_usecase(project: PathBuf, file: PathBuf, add: Vec<String>, remove: Vec<String>, list: bool) -> i32 {
     let path = if file.is_absolute() { file } else { project.join(file) };
     let filename = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     if markers::role_of(&filename) != Some(markers::Role::Usecase) {
-        eprintln!("error: {} is not a *usecase.iter.md file (the filename declares the role)", path.display());
+        eprintln!("error: {} is not a *.usecase.iter.md file (the filename declares the nodetype)", path.display());
         return 2;
     }
     let content = match std::fs::read_to_string(&path) {
@@ -972,71 +1053,32 @@ fn cmd_usecase(project: PathBuf, file: PathBuf, add: Vec<String>, remove: Vec<St
             return 2;
         }
     };
-    let (_, mut participants, _) = markers::frontmatter(&content);
-    // The object-ref is everything after the leading step token.
-    let ref_part = |s: &str| s.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-    let step_of = |s: &str| s.split_whitespace().next().and_then(|t| t.parse::<f64>().ok()).unwrap_or(f64::MAX);
+    let front = markers::parse_front(&content);
+    let mut codenodes = front.child("codenodes").unwrap_or_default();
     for r in &remove {
         let r = r.trim();
-        participants.retain(|p| p != r && ref_part(p) != r);
+        codenodes.retain(|p| p != r);
     }
     for a in &add {
         let a = a.trim();
-        if a.is_empty() {
-            continue;
+        if !a.is_empty() && !codenodes.iter().any(|p| p == a) {
+            codenodes.push(a.to_string());
         }
-        let new_ref = ref_part(a);
-        if !new_ref.is_empty() {
-            if let Some(existing) = participants.iter_mut().find(|p| ref_part(p) == new_ref) {
-                *existing = a.to_string();
-                continue;
-            }
-        }
-        participants.push(a.to_string());
     }
-    participants.sort_by(|x, y| step_of(x).partial_cmp(&step_of(y)).unwrap_or(std::cmp::Ordering::Equal));
-
     if !add.is_empty() || !remove.is_empty() {
-        // Rewrite: keep every frontmatter line except the old participants block,
-        // append the new block just before the closing fence.
-        let trimmed = content.trim_start();
-        let Some(rest) = trimmed.strip_prefix("---") else {
-            eprintln!("error: {} has no frontmatter fence", path.display());
-            return 2;
-        };
-        let Some(end) = rest.find("\n---") else {
-            eprintln!("error: {} has no closing frontmatter fence", path.display());
-            return 2;
-        };
-        let mut kept: Vec<String> = Vec::new();
-        let mut in_part = false;
-        for line in rest[..end].lines() {
-            let t = line.trim();
-            if in_part && t.starts_with("- ") {
-                continue;
-            }
-            in_part = false;
-            if t == "participants:" {
-                in_part = true;
-                continue;
-            }
-            kept.push(line.to_string());
-        }
-        if !participants.is_empty() {
-            kept.push("participants:".to_string());
-            for p in &participants {
-                kept.push(format!("  - {}", p));
-            }
-        }
-        let new_content = format!("---{}\n---{}", kept.join("\n"), &rest[end + 4..]);
-        if let Err(e) = std::fs::write(&path, new_content) {
-            eprintln!("error: cannot write {}: {}", path.display(), e);
+        if let Err(e) = markers::set_children_key(&path, "codenodes", &codenodes) {
+            eprintln!("error: {}", e);
             return 1;
         }
-        println!("{}: participants updated ({} entr{})", path.display(), participants.len(), if participants.len() == 1 { "y" } else { "ies" });
+        println!(
+            "{}: codenodes updated ({} entr{})",
+            path.display(),
+            codenodes.len(),
+            if codenodes.len() == 1 { "y" } else { "ies" }
+        );
     }
     if list {
-        for p in &participants {
+        for p in &codenodes {
             println!("{}", p);
         }
     }
@@ -1051,7 +1093,7 @@ fn cmd_usecase(project: PathBuf, file: PathBuf, add: Vec<String>, remove: Vec<St
 /// later refs in the same invocation see earlier edits; any refusal (unknown/
 /// ambiguous ref, or touching a blocked flag) aborts with exit 2 — partial
 /// application is reported, never silent.
-fn cmd_testloop(
+fn cmd_teststate(
     project: PathBuf,
     omit: Vec<String>,
     include: Vec<String>,
@@ -1059,21 +1101,18 @@ fn cmd_testloop(
     clear: Vec<String>,
     list: bool,
 ) -> i32 {
-    let settings = server::project_settings(&project);
-    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md").to_string();
-    let roots = server::scan_roots(&project);
-    let scan_now = || markers::scan(&project, &roots, &glob);
+    let scan_now = || markers::scan_project(&project).1;
 
-    let edits: Vec<(markers::TestLoopAction, &Vec<String>)> = vec![
-        (markers::TestLoopAction::Omit, &omit),
-        (markers::TestLoopAction::Include, &include),
-        (markers::TestLoopAction::Block, &block),
-        (markers::TestLoopAction::Clear, &clear),
+    let edits: Vec<(markers::TestStateAction, &Vec<String>)> = vec![
+        (markers::TestStateAction::Omit, &omit),
+        (markers::TestStateAction::Include, &include),
+        (markers::TestStateAction::Block, &block),
+        (markers::TestStateAction::Clear, &clear),
     ];
     let mut edited = 0usize;
     for (action, refs) in edits {
         for target in refs {
-            match markers::testloop_apply(&scan_now(), target, action) {
+            match markers::teststate_apply(&scan_now(), target, action) {
                 Ok(summary) => {
                     println!("{}", summary);
                     edited += 1;
@@ -1091,29 +1130,28 @@ fn cmd_testloop(
 
     if list || edited == 0 {
         let scan = scan_now();
-        println!("test loop state (flag → effective):");
+        println!("teststate (flag → effective):");
         for n in &scan.nodes {
-            let flag = if n.test_loop.trim().is_empty() { "-".to_string() } else { n.test_loop.trim().to_string() };
-            let eff = match markers::effective_test_loop(n, &scan.nodes) {
-                markers::TestLoopState::Included => "included".to_string(),
-                markers::TestLoopState::Omitted { value, by } => format!("OMITTED ({} via {})", value, by),
+            let flag = if n.teststate.trim().is_empty() { "-".to_string() } else { n.teststate.trim().to_string() };
+            let eff = match markers::effective_teststate(n, &scan.nodes) {
+                markers::TestState::Included => "included".to_string(),
+                markers::TestState::Omitted { value, by } => format!("OMITTED ({} via {})", value, by),
             };
-            let key = if n.key.is_empty() { ".".to_string() } else { n.key.clone() };
-            println!("  object    {:40} {:10} {:8} → {}", key, n.name, flag, eff);
+            println!("  object    {:40} {:10} {:8} → {}", n.key, n.name, flag, eff);
         }
         for u in &scan.usecases {
-            let flag = if u.test_loop.trim().is_empty() { "-".to_string() } else { u.test_loop.trim().to_string() };
-            let eff = match markers::own_test_loop(&u.test_loop, &u.file) {
-                markers::TestLoopState::Included => "included".to_string(),
-                markers::TestLoopState::Omitted { value, .. } => format!("OMITTED ({})", value),
+            let flag = if u.teststate.trim().is_empty() { "-".to_string() } else { u.teststate.trim().to_string() };
+            let eff = match markers::own_teststate(&u.teststate, &u.file) {
+                markers::TestState::Included => "included".to_string(),
+                markers::TestState::Omitted { value, .. } => format!("OMITTED ({})", value),
             };
             println!("  usecase   {:51} {:8} → {}", u.name, flag, eff);
         }
         for i in &scan.interfaces {
-            let flag = if i.test_loop.trim().is_empty() { "-".to_string() } else { i.test_loop.trim().to_string() };
-            let eff = match markers::own_test_loop(&i.test_loop, &i.file) {
-                markers::TestLoopState::Included => "included".to_string(),
-                markers::TestLoopState::Omitted { value, .. } => format!("OMITTED ({})", value),
+            let flag = if i.teststate.trim().is_empty() { "-".to_string() } else { i.teststate.trim().to_string() };
+            let eff = match markers::own_teststate(&i.teststate, &i.file) {
+                markers::TestState::Included => "included".to_string(),
+                markers::TestState::Omitted { value, .. } => format!("OMITTED ({})", value),
             };
             println!("  interface {:51} {:8} → {}", i.id, flag, eff);
         }
@@ -1121,20 +1159,131 @@ fn cmd_testloop(
     0
 }
 
-/// The C4 tree as JSON, for agents: the same scan (roots + glob + frontmatter)
-/// the webapp/sweep/validate share, printed instead of served.
+/// The structureV2 DAG as JSON, for agents: the same scan the
+/// webapp/sweep/validate share, printed instead of served.
 fn cmd_markers(project: PathBuf) -> i32 {
-    let settings = server::project_settings(&project);
-    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md").to_string();
-    let roots = server::scan_roots(&project);
-    let scan = markers::scan(&project, &roots, &glob);
+    let (_p, scan) = markers::scan_project(&project);
     match serde_json::to_string_pretty(&scan) {
         Ok(json) => {
             println!("{}", json);
             0
         }
         Err(e) => {
-            eprintln!("error: cannot serialize marker scan: {}", e);
+            eprintln!("error: cannot serialize scan: {}", e);
+            1
+        }
+    }
+}
+
+/// `iter resolve` — the engine-side placeholder oracle: expand a `{key}`
+/// pattern with the project vars (plus a node's file-relative keys when
+/// --node names one). Prints one value per line; --files globs them.
+fn cmd_resolve(project: PathBuf, node: Option<String>, pattern: String, files: bool) -> i32 {
+    let (proj, scan) = markers::scan_project(&project);
+    let mut vars = proj.vars();
+    if let Some(target) = node {
+        let t = target.trim();
+        let matches: Vec<&markers::Node> = scan
+            .nodes
+            .iter()
+            .filter(|n| n.key == t || n.name == t || n.path.ends_with(t))
+            .collect();
+        match matches.len() {
+            0 => {
+                eprintln!("error: \"{}\" matches no node (key, name, or file path suffix)", t);
+                return 2;
+            }
+            1 => {
+                let n = matches[0];
+                vars = vars.with_file(Path::new(&n.path));
+                vars.set_list(
+                    "codedirs",
+                    &n.codedirs.iter().map(|d| format!("{}/", d)).collect::<Vec<_>>(),
+                );
+            }
+            n => {
+                eprintln!("error: \"{}\" is ambiguous ({} nodes match) — use the node key or file path", t, n);
+                return 2;
+            }
+        }
+    }
+    if files {
+        for f in vars.expand_files(&pattern, &proj.topdir) {
+            println!("{}", f.display());
+        }
+    } else {
+        for v in vars.expand(&pattern) {
+            println!("{}", v);
+        }
+    }
+    0
+}
+
+/// The Orphanage CLI. `--ensure-todo` opens ONE recommendation work item and
+/// dedups against any still-open orphanage item, so the daily schedule never
+/// stacks duplicates (and creates nothing when the orphanage is empty).
+fn cmd_orphans(project: PathBuf, ensure_todo: bool) -> i32 {
+    let (_p, scan) = markers::scan_project(&project);
+    if scan.orphans.is_empty() {
+        println!("orphanage: empty — every discovered node file is linked into the DAG");
+    } else {
+        println!("orphanage: {} file(s) not linked into the DAG", scan.orphans.len());
+        for o in &scan.orphans {
+            println!("  [{}] {} — {}", o.role, o.path, o.reason);
+        }
+    }
+    if !ensure_todo || scan.orphans.is_empty() {
+        return 0;
+    }
+    let cfg = config::load(&project);
+    let queue = Queue::new(&project, &cfg);
+    let mut listing = String::new();
+    for o in &scan.orphans {
+        listing.push_str(&format!("- [{}] {} — {}\n", o.role, o.path, o.reason));
+    }
+    let mut item = WorkItem {
+        workid: uuid::Uuid::new_v4().to_string(),
+        item_type: "plan".into(),
+        state: workitems::STATE_TODO.into(),
+        title: format!("orphanage review: {} unlinked iter file(s)", scan.orphans.len()),
+        source: "orphanage".into(),
+        source_testgroup: "orphanage-review".into(),
+        priority: 8,
+        codepath: ".".into(),
+        mainwork: format!(
+            "The Orphanage holds {} file(s) matching the iter naming rules that are NOT linked into the \
+             project DAG (structureV2: explicit `children` links are the only joining mechanism):\n\n{}\n\
+             For each orphan, recommend ONE of:\n\
+             1. Link it — add it to the right parent's children (a code node's `codenodes`, or make a \
+             bizreq/techreq/testgroup match a parent's patterns). Use `iter markers` to see the DAG and \
+             `iter usecase --add` for use-case links.\n\
+             2. Leave it — staying in the orphanage is a valid choice; say why.\n\
+             3. Retire it — if it is dead, recommend deletion (do NOT delete yourself).\n\
+             Write the recommendations into this item's output for human review.",
+            scan.orphans.len(),
+            listing
+        ),
+        ..Default::default()
+    };
+    item.times.added = workitems::now_iso();
+    let created = queue.with_lock(|items| {
+        if items.iter().any(|i| i.source_testgroup == "orphanage-review") {
+            return false;
+        }
+        items.push(item.clone());
+        true
+    });
+    match created {
+        Ok(true) => {
+            println!("orphanage-review work item {} created (todo)", item.workid);
+            0
+        }
+        Ok(false) => {
+            println!("an orphanage-review item is already open — no duplicate created");
+            0
+        }
+        Err(e) => {
+            eprintln!("error: cannot create orphanage item: {}", e);
             1
         }
     }
@@ -1312,11 +1461,11 @@ fn cmd_init(dest: PathBuf, from: Option<PathBuf>) -> i32 {
     };
     match result {
         Ok(n) => {
-            let reqs_added = template::ensure_global_reqs(&dest, &config::load(&dest)).unwrap_or(0);
+            let head_added = project::ensure_head_files(&dest).unwrap_or(0);
             println!(
                 "initialized {} — {} file(s) added{} (existing files untouched)",
                 dest.join(".iter").display(),
-                n + reqs_added,
+                n + head_added,
                 external.as_ref().map(|d| format!(" from {}", d.display())).unwrap_or_default()
             );
             0

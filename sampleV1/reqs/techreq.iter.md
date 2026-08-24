@@ -1,3 +1,10 @@
+---
+name: "reqs techreq"
+description: "techreq for reqs"
+children:
+  reqpaths: []
+---
+
 # Technical requirements — project-wide
 
 Global technical requirements and constraints for **Sample Ledger**: stack

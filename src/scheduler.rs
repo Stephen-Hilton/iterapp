@@ -50,10 +50,11 @@ struct Shared {
     /// in-memory noise suppression; a restart just retries sooner.
     deferred: Mutex<HashMap<String, Instant>>,
     /// Resolved lock scopes of items currently running in THIS engine
-    /// (workid → (path, codepath_ignore)). pick_next skips candidates that overlap
-    /// one, so an occupied lock scope never costs a pick; entries are removed when
-    /// the worker thread finishes.
-    running_paths: Mutex<HashMap<String, (PathBuf, Vec<String>)>>,
+    /// (workid → [(path, codepath_ignore)] — structureV2: an item may carry
+    /// several codepaths and ALL are claimed). pick_next skips candidates that
+    /// overlap one, so an occupied lock scope never costs a pick; entries are
+    /// removed when the worker thread finishes.
+    running_paths: Mutex<HashMap<String, Vec<(PathBuf, Vec<String>)>>>,
     /// Usage-limit hold: pick nothing until this instant (set by a worker that hit a
     /// window limit; lifted early when a fresh snapshot shows utilization back
     /// under 95%). Unlike the stop signal, the engine stays alive and auto-resumes.
@@ -357,14 +358,15 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
                     ),
                 );
                 let shared2 = Arc::clone(&shared);
-                // Claim the resolved codepath before spawning, so a second pick in
-                // this same tick already sees it as occupied.
-                let resolved = resolve_codepath(&config::code_root(&shared.project_root, &cfg), &item.codepath);
-                shared
-                    .running_paths
-                    .lock()
-                    .unwrap()
-                    .insert(item.workid.clone(), (resolved, item.codepath_ignore.clone()));
+                // Claim every resolved codepath before spawning, so a second
+                // pick in this same tick already sees them as occupied.
+                let base = config::code_root(&shared.project_root, &cfg);
+                let resolved: Vec<(PathBuf, Vec<String>)> = item
+                    .all_codepaths()
+                    .iter()
+                    .map(|p| (resolve_codepath(&base, p), item.codepath_ignore.clone()))
+                    .collect();
+                shared.running_paths.lock().unwrap().insert(item.workid.clone(), resolved);
                 let claim = PathClaim { shared: Arc::clone(&shared), workid: item.workid.clone() };
                 let handle = if is_shell {
                     std::thread::spawn(move || {
@@ -536,7 +538,8 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
     let items = queue.load();
     let now = chrono::Utc::now();
     let code_root = config::code_root(&shared.project_root, &cfg);
-    let occupied: Vec<(PathBuf, Vec<String>)> = shared.running_paths.lock().unwrap().values().cloned().collect();
+    let occupied: Vec<(PathBuf, Vec<String>)> =
+        shared.running_paths.lock().unwrap().values().flatten().cloned().collect();
     // Closed archive, loaded once per pick and only if a candidate has deps.
     let mut closed_cache: Option<Vec<WorkItem>> = None;
     let mut best: Option<usize> = None;
@@ -574,10 +577,13 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
         let repairs = disjointness_repairs(item, &cand_path, &items, &code_root, &cfg.globalsettings.test_dir);
         let effective_ignore: Vec<String> =
             item.codepath_ignore.iter().cloned().chain(repairs.iter().cloned()).collect();
-        if occupied.iter().any(|(r, r_ign)| scopes_overlap(r, r_ign, &cand_path, &effective_ignore)) {
-            continue;
-        }
-        if locks::find_ancestor_lock(&cand_path, now).is_some() {
+        // structureV2: EVERY codepath the item carries must be free.
+        let cand_paths: Vec<PathBuf> =
+            item.all_codepaths().iter().map(|p| resolve_codepath(&code_root, p)).collect();
+        if cand_paths.iter().any(|cp| {
+            occupied.iter().any(|(r, r_ign)| scopes_overlap(r, r_ign, cp, &effective_ignore))
+                || locks::find_ancestor_lock(cp, now).is_some()
+        }) {
             continue;
         }
         let better = match best {
@@ -629,6 +635,27 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
             None
         }
     }
+}
+
+/// Acquire the codepath lock on EVERY path an item carries (structureV2: a
+/// node's codedirs may put its code in several places, so a fix item locks
+/// them all). All-or-nothing: a conflict drops the already-acquired locks
+/// (RAII) and returns the conflicting path.
+fn acquire_all_codepath_locks(
+    code_root: &Path,
+    item: &WorkItem,
+    agent_type: &str,
+    lock_timeout: u64,
+) -> Result<Vec<locks::CodepathLock>, PathBuf> {
+    let mut acquired = Vec::new();
+    for p in item.all_codepaths() {
+        let path = resolve_codepath(code_root, &p);
+        match locks::acquire_codepath_lock(&path, &item.workid, agent_type, lock_timeout, &item.codepath_ignore) {
+            Ok(l) => acquired.push(l),
+            Err(conflict) => return Err(conflict), // drops `acquired` → releases
+        }
+    }
+    Ok(acquired)
 }
 
 /// The ignore patterns a `code` candidate is missing: one per open testwriter item
@@ -688,8 +715,9 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
         return;
     }
 
-    // Codepath lock (see .iter/.engine/codepath_lock.md).
-    let lock = match locks::acquire_codepath_lock(&codepath, &item.workid, &agent.type_name, lock_timeout, &item.codepath_ignore) {
+    // Codepath lock (see .iter/.engine/codepath_lock.md) — structureV2: an
+    // item locks EVERY codepath it carries, all-or-nothing.
+    let lock = match acquire_all_codepath_locks(&code_root, &item, &agent.type_name, lock_timeout) {
         Ok(lock) => {
             logging::info(&tag, &format!("codepath lock acquired: {}", codepath.display()));
             lock
@@ -723,6 +751,15 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
     // The workid lets an `iter critreview` subprocess flag THIS item as failed
     // deterministically (fail-flag file) instead of trusting the agent to stop.
     session.envs.push(("ITER_WORKID".to_string(), item.workid.clone()));
+    // Every locked codepath, colon-joined (first = the working directory).
+    session.envs.push((
+        "ITER_CODEPATHS".to_string(),
+        item.all_codepaths()
+            .iter()
+            .map(|p| resolve_codepath(&code_root, p).to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":"),
+    ));
     // A user stop kills the session mid-turn (runner polls this path).
     session.stop_flag = Some(stopitem_path(&shared.project_root, &item.workid));
     // Stale flags from a killed prior attempt. (Stale STOP flags are removed
@@ -922,13 +959,7 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
         fail_item(&shared, &item, &msg, String::new(), &tag);
         return;
     }
-    let lock = match locks::acquire_codepath_lock(
-        &codepath,
-        &item.workid,
-        "shell",
-        cfg.engine.codepath_lock_timeout_sec,
-        &item.codepath_ignore,
-    ) {
+    let lock = match acquire_all_codepath_locks(&code_root, &item, "shell", cfg.engine.codepath_lock_timeout_sec) {
         Ok(lock) => lock,
         Err(conflict) => {
             let backoff = cfg.engine.codepath_conflict_backoff_sec;
@@ -953,13 +984,30 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
     let envs: Vec<(String, String)> = vec![
         ("ITER_BIN".into(), iter_bin),
         ("ITER_PROJECT".into(), shared.project_root.to_string_lossy().into_owned()),
-        ("ITER_BIZREQ".into(), config::global_bizreq(&shared.project_root, &cfg).to_string_lossy().into_owned()),
-        ("ITER_TECHREQ".into(), config::global_techreq(&shared.project_root, &cfg).to_string_lossy().into_owned()),
-        ("ITER_REQS".into(), config::reqs_dir(&shared.project_root, &cfg).to_string_lossy().into_owned()),
+        (
+            "ITER_MAINFILE".into(),
+            crate::project::Project::load(&shared.project_root).mainfile.to_string_lossy().into_owned(),
+        ),
+        (
+            "ITER_CONTEXT_FILES".into(),
+            config::global_context_files(&shared.project_root)
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(":"),
+        ),
         ("ITER_TEST_DIR".into(), cfg.globalsettings.test_dir.clone()),
         ("ITER_INTERFACE_DIR".into(), config::interface_dir(&shared.project_root, &cfg).to_string_lossy().into_owned()),
         ("ITER_USECASE_DIR".into(), config::usecase_dir(&shared.project_root, &cfg).to_string_lossy().into_owned()),
         ("ITER_WORKID".into(), item.workid.clone()),
+        (
+            "ITER_CODEPATHS".into(),
+            item.all_codepaths()
+                .iter()
+                .map(|p| resolve_codepath(&code_root, p).to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(":"),
+        ),
     ];
 
     // Undo point, mirroring the agent path (stale stop flags already died at
@@ -1331,8 +1379,7 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
     // agent/source/prepostwork definitions stay with the engine home (.iter/).
     let cfg = shared.cfg();
     let code_root = config::code_root(&shared.project_root, &cfg);
-    let reqs_dir = config::reqs_dir(&shared.project_root, &cfg);
-    let (context_files, warnings) = context::resolve(&item.context, codepath, &code_root, &reqs_dir);
+    let (context_files, warnings) = context::resolve(&item.context, codepath, &code_root);
     for w in &warnings {
         logging::warn(tag, w);
     }
@@ -1350,18 +1397,19 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
         codepath.display()
     ));
     spinup.push_str(&previous_attempt_section(item));
-    // The GLOBAL requirements are surfaced to EVERY work item — exactly the two
-    // files the settings name (global_bizreq_path / global_techreq_path), never a
-    // directory scan. Files already attached as context aren't repeated.
-    let reqs_files: Vec<_> = config::global_req_files(&shared.project_root, &cfg)
+    // The project head is surfaced to EVERY work item (structureV2): the
+    // main.iter.md project definition first, then every globalcontextfiles
+    // match — ONE spot configures all always-loaded context. Files already
+    // attached as this item's context aren't repeated.
+    let head_files: Vec<_> = config::global_context_files(&shared.project_root)
         .into_iter()
         .filter(|f| !context_files.contains(f))
         .collect();
-    if !reqs_files.is_empty() {
+    if !head_files.is_empty() {
         spinup.push_str(
-            "\n# Project-wide requirements ($ITER_BIZREQ / $ITER_TECHREQ)\nGlobal requirements for the whole project — read what applies before starting:\n",
+            "\n# Project context ($ITER_MAINFILE + globalcontextfiles)\nThe project definition and global requirements — read what applies before starting:\n",
         );
-        for f in &reqs_files {
+        for f in &head_files {
             spinup.push_str(&format!("- {}\n", f.display()));
         }
     }
@@ -1372,7 +1420,7 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
         }
     }
     if item.item_type.starts_with("test") && !item.testfiles.is_empty() {
-        let (test_files, twarn) = context::resolve(&item.testfiles, codepath, &code_root, &reqs_dir);
+        let (test_files, twarn) = context::resolve(&item.testfiles, codepath, &code_root);
         for w in &twarn {
             logging::warn(tag, w);
         }
@@ -1528,7 +1576,7 @@ mod tests {
             .running_paths
             .lock()
             .unwrap()
-            .insert("running".into(), (root.join("a").canonicalize().unwrap(), Vec::new()));
+            .insert("running".into(), vec![(root.join("a").canonicalize().unwrap(), Vec::new())]);
         let _lock = locks::acquire_codepath_lock(&root.join("b"), "other-engine", "code", 600, &[]).unwrap();
         let picked = pick_next(&shared, &["code"], false).expect("must keep moving down the queue");
         assert_eq!(picked.workid, "w-free");
@@ -1549,7 +1597,7 @@ mod tests {
             .running_paths
             .lock()
             .unwrap()
-            .insert("running-code".into(), (root.join("obj").canonicalize().unwrap(), vec!["test/".into()]));
+            .insert("running-code".into(), vec![(root.join("obj").canonicalize().unwrap(), vec!["test/".into()])]);
         // A testwriter item scoped to the carved-out subtree is runnable NOW…
         let tw = WorkItem {
             workid: "w-tw".into(),
@@ -1581,7 +1629,7 @@ mod tests {
             .running_paths
             .lock()
             .unwrap()
-            .insert("running-tw".into(), (root.join("obj/test").canonicalize().unwrap(), Vec::new()));
+            .insert("running-tw".into(), vec![(root.join("obj/test").canonicalize().unwrap(), Vec::new())]);
         let code_ign = WorkItem {
             workid: "w-code-ign".into(),
             item_type: "code".into(),
@@ -1768,21 +1816,26 @@ mod tests {
     }
 
     #[test]
-    fn code_root_setting_rebases_relative_codepaths() {
+    fn topdir_setting_rebases_relative_codepaths() {
+        // structureV2: {topdir} from .iter/config.iter.json replaced the old
+        // code_root setting — the pdy iter-in-a-subdir layout.
         let root = std::env::temp_dir().join(format!("iterloop-croot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let engine_home = root.join("devops");
         std::fs::create_dir_all(engine_home.join(".iter/.engine")).unwrap();
         std::fs::create_dir_all(root.join("core/repos/comp")).unwrap();
 
-        // Default: relative codepaths resolve against the engine home.
+        // Default: topdir = the engine home (parent of .iter/).
         let cfg = Config::default();
         let base = config::code_root(&engine_home, &cfg);
         assert_eq!(base, engine_home.canonicalize().unwrap());
 
-        // code_root ".." rebases them to the parent — iter-in-a-subdir layout.
-        let mut cfg = Config::default();
-        cfg.globalsettings.code_root = "..".into();
+        // topdir "{thisfiledir}/../../" rebases to the parent.
+        std::fs::write(
+            crate::project::config_path(&engine_home),
+            r#"{ "topdir": "{thisfiledir}/../../" }"#,
+        )
+        .unwrap();
         let base = config::code_root(&engine_home, &cfg);
         assert_eq!(base, root.canonicalize().unwrap());
         let resolved = resolve_codepath(&base, "core/repos/comp");

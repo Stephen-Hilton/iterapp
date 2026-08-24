@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::locks;
 use crate::logging;
 use crate::markers;
@@ -46,10 +46,9 @@ impl Default for SweepOptions {
     }
 }
 
-/// A missing-tests gap found during discovery: a declared testgroup file that
-/// doesn't exist, or a group with an empty testlist. Births a testwriter
-/// authoring item in `todo`; `key` is the `source_testgroup` dedup value (the
-/// group label, or the declared file path when there is no group yet).
+/// A missing-tests gap found during discovery: a declared testgroup entry that
+/// matched nothing, or a group with an empty testlist. Births a testwriter
+/// authoring item in `todo`; `key` is the `source_testgroup` dedup value.
 struct AuthoringGap {
     key: String,
     title: String,
@@ -58,11 +57,10 @@ struct AuthoringGap {
     mainwork: String,
 }
 
-/// What kind of file declared a sweepable testgroup (2026-08-17: the sweep
-/// universe grew from marker files to markers + use-cases + interfaces). The
-/// kind decides fix-item SCOPING: a C4 object's tests scope to its directory;
-/// use-case journeys and interface contracts span objects, so their red runs
-/// birth fix items scoped to the code root with diagnose-or-escalate guidance.
+/// What kind of node declared a sweepable testgroup. The kind decides fix-item
+/// SCOPING: a code node's tests scope to its codedirs; use-case journeys and
+/// interface contracts span nodes, so their red runs birth fix items scoped to
+/// the topdir with diagnose-or-escalate guidance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SweepKind {
     Object,
@@ -71,27 +69,28 @@ enum SweepKind {
 }
 
 impl SweepKind {
-    /// "marker file" / "use-case file" / "interface file" — for prompts.
     fn declaring(&self) -> &'static str {
         match self {
-            SweepKind::Object => "marker file",
+            SweepKind::Object => "code node file",
             SweepKind::Usecase => "use-case file",
             SweepKind::Interface => "interface file",
         }
     }
 }
 
-/// One declaring file the sweep walks: test ownership flows from its
-/// `testgroup:` key, never from where a testgroup.iter.md happens to sit.
+/// One declaring node the sweep walks: test ownership flows from its resolved
+/// `children.testgroups` links, never from where a testgroup.iter.md happens
+/// to sit.
 struct SweepUnit {
     kind: SweepKind,
     name: String,
-    /// The declaring file (marker / use-case / interface), for prompts + context.
     declaring_path: String,
-    /// The declaring file's directory: testgroup paths resolve against it.
+    /// The declaring file's directory ({thisfiledir}).
     object_dir: PathBuf,
-    testgroup: String,
-    test_dir: String,
+    /// The node's resolved testgroup.iter.md files.
+    tg_files: Vec<PathBuf>,
+    /// The node's resolved codedirs (Object kind): fix-item codepaths.
+    codepaths: Vec<String>,
 }
 
 /// One runnable unit: a testgroup declared by a `SweepUnit`, due for a run.
@@ -101,13 +100,13 @@ struct Candidate {
     tg_file: PathBuf,
     group: TestGroup,
     priority: i64,
-    /// The declaring file's directory: an Object fix item's codepath / lock scope.
     object_dir: PathBuf,
     /// Subtree carved out of an Object fix item's lock scope (the testwriter's
     /// turf), relative to object_dir, e.g. "test/" or "tests/".
     carve: String,
-    /// For the fix-item prompt: which file declared this group.
     marker_path: String,
+    /// Relative codepaths for the fix item (Object kind; from codedirs).
+    codepaths: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -120,11 +119,11 @@ pub struct SweepReport {
     pub items_created: usize,
     pub items_refreshed: usize,
     pub stale_closed: usize,
-    /// C4 objects whose marker file has no `testgroup:` key — deliberately untested.
+    /// Nodes with no testgroups and no declared intent — deliberately untested
+    /// (code nodes), or deliberately opted out (declared empty on any kind).
     pub undeclared: usize,
-    /// Objects/use-cases/interfaces parked out of the sweep by `test_loop:`
-    /// omit|blocked (own flag or an ancestor's) — counted and named in notes,
-    /// never silently dropped.
+    /// Nodes parked out of the sweep by `teststate:` omit|block — counted and
+    /// named in notes, never silently dropped.
     pub omitted: usize,
     pub notes: Vec<String>,
 }
@@ -132,33 +131,28 @@ pub struct SweepReport {
 impl SweepReport {
     pub fn summary(&self) -> String {
         format!(
-            "test sweep: {} declared group(s) examined, {} ran ({} green, {} red, {} error); {} item(s) created, {} refreshed, {} stale auto-closed; {} C4 object(s) without a testgroup: key; {} omitted by test_loop flag",
+            "test sweep: {} declared group(s) examined, {} ran ({} green, {} red, {} error); {} item(s) created, {} refreshed, {} stale auto-closed; {} node(s) without tests declared; {} omitted by teststate flag",
             self.examined, self.ran, self.green, self.red, self.error, self.items_created, self.items_refreshed, self.stale_closed, self.undeclared, self.omitted
         )
     }
 }
 
-/// One deterministic sweep (features/TDD.md "Engine Test Sweep"). Discovery is
-/// marker-driven: scan for marker files (same roots/glob as the Projects view),
-/// follow each `level:` marker's MANDATORY `testgroup:` key to its
-/// testgroup.iter.md, re-run groups not provably green-and-fresh (respecting
-/// `SweepOptions::concurrency`), record every run, and translate results into work
-/// items — red → per-group fix item scoped to the C4 object's directory (queued/todo
-/// per the group's auto_fix), error → testwriter repair item in todo — with a dedup
-/// guard on `source_testgroup` and auto-close of unstarted sweep items whose group
-/// came back green. testgroup.iter.md files no marker claims are reported, never run.
+/// One deterministic sweep (features/TDD.md "Engine Test Sweep"), structureV2
+/// edition. Discovery is DAG-driven: the same scan the Projects view uses
+/// resolves every node's `children.testgroups` links; groups not provably
+/// green-and-fresh re-run (respecting `concurrency`), every run is recorded,
+/// and results translate into work items — red → per-group fix item scoped by
+/// the node's codedirs (queued/todo per the group's auto_fix), error →
+/// testwriter repair item in todo — with a dedup guard on `source_testgroup`
+/// and auto-close of unstarted sweep items whose group came back green.
+/// Orphaned testgroup files are the Orphanage's business, not the sweep's.
 pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepReport {
     let mut report = SweepReport::default();
-    let code_root = config::code_root(project_root, cfg);
     let now = chrono::Utc::now();
     let stale_cutoff = now - chrono::Duration::hours(opts.green_stale_hours.max(1) as i64);
 
-    // Same marker universe the Projects view sees (projects.json scan_roots + glob),
-    // through the ONE shared resolver (~ expansion included).
-    let settings = crate::server::project_settings(project_root);
-    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md").to_string();
-    let roots = crate::server::scan_roots(project_root);
-    let scan = markers::scan(project_root, &roots, &glob);
+    let (project, scan) = markers::scan_project(project_root);
+    let code_root = project.topdir.clone();
 
     let rel = |p: &Path| {
         p.strip_prefix(&code_root)
@@ -170,142 +164,188 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
     };
     let mut claimed: Vec<PathBuf> = Vec::new();
     let mut candidates: Vec<Candidate> = Vec::new();
-    // Missing tests found during discovery (declared testgroup file absent, or a
-    // group with an empty testlist): each births ONE testwriter authoring item in
-    // `todo` (2026-08-17 flow — the minor-effort "missing tests only" branch;
-    // human gate before authoring starts). If the testwriter then finds no code
-    // to test (major effort), IT escalates to plan — the deterministic sweep
-    // never judges minor vs major.
     let mut authoring: Vec<AuthoringGap> = Vec::new();
-
-    // The sweep universe (2026-08-17): markers AND use-cases AND interfaces.
-    // Rules differ per kind on a MISSING `testgroup:` key — for a C4 object,
-    // absence is a choice (deliberately untested); for use-cases (E2E journey
-    // tests) and interfaces (contract-enforcement tests) tests ARE the point,
-    // so a missing key is a coverage gap that births an authoring item. The
-    // explicit value `testgroup: none` opts a use-case/interface out.
     let mut units: Vec<SweepUnit> = Vec::new();
-    // Parked by the test_loop flag (features/test_loop_flag.md): reported, and
-    // their groups' UNSTARTED sweep-born items auto-closed — but never run.
-    // (name, tg file if declared, flag value, deciding marker)
-    let mut parked: Vec<(String, Option<PathBuf>, String, String)> = Vec::new();
+    // Parked by the teststate flag: reported, and their groups' UNSTARTED
+    // sweep-born items auto-closed — but never run.
+    let mut parked: Vec<(String, Vec<PathBuf>, String, String)> = Vec::new();
+
+    // A declared-but-matching-nothing testgroups entry: the authoring gap.
+    fn declared_missing_gap(
+        kind: SweepKind,
+        name: &str,
+        declaring: &str,
+        declared: &str,
+        codepath: String,
+    ) -> AuthoringGap {
+        AuthoringGap {
+            key: declared.to_string(),
+            title: format!("author tests for \"{}\" (declared testgroup file missing)", name),
+            codepath,
+            context: vec![declaring.to_string()],
+            mainwork: format!(
+                "The {declaring_kind} {declaring} declares a testgroups link resolving to {declared}, but no file matches.\n\
+                 Create it, and author the tests it should register:\n\
+                 1. Read the declaring file, its linked bizreqs/techreqs (and the global context files in $ITER_CONTEXT_FILES), and the code.\n\
+                 2. If the CODE this should exercise is missing too, this is a plan-sized gap, not a testwriter task: \
+                 escalate — create a plan work item carrying what you found (\"$ITER_BIN\" add --project \"$ITER_PROJECT\" \
+                 --type plan --title \"plan: build out {name}\" --source-testgroup \"{declared}\" \
+                 --mainwork \"<gap analysis>\") and finish this item reporting the escalation.\n\
+                 3. Otherwise create the testgroup file with testgroups, write the test scripts (shell-script contract: \
+                 exit 0 as-expected / 1 unexpected / other = script error; last line `ITER_RESULT pass=X fail=Y total=Z`), \
+                 and register every test in the testlist. Confine writes to the test directory.",
+                declaring_kind = kind.declaring(),
+                declaring = declaring,
+                declared = declared,
+                name = name,
+            ),
+        }
+    }
+
     for node in &scan.nodes {
-        // The gate comes first: parked is parked, testgroup key or not.
-        // Effective state resolves ancestry (nearest omit/include wins,
-        // blocked beats everything), so omitting a container carries down.
-        if let markers::TestLoopState::Omitted { value, by } = markers::effective_test_loop(node, &scan.nodes) {
+        // The gate comes first: parked is parked, testgroups or not. Effective
+        // state resolves DAG ancestry (block beats everything; a node shared
+        // by an omitting and an including chain runs via the including one).
+        if let markers::TestState::Omitted { value, by } = markers::effective_teststate(node, &scan.nodes) {
             report.omitted += 1;
             report.notes.push(format!(
-                "omitted from test loop: object \"{}\" (test_loop: {} via {})",
+                "omitted from test loop: object \"{}\" (teststate: {} via {})",
                 node.name, value, by
             ));
-            let tg = (!node.testgroup.is_empty() && node.testgroup.trim() != "none")
-                .then(|| PathBuf::from(&node.dir).join(&node.testgroup));
-            parked.push((node.name.clone(), tg, value, by));
+            parked.push((node.name.clone(), node.testgroups.iter().map(PathBuf::from).collect(), value, by));
             continue;
         }
-        if node.testgroup.is_empty() {
-            report.undeclared += 1;
+        for missing in &node.missing_testgroups {
+            report.notes.push(format!(
+                "\"{}\": declared testgroups link matches nothing ({}) — testwriter authoring item ensured",
+                node.name, missing
+            ));
+            authoring.push(declared_missing_gap(
+                SweepKind::Object,
+                &node.name,
+                &node.path,
+                &rel(Path::new(missing)),
+                rel(Path::new(&node.dir)),
+            ));
+        }
+        if node.testgroups.is_empty() {
+            if node.missing_testgroups.is_empty() {
+                // Default glob matched nothing (or declared empty): for CODE
+                // nodes absence is a choice — deliberately untested.
+                report.undeclared += 1;
+            }
             continue;
         }
+        let codepaths: Vec<String> = if node.codedirs.is_empty() {
+            vec![rel(Path::new(&node.dir))]
+        } else {
+            node.codedirs.iter().map(|d| rel(Path::new(d))).collect()
+        };
         units.push(SweepUnit {
             kind: SweepKind::Object,
             name: node.name.clone(),
             declaring_path: node.path.clone(),
             object_dir: PathBuf::from(&node.dir),
-            testgroup: node.testgroup.clone(),
-            test_dir: node.test_dir.clone(),
+            tg_files: node.testgroups.iter().map(PathBuf::from).collect(),
+            codepaths,
         });
     }
-    let mut keyless: Vec<(SweepKind, String, String)> = Vec::new(); // (kind, name, declaring file)
+
+    // Use-cases and interfaces: tests ARE the point (E2E journeys / contract
+    // enforcement), so a default glob matching nothing is a coverage gap that
+    // births an authoring item. A DECLARED empty list is the deliberate
+    // opt-out (the old `testgroup: none`).
+    let mut coverage_gaps: Vec<(SweepKind, String, String, PathBuf)> = Vec::new(); // (kind, name, declaring, dir)
     for uc in &scan.usecases {
         let dir = Path::new(&uc.file).parent().map(PathBuf::from).unwrap_or_else(|| code_root.clone());
-        // Own flag only (no ancestry): a parked use case is skipped entirely —
-        // its missing-key authoring machinery is suspended too, since parked
-        // means "not spending attention here yet".
-        if let markers::TestLoopState::Omitted { value, by } = markers::own_test_loop(&uc.test_loop, &uc.file) {
+        if let markers::TestState::Omitted { value, .. } = markers::own_teststate(&uc.teststate, &uc.file) {
             report.omitted += 1;
-            report.notes.push(format!("omitted from test loop: use case \"{}\" (test_loop: {})", uc.name, value));
-            let tg = (!uc.testgroup.trim().is_empty() && uc.testgroup.trim() != "none")
-                .then(|| dir.join(uc.testgroup.trim()));
-            parked.push((uc.name.clone(), tg, value, by));
+            report.notes.push(format!("omitted from test loop: use case \"{}\" (teststate: {})", uc.name, value));
+            parked.push((uc.name.clone(), uc.testgroups.iter().map(PathBuf::from).collect(), value, uc.file.clone()));
             continue;
         }
-        match uc.testgroup.trim() {
-            "none" => report.undeclared += 1,
-            "" => keyless.push((SweepKind::Usecase, uc.name.clone(), uc.file.clone())),
-            tg => units.push(SweepUnit {
-                kind: SweepKind::Usecase,
-                name: uc.name.clone(),
-                declaring_path: uc.file.clone(),
-                object_dir: dir,
-                testgroup: tg.to_string(),
-                test_dir: uc.test_dir.clone(),
-            }),
+        for missing in &uc.missing_testgroups {
+            authoring.push(declared_missing_gap(SweepKind::Usecase, &uc.name, &uc.file, &rel(Path::new(missing)), rel(&dir)));
         }
+        if uc.testgroups.is_empty() {
+            if uc.testgroups_declared && uc.missing_testgroups.is_empty() {
+                report.undeclared += 1; // declared empty = opt-out
+            } else if uc.missing_testgroups.is_empty() {
+                coverage_gaps.push((SweepKind::Usecase, uc.name.clone(), uc.file.clone(), dir));
+            }
+            continue;
+        }
+        units.push(SweepUnit {
+            kind: SweepKind::Usecase,
+            name: uc.name.clone(),
+            declaring_path: uc.file.clone(),
+            object_dir: dir,
+            tg_files: uc.testgroups.iter().map(PathBuf::from).collect(),
+            codepaths: vec![".".into()],
+        });
     }
     for iface in &scan.interfaces {
         let dir = Path::new(&iface.file).parent().map(PathBuf::from).unwrap_or_else(|| code_root.clone());
-        if let markers::TestLoopState::Omitted { value, by } = markers::own_test_loop(&iface.test_loop, &iface.file) {
+        if let markers::TestState::Omitted { value, .. } = markers::own_teststate(&iface.teststate, &iface.file) {
             report.omitted += 1;
-            report.notes.push(format!("omitted from test loop: interface \"{}\" (test_loop: {})", iface.id, value));
-            let tg = (!iface.testgroup.trim().is_empty() && iface.testgroup.trim() != "none")
-                .then(|| dir.join(iface.testgroup.trim()));
-            parked.push((iface.id.clone(), tg, value, by));
+            report.notes.push(format!("omitted from test loop: interface \"{}\" (teststate: {})", iface.id, value));
+            parked.push((iface.id.clone(), iface.testgroups.iter().map(PathBuf::from).collect(), value, iface.file.clone()));
             continue;
         }
-        match iface.testgroup.trim() {
-            "none" => report.undeclared += 1,
-            "" => keyless.push((SweepKind::Interface, iface.id.clone(), iface.file.clone())),
-            tg => units.push(SweepUnit {
-                kind: SweepKind::Interface,
-                name: iface.id.clone(),
-                declaring_path: iface.file.clone(),
-                object_dir: dir,
-                testgroup: tg.to_string(),
-                test_dir: iface.test_dir.clone(),
-            }),
+        for missing in &iface.missing_testgroups {
+            authoring.push(declared_missing_gap(SweepKind::Interface, &iface.id, &iface.file, &rel(Path::new(missing)), rel(&dir)));
         }
+        if iface.testgroups.is_empty() {
+            if iface.testgroups_declared && iface.missing_testgroups.is_empty() {
+                report.undeclared += 1;
+            } else if iface.missing_testgroups.is_empty() {
+                coverage_gaps.push((SweepKind::Interface, iface.id.clone(), iface.file.clone(), dir));
+            }
+            continue;
+        }
+        units.push(SweepUnit {
+            kind: SweepKind::Interface,
+            name: iface.id.clone(),
+            declaring_path: iface.file.clone(),
+            object_dir: dir,
+            tg_files: iface.testgroups.iter().map(PathBuf::from).collect(),
+            codepaths: vec![".".into()],
+        });
     }
 
-    // Use-cases/interfaces with NO `testgroup:` key: the coverage gap itself is
-    // the finding. One authoring item each — the testwriter creates the
-    // testgroup file, adds the key to the declaring file (sanctioned write),
-    // and authors the tests.
-    for (kind, name, declaring) in keyless {
+    for (kind, name, declaring, _dir) in coverage_gaps {
         let flavor = match kind {
             SweepKind::Usecase =>
                 "end-to-end JOURNEY tests: scripts that walk the actual user journey this use-case \
-                 describes, through the real participants",
+                 describes, through the real linked code nodes",
             _ =>
                 "CONTRACT-enforcement tests: scripts that assert the real providers' inputs/outputs \
                  against the contract's example in the interface file body — so drift turns red \
                  instead of silently accumulating",
         };
         report.notes.push(format!(
-            "{} \"{}\" has no testgroup: key — testwriter authoring item ensured",
+            "{} \"{}\" has no testgroups — testwriter authoring item ensured",
             kind.declaring(),
             name
         ));
         authoring.push(AuthoringGap {
             key: rel(Path::new(&declaring)),
-            title: format!("author {} tests for \"{}\" (no testgroup declared)",
+            title: format!("author {} tests for \"{}\" (no testgroups declared)",
                 if kind == SweepKind::Usecase { "E2E" } else { "contract" }, name),
             codepath: rel(Path::new(&declaring).parent().unwrap_or(&code_root)),
             context: vec![declaring.clone()],
             mainwork: format!(
-                "The {declaring_kind} {declaring} declares no `testgroup:` key — this {what} has no tests.\n\
+                "The {declaring_kind} {declaring} resolves no testgroups — this {what} has no tests.\n\
                  Author {flavor}.\n\
-                 1. Create a testgroup.iter.md near the declaring file, add `testgroup: <relative path>` \
-                 (and `test_dir:`) to the declaring file's frontmatter — this registration is your one \
-                 sanctioned write outside the test directory — then write and register the scripts \
-                 (shell-script contract: exit 0 as-expected / 1 unexpected / other = script error; \
+                 1. Create `{{thisfiledir}}/{{thisfilestem}}/<name>.testgroup.iter.md` beside the declaring file \
+                 (the default link location, so no frontmatter change is needed), then write and register the \
+                 scripts (shell-script contract: exit 0 as-expected / 1 unexpected / other = script error; \
                  last line `ITER_RESULT pass=X fail=Y total=Z`).\n\
                  2. If the underlying capability doesn't exist yet to test, escalate instead: \
                  \"$ITER_BIN\" add --project \"$ITER_PROJECT\" --type plan \
                  --title \"plan: build out {name}\" --source-testgroup \"{key}\" \
                  --mainwork \"<your gap analysis>\" — then finish this item reporting the escalation.\n\
-                 3. If this {what} genuinely should not be tested, set `testgroup: none` on the \
+                 3. If this {what} genuinely should not be tested, declare `children.testgroups: []` on the \
                  declaring file and report why.",
                 declaring_kind = kind.declaring(),
                 declaring = declaring,
@@ -319,145 +359,99 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
 
     for unit in &units {
         let object_dir = &unit.object_dir;
-        let tg_file = object_dir.join(&unit.testgroup);
-        let tg_file = match tg_file.canonicalize() {
-            Ok(p) => p,
-            Err(_) => {
-                report.notes.push(format!(
-                    "\"{}\": {} declares testgroup: {} but the file does not exist — testwriter authoring item ensured",
-                    unit.name,
-                    unit.kind.declaring(),
-                    unit.testgroup
-                ));
-                // The declared test dir may not exist yet either, so the item is
-                // scoped to the declaring file's directory; the prompt confines writes.
-                let declared = rel(&object_dir.join(&unit.testgroup));
-                authoring.push(AuthoringGap {
-                    key: declared.clone(),
-                    title: format!("author tests for \"{}\" (declared testgroup file missing)", unit.name),
-                    codepath: rel(object_dir),
-                    context: vec![unit.declaring_path.clone()],
-                    mainwork: format!(
-                        "The {declaring_kind} {marker} declares `testgroup: {tg}` but that file does not exist.\n\
-                         Create it, and author the tests it should register:\n\
-                         1. Read the declaring file, the local bizreq/techreq (and the global $ITER_BIZREQ / $ITER_TECHREQ), and the code.\n\
-                         2. If the CODE this should exercise is missing too, this is a plan-sized gap, not a testwriter task: \
-                         escalate — create a plan work item carrying what you found (\"$ITER_BIN\" add --project \"$ITER_PROJECT\" \
-                         --type plan --title \"plan: build out {name}\" --source-testgroup \"{declared}\" \
-                         --mainwork \"<gap analysis>\") and finish this item reporting the escalation.\n\
-                         3. Otherwise create {declared} with testgroups, write the test scripts (shell-script contract: \
-                         exit 0 as-expected / 1 unexpected / other = script error; last line `ITER_RESULT pass=X fail=Y total=Z`), \
-                         and register every test in the testlist. Confine writes to the test directory.",
-                        declaring_kind = unit.kind.declaring(),
-                        marker = unit.declaring_path,
-                        tg = unit.testgroup,
-                        name = unit.name,
-                        declared = declared,
-                    ),
-                });
-                continue;
-            }
-        };
-        claimed.push(tg_file.clone());
-        // The carve: declared test_dir, else the declared testgroups file's own
-        // subdirectory (when it has one), else the global default.
-        let carve = if !unit.test_dir.is_empty() {
-            unit.test_dir.trim_end_matches('/').to_string()
-        } else {
-            tg_file
+        for tg_file in &unit.tg_files {
+            let Ok(tg_file) = tg_file.canonicalize() else { continue };
+            claimed.push(tg_file.clone());
+            // The carve: the testgroup file's own subdirectory (when it has
+            // one), else the global default test dir name.
+            let carve = tg_file
                 .parent()
                 .and_then(|p| p.strip_prefix(object_dir).ok())
                 .map(|r| r.to_string_lossy().into_owned())
                 .filter(|r| !r.is_empty())
-                .unwrap_or_else(|| cfg.globalsettings.test_dir.clone())
-        };
-        let Ok(content) = std::fs::read_to_string(&tg_file) else { continue };
-        for group in testgroups::parse(&content) {
-            report.examined += 1;
-            if group.testlist.is_empty() {
-                // Tests not written yet is never a red run — it becomes a
-                // testwriter authoring item (todo) instead.
-                report.notes.push(format!("\"{}\": no tests registered — testwriter authoring item ensured", group.label));
-                authoring.push(AuthoringGap {
-                    key: group.label.clone(),
-                    title: format!("author tests for testgroup \"{}\" (empty testlist)", group.label),
-                    codepath: rel(tg_file.parent().unwrap_or(object_dir)),
-                    context: vec![tg_file.to_string_lossy().into_owned(), unit.declaring_path.clone()],
-                    mainwork: format!(
-                        "Testgroup \"{label}\" in {tg_file} has no tests registered.\n\
-                         Author them: read the {declaring_kind} {marker}, the local bizreq/techreq (and the global \
-                         $ITER_BIZREQ / $ITER_TECHREQ), and the code; write test scripts honoring the shell-script contract (exit 0 \
-                         as-expected / 1 unexpected / other = script error; last line `ITER_RESULT pass=X fail=Y total=Z`) \
-                         and register each in the group's testlist. If the code this group should exercise does not \
-                         exist yet, escalate to a plan work item (`iter add --type plan --source-testgroup \"{label}\" …`) \
-                         with your gap analysis instead of writing tests against nothing, and finish this item \
-                         reporting the escalation.",
-                        label = group.label,
-                        tg_file = tg_file.display(),
-                        declaring_kind = unit.kind.declaring(),
-                        marker = unit.declaring_path,
-                    ),
-                });
-                continue;
-            }
-            let fresh_green = group.is_green()
-                && workitems::parse_iso(&group.lastrun).map(|t| t > stale_cutoff).unwrap_or(false);
-            if fresh_green {
-                continue;
-            }
-            let priority = if group.is_green() {
-                opts.priority_green // was green, went stale
-            } else {
-                opts.priority_red // never/no-longer green
-            };
-            // An agent working anywhere near the tests makes results meaningless
-            // (and a testwriter may be mid-edit on the scripts): skip until quiet.
-            if let Some(lock) = locks::find_active_lock(object_dir, &[], now) {
-                report.notes.push(format!("skip \"{}\": codepath busy ({})", group.label, lock.display()));
-                continue;
-            }
-            candidates.push(Candidate {
-                kind: unit.kind,
-                tg_file: tg_file.clone(),
-                group,
-                priority,
-                object_dir: object_dir.clone(),
-                carve: carve.clone(),
-                marker_path: unit.declaring_path.clone(),
-            });
-        }
-    }
-
-    // Parked units (test_loop flag): their testgroup files stay CLAIMED — a
-    // parked container must not make its groups look "unowned" — and any
-    // UNSTARTED sweep-born item for their groups auto-closes, so parked work
-    // stops burning agent time. Lifting the flag reverses it all: the next
-    // sweep re-runs the groups and re-births fix items if they are still red.
-    {
-        let queue = Queue::new(project_root, cfg);
-        for (name, tg, value, by) in &parked {
-            let Some(tg) = tg else { continue };
-            let Ok(tg_file) = tg.canonicalize() else { continue };
-            claimed.push(tg_file.clone());
+                .unwrap_or_else(|| cfg.globalsettings.test_dir.clone());
             let Ok(content) = std::fs::read_to_string(&tg_file) else { continue };
             for group in testgroups::parse(&content) {
-                let reason = format!(
-                    "testgroup \"{}\" of \"{}\" is omitted from the test loop (test_loop: {} via {}); item was unstarted",
-                    group.label, name, value, by
-                );
-                report.stale_closed += close_stale_items(&queue, &group.label, &reason);
+                report.examined += 1;
+                if group.testlist.is_empty() {
+                    // Tests not written yet is never a red run — it becomes a
+                    // testwriter authoring item (todo) instead.
+                    report.notes.push(format!("\"{}\": no tests registered — testwriter authoring item ensured", group.label));
+                    authoring.push(AuthoringGap {
+                        key: group.label.clone(),
+                        title: format!("author tests for testgroup \"{}\" (empty testlist)", group.label),
+                        codepath: rel(tg_file.parent().unwrap_or(object_dir)),
+                        context: vec![tg_file.to_string_lossy().into_owned(), unit.declaring_path.clone()],
+                        mainwork: format!(
+                            "Testgroup \"{label}\" in {tg_file} has no tests registered.\n\
+                             Author them: read the {declaring_kind} {marker}, its linked bizreqs/techreqs (and the global \
+                             context files in $ITER_CONTEXT_FILES), and the code; write test scripts honoring the shell-script contract (exit 0 \
+                             as-expected / 1 unexpected / other = script error; last line `ITER_RESULT pass=X fail=Y total=Z`) \
+                             and register each in the group's testlist. If the code this group should exercise does not \
+                             exist yet, escalate to a plan work item (`iter add --type plan --source-testgroup \"{label}\" …`) \
+                             with your gap analysis instead of writing tests against nothing, and finish this item \
+                             reporting the escalation.",
+                            label = group.label,
+                            tg_file = tg_file.display(),
+                            declaring_kind = unit.kind.declaring(),
+                            marker = unit.declaring_path,
+                        ),
+                    });
+                    continue;
+                }
+                let fresh_green = group.is_green()
+                    && workitems::parse_iso(&group.lastrun).map(|t| t > stale_cutoff).unwrap_or(false);
+                if fresh_green {
+                    continue;
+                }
+                let priority = if group.is_green() { opts.priority_green } else { opts.priority_red };
+                // An agent working anywhere near the tests makes results
+                // meaningless: skip until quiet.
+                if let Some(lock) = locks::find_active_lock(object_dir, &[], now) {
+                    report.notes.push(format!("skip \"{}\": codepath busy ({})", group.label, lock.display()));
+                    continue;
+                }
+                candidates.push(Candidate {
+                    kind: unit.kind,
+                    tg_file: tg_file.clone(),
+                    group,
+                    priority,
+                    object_dir: object_dir.clone(),
+                    carve: carve.clone(),
+                    marker_path: unit.declaring_path.clone(),
+                    codepaths: unit.codepaths.clone(),
+                });
             }
         }
     }
 
-    // testgroup.iter.md files no declaring file claims: surfaced, never run.
-    for file in testgroups::find_files(&code_root) {
-        let canon = file.canonicalize().unwrap_or(file.clone());
-        if !claimed.contains(&canon) {
-            report.notes.push(format!(
-                "unowned testgroup.iter.md (no marker/use-case/interface file declares it via testgroup:): {}",
-                file.display()
-            ));
+    // Parked units (teststate flag): any UNSTARTED sweep-born item for their
+    // groups auto-closes, so parked work stops burning agent time. Lifting the
+    // flag reverses it all: the next sweep re-runs the groups and re-births
+    // fix items if they are still red.
+    {
+        let queue = Queue::new(project_root, cfg);
+        for (name, tgs, value, by) in &parked {
+            for tg in tgs {
+                let Ok(tg_file) = tg.canonicalize() else { continue };
+                claimed.push(tg_file.clone());
+                let Ok(content) = std::fs::read_to_string(&tg_file) else { continue };
+                for group in testgroups::parse(&content) {
+                    let reason = format!(
+                        "testgroup \"{}\" of \"{}\" is omitted from the test loop (teststate: {} via {}); item was unstarted",
+                        group.label, name, value, by
+                    );
+                    report.stale_closed += close_stale_items(&queue, &group.label, &reason);
+                }
+            }
+        }
+    }
+
+    // Testgroup files no linked node claims belong to the Orphanage — named
+    // here too so a sweep log alone shows the gap.
+    for orphan in &scan.orphans {
+        if orphan.role == "testgroup" {
+            report.notes.push(format!("orphaned testgroup file (no linked node claims it): {}", orphan.path));
         }
     }
 
@@ -465,9 +459,8 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
     // of work is a testgroup FILE, not a group: `run_group` records a result by
     // rewriting the whole file, so two groups of the SAME file running in
     // parallel would each write back content read before the other's update and
-    // the first result would vanish — the group would look like it never ran.
-    // Bucketing by file keeps every file single-writer while different files
-    // still run concurrently (the common case — most files hold one group).
+    // the first result would vanish. Bucketing by file keeps every file
+    // single-writer while different files still run concurrently.
     let mut buckets: Vec<(PathBuf, Vec<Candidate>)> = Vec::new();
     for cand in candidates {
         let key = cand.tg_file.canonicalize().unwrap_or_else(|_| cand.tg_file.clone());
@@ -499,8 +492,8 @@ pub fn sweep(project_root: &Path, cfg: &Config, opts: &SweepOptions) -> SweepRep
     let queue = Queue::new(project_root, cfg);
 
     // Authoring gaps first: one open testwriter item per gap (same
-    // source_testgroup dedup as fix items — an open item, whoever created it,
-    // suppresses a new one). Born `todo`: new-test authoring gets a human gate.
+    // source_testgroup dedup as fix items). Born `todo`: new-test authoring
+    // gets a human gate.
     for gap in &authoring {
         let open_count = queue.load().len();
         let mut item = WorkItem {
@@ -584,8 +577,8 @@ enum Action {
 
 /// Any sweep-born item still sitting unstarted (todo/queued, zero attempts)
 /// for this group is closed with `reason` — the deterministic, zero-agent
-/// stale-close, used when a group came back green and when its object was
-/// parked by the test_loop flag. Items an agent has started are left alone.
+/// stale-close, used when a group came back green and when its node was
+/// parked by the teststate flag. Items an agent has started are left alone.
 fn close_stale_items(queue: &Queue, label: &str, reason: &str) -> usize {
     let closed: Vec<WorkItem> = queue
         .with_lock(|items| {
@@ -671,7 +664,7 @@ fn build_fix_item(
     run: &GroupRunResult,
     failing: &[String],
 ) -> WorkItem {
-    let code_root = config::code_root(project_root, cfg);
+    let code_root = crate::config::code_root(project_root, cfg);
     let group = &cand.group;
     let rel = |p: &Path| {
         p.strip_prefix(&code_root)
@@ -734,12 +727,15 @@ fn build_fix_item(
         item.item_type = "code".into();
         item.state = if group.auto_fix { workitems::STATE_QUEUED.into() } else { workitems::STATE_TODO.into() };
         item.title = format!("fix red testgroup \"{}\" ({} failing)", group.label, failing.len());
-        item.codepath = rel(&cand.object_dir);
-        item.codepath_ignore = vec![format!("{}/", cand.carve)];
+        // structureV2: the fix scope comes from the node's codedirs (a node's
+        // code may live away from its file); extra codedirs ride as codepaths.
+        item.codepath = cand.codepaths.first().cloned().unwrap_or_else(|| rel(&cand.object_dir));
+        item.codepaths = cand.codepaths.clone();
+        item.codepath_ignore = vec![format!("{}/", cand.carve.trim_end_matches('/'))];
         item.mainwork = format!(
             "The deterministic test sweep found testgroup \"{label}\" RED.\n\
              Failing at sweep time:\n{failing_lines}\n\
-             Test definitions: {tg_file} (declared by the marker file {marker})\nRun logs: {runs_dir}\n\n\
+             Test definitions: {tg_file} (declared by the code node file {marker})\nRun logs: {runs_dir}\n\n\
              Make the whole testgroup green:\n\
              1. FIRST reproduce — run: \"$ITER_BIN\" runtests --project \"$ITER_PROJECT\" --group \"{label}\" --broken\n   \
                 This asserts the defect is still present. If the group is actually green the item is stale: \
@@ -750,7 +746,7 @@ fn build_fix_item(
                 [--test <id>]. Neutral runs never flag anything.\n\
              4. Completion gate — run: \"$ITER_BIN\" runtests --project \"$ITER_PROJECT\" --group \"{label}\" --fixed\n   \
                 This asserts the WHOLE group is green (a fix that breaks a neighbor cannot close the item).\n\n\
-             If the fix is comprehensive — spans C4 objects, needs design decisions, won't fit this session — \
+             If the fix is comprehensive — spans code nodes, needs design decisions, won't fit this session — \
              do NOT grind against the timeout and do NOT spawn subagents. Escalate: create a plan work item \
              carrying your full diagnosis:\n  \"$ITER_BIN\" add --project \"$ITER_PROJECT\" --type plan \
              --title \"plan fix for testgroup {label}\" --source-testgroup \"{label}\" \
@@ -765,9 +761,9 @@ fn build_fix_item(
             priority = cand.priority,
         );
     } else {
-        // Use-case journey / interface contract red: the failure spans C4
-        // objects, so the fix can't pre-scope to one directory. The item takes
-        // the whole code root as its lock scope (heavy — which is why auto_fix
+        // Use-case journey / interface contract red: the failure spans code
+        // nodes, so the fix can't pre-scope to one directory. The item takes
+        // the whole topdir as its lock scope (heavy — which is why auto_fix
         // defaults false and this usually lands in todo, where a human can
         // narrow the codepath before queueing) and the prompt leads with
         // diagnosis: fix locally when the culprit is small, escalate to plan
@@ -781,16 +777,16 @@ fn build_fix_item(
             "The deterministic test sweep found the {what} testgroup \"{label}\" RED.\n\
              Failing at sweep time:\n{failing_lines}\n\
              Test definitions: {tg_file} (declared by the {declaring_kind} {marker})\nRun logs: {runs_dir}\n\n\
-             This failure spans C4 objects, so your lock scope is the whole code root — work surgically:\n\
+             This failure spans code nodes, so your lock scope is the whole top directory — work surgically:\n\
              1. FIRST reproduce — run: \"$ITER_BIN\" runtests --project \"$ITER_PROJECT\" --group \"{label}\" --broken\n   \
                 If the group is actually green the item is stale: the engine flags it and you STOP.\n\
-             2. Diagnose from the run logs WHICH object(s) are at fault ({context_hint}).\n\
+             2. Diagnose from the run logs WHICH node(s) are at fault ({context_hint}).\n\
              3. Small, local culprit → fix the CODE there (never the tests), re-run neutrally while iterating, \
                 then gate completion with --fixed.\n\
              4. Structural culprit (contract change rippling through providers, journey needs new capability) → \
                 do NOT grind: escalate — \"$ITER_BIN\" add --project \"$ITER_PROJECT\" --type plan \
                 --title \"plan fix for {what} {label}\" --source-testgroup \"{label}\" \
-                --mainwork \"<your diagnosis: objects at fault, contract/journey deltas>\" --priority {priority} \
+                --mainwork \"<your diagnosis: nodes at fault, contract/journey deltas>\" --priority {priority} \
                 — then finish this item reporting the escalation.",
             what = what,
             label = group.label,
@@ -800,7 +796,7 @@ fn build_fix_item(
             marker = cand.marker_path,
             runs_dir = run.test_dir.join("runs").display(),
             context_hint = if cand.kind == SweepKind::Usecase {
-                "the use-case file's participants: list names them in journey order"
+                "the use-case file's children.codenodes list names them"
             } else {
                 "the interface file's contract body is the expected shape; check its providers"
             },
@@ -819,20 +815,23 @@ mod tests {
         let root = std::env::temp_dir().join(format!("iter-sweep-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".iter/.engine")).unwrap();
+        std::fs::write(root.join("main.iter.md"), "---\nprojectname: T\n---\nbody\n").unwrap();
         let test_dir = root.join("comp/test");
         std::fs::create_dir_all(&test_dir).unwrap();
         (root, test_dir)
     }
 
-    /// The C4 object's marker file, declaring its testgroup.iter.md — the
-    /// mandatory key the sweep discovers through.
-    fn write_marker(root: &Path, testgroup: &str, test_dir: &str) {
-        let mut front = format!("---\nname: \"Comp\"\nlevel: component\ndescription: \"c\"\ntestgroup: {}\n", testgroup);
-        if !test_dir.is_empty() {
-            front.push_str(&format!("test_dir: {}\n", test_dir));
-        }
-        front.push_str("---\nbody\n");
-        std::fs::write(root.join("comp/comp.marker.iter.md"), front).unwrap();
+    /// A context-level code node declaring its testgroups via the default
+    /// fuzzy link ({thisfiledir}/test/*.testgroup.iter.md).
+    fn write_node(root: &Path, extra_front: &str) {
+        std::fs::write(
+            root.join("comp/comp.code.iter.md"),
+            format!(
+                "---\nname: \"Comp\"\nlevel: context\ndescription: \"c\"\n{}children:\n  testgroups: [\"{{thisfiledir}}/test/*.testgroup.iter.md\"]\n---\nbody\n",
+                extra_front
+            ),
+        )
+        .unwrap();
     }
 
     fn write_group(test_dir: &Path, label: &str, scripts: &[(&str, &str)], auto_fix: bool) -> PathBuf {
@@ -844,34 +843,36 @@ mod tests {
             .map(|(f, _)| TestEntry { id: f.trim_end_matches(".sh").into(), name: (*f).into(), desc: String::new(), shell: (*f).into() })
             .collect();
         let group = TestGroup { label: label.into(), auto_fix, testlist: entries, ..Default::default() };
-        let tg_file = test_dir.join("testgroup.iter.md");
+        let tg_file = test_dir.join("comp.testgroup.iter.md");
         std::fs::write(&tg_file, testgroups::update("# tests\n", &[group])).unwrap();
         tg_file
     }
 
-    // The Test-Loop gate (features/test_loop_flag.md): an omitted container's
-    // groups never run and its unstarted sweep items auto-close, while an
-    // `include` child underneath re-enters the sweep — break either side of
-    // the resolver and this goes red.
+    // The teststate gate: an omitted context's groups never run and its
+    // unstarted sweep items auto-close, while an `include` child linked
+    // underneath re-enters the sweep.
     #[test]
-    fn test_loop_flag_parks_subtree_and_include_reenters() {
-        let (root, _td) = setup("tlpark");
-        // Container comp/ is omitted; its own (red) group must not run.
+    fn teststate_flag_parks_subtree_and_include_reenters() {
+        let (root, _td) = setup("tspark");
         std::fs::write(
-            root.join("comp/comp.marker.iter.md"),
-            "---\nname: \"Comp\"\nlevel: container\ntestgroup: test/testgroup.iter.md\ntest_dir: test\ntest_loop: omit\n---\nbody\n",
+            root.join("comp/comp.code.iter.md"),
+            "---\nname: \"Comp\"\nlevel: context\ndescription: d\nteststate: omit\nchildren:\n  codenodes: [\"{thisfiledir}/sub/*.code.iter.md\"]\n  testgroups: [\"{thisfiledir}/test/*.testgroup.iter.md\"]\n---\nbody\n",
         )
         .unwrap();
         write_group(&root.join("comp/test"), "Parked G", &[("t1.sh", "exit 1\n")], false);
-        // Component comp/sub/ carries an explicit include — re-entered, runs red.
         let sub_test = root.join("comp/sub/test");
         std::fs::create_dir_all(&sub_test).unwrap();
         std::fs::write(
-            root.join("comp/sub/sub.marker.iter.md"),
-            "---\nname: \"Sub\"\nlevel: component\ntestgroup: test/testgroup.iter.md\ntest_dir: test\ntest_loop: include\n---\nbody\n",
+            root.join("comp/sub/sub.code.iter.md"),
+            "---\nname: \"Sub\"\nlevel: component\ndescription: d\nteststate: include\nchildren:\n  testgroups: [\"{thisfiledir}/test/*.testgroup.iter.md\"]\n---\nbody\n",
         )
         .unwrap();
-        write_group(&sub_test, "Sub G", &[("t1.sh", "exit 1\n")], false);
+        {
+            let entries = vec![TestEntry { id: "t1".into(), name: "t1.sh".into(), desc: String::new(), shell: "t1.sh".into() }];
+            std::fs::write(sub_test.join("t1.sh"), "exit 1\n").unwrap();
+            let group = TestGroup { label: "Sub G".into(), testlist: entries, ..Default::default() };
+            std::fs::write(sub_test.join("sub.testgroup.iter.md"), testgroups::update("# t\n", &[group])).unwrap();
+        }
         // An unstarted sweep-born item for the parked group must auto-close.
         let cfg = Config::default();
         let queue = Queue::new(&root, &cfg);
@@ -887,7 +888,7 @@ mod tests {
         queue.append(&stale).unwrap();
 
         let report = sweep(&root, &cfg, &SweepOptions::default());
-        assert_eq!(report.omitted, 1, "the container is omitted: {:?}", report.notes);
+        assert_eq!(report.omitted, 1, "the context is omitted: {:?}", report.notes);
         assert_eq!(report.red, 1, "the included child still runs: {:?}", report.notes);
         assert!(report.notes.iter().any(|n| n.contains("omitted from test loop") && n.contains("Comp")));
         let open = queue.load();
@@ -901,25 +902,20 @@ mod tests {
         let auto = closed.iter().find(|i| i.workid == "w-parked").expect("archived");
         assert!(auto.output.contains("omitted from the test loop"), "{}", auto.output);
         assert_eq!(report.stale_closed, 1);
-        // Nothing ran for the parked group: no fix item for it.
         assert!(!open.iter().any(|i| i.source_testgroup == "Parked G"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // A parked use case is skipped entirely — even its missing-testgroup-key
+    // A parked use case is skipped entirely — even its missing-testgroup
     // authoring machinery is suspended while parked.
     #[test]
     fn parked_usecase_suspends_authoring_and_runs() {
-        let (root, _td) = setup("tluc");
-        std::fs::write(
-            root.join("comp/comp.marker.iter.md"),
-            "---\nname: \"Comp\"\nlevel: component\n---\nbody\n",
-        )
-        .unwrap();
+        let (root, _td) = setup("tsuc");
+        write_node(&root, "");
         std::fs::create_dir_all(root.join("usecases")).unwrap();
         std::fs::write(
             root.join("usecases/later.usecase.iter.md"),
-            "---\nname: \"Later Feature\"\ndescription: \"parked\"\ntest_loop: omit\n---\nbody\n",
+            "---\nname: \"Later Feature\"\ndescription: \"parked\"\nteststate: omit\nchildren:\n  codenodes: []\n---\nbody\n",
         )
         .unwrap();
         let cfg = Config::default();
@@ -927,12 +923,12 @@ mod tests {
         assert_eq!(report.omitted, 1, "notes: {:?}", report.notes);
         assert!(
             Queue::new(&root, &cfg).load().is_empty(),
-            "no authoring item while parked — the missing-key machinery is suspended"
+            "no authoring item while parked — the missing-tests machinery is suspended"
         );
         // Lift the flag: the coverage gap surfaces again.
         std::fs::write(
             root.join("usecases/later.usecase.iter.md"),
-            "---\nname: \"Later Feature\"\ndescription: \"parked\"\n---\nbody\n",
+            "---\nname: \"Later Feature\"\ndescription: \"parked\"\nchildren:\n  codenodes: []\n---\nbody\n",
         )
         .unwrap();
         sweep(&root, &cfg, &SweepOptions::default());
@@ -941,19 +937,19 @@ mod tests {
     }
 
     #[test]
-    fn usecase_without_testgroup_key_births_authoring_item_and_none_opts_out() {
+    fn usecase_without_tests_births_authoring_item_and_declared_empty_opts_out() {
         let (root, _td) = setup("ucswp");
         std::fs::create_dir_all(root.join("usecases")).unwrap();
         std::fs::write(
             root.join("usecases/login.usecase.iter.md"),
-            "---\nname: \"User Login\"\ndescription: \"login journey\"\n---\nbody\n",
+            "---\nname: \"User Login\"\ndescription: \"login journey\"\nchildren:\n  codenodes: []\n---\nbody\n",
         )
         .unwrap();
-        // An interface deliberately opted out contributes nothing.
+        // An interface deliberately opted out (declared empty) contributes nothing.
         std::fs::create_dir_all(root.join("interfaces")).unwrap();
         std::fs::write(
             root.join("interfaces/auth.interface.iter.md"),
-            "---\ninterface: auth-api\nkind: http\ntestgroup: none\n---\ncontract\n",
+            "---\nname: auth-api\nkind: request-reply\ndescription: d\nchildren:\n  testgroups: []\n---\ncontract\n",
         )
         .unwrap();
         let cfg = Config::default();
@@ -972,20 +968,26 @@ mod tests {
     #[test]
     fn red_usecase_group_scopes_fix_item_to_code_root() {
         let (root, _td) = setup("ucred");
-        let uc_test = root.join("usecases/login-test");
+        let uc_test = root.join("usecases/login");
         std::fs::create_dir_all(&uc_test).unwrap();
         std::fs::write(
             root.join("usecases/login.usecase.iter.md"),
-            "---\nname: \"User Login\"\ntestgroup: login-test/testgroup.iter.md\ntest_dir: login-test\n---\nbody\n",
+            "---\nname: \"User Login\"\ndescription: d\nchildren:\n  codenodes: []\n  testgroups: [\"{thisfiledir}/{thisfilestem}/*.testgroup.iter.md\"]\n---\nbody\n",
         )
         .unwrap();
-        write_group(&uc_test, "Login E2E", &[("t1.sh", "exit 1\n")], false);
+        std::fs::write(uc_test.join("t1.sh"), "exit 1\n").unwrap();
+        let group = TestGroup {
+            label: "Login E2E".into(),
+            testlist: vec![TestEntry { id: "t1".into(), name: "t1".into(), desc: String::new(), shell: "t1.sh".into() }],
+            ..Default::default()
+        };
+        std::fs::write(uc_test.join("login.testgroup.iter.md"), testgroups::update("# t\n", &[group])).unwrap();
         let cfg = Config::default();
         let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.red, 1, "notes: {:?}", report.notes);
         let items = Queue::new(&root, &cfg).load();
         let fix = items.iter().find(|i| i.item_type == "code").expect("fix item born");
-        assert_eq!(fix.codepath, ".", "journey failures span objects → code-root scope");
+        assert_eq!(fix.codepath, ".", "journey failures span nodes → topdir scope");
         assert_eq!(fix.state, workitems::STATE_TODO);
         assert!(fix.mainwork.contains("use-case journey"), "{}", fix.mainwork);
         assert!(fix.mainwork.contains("--source-testgroup"), "escalation carries provenance");
@@ -994,13 +996,17 @@ mod tests {
 
     #[test]
     fn missing_tests_birth_testwriter_authoring_items_in_todo() {
-        // Declared testgroup file absent → authoring item keyed by the declared path.
+        // Declared explicit testgroup entry matching nothing → authoring item.
         let (root, _test_dir) = setup("authoring");
-        write_marker(&root, "test/testgroup.iter.md", "test");
+        std::fs::write(
+            root.join("comp/comp.code.iter.md"),
+            "---\nname: \"Comp\"\nlevel: context\ndescription: d\nchildren:\n  testgroups: [\"{thisfiledir}/test/comp.testgroup.iter.md\"]\n---\nbody\n",
+        )
+        .unwrap();
         std::fs::remove_dir_all(root.join("comp/test")).unwrap();
         let cfg = Config::default();
         let report = sweep(&root, &cfg, &SweepOptions::default());
-        assert_eq!(report.items_created, 1);
+        assert_eq!(report.items_created, 1, "{:?}", report.notes);
         let queue = Queue::new(&root, &cfg);
         let items = queue.load();
         assert_eq!(items.len(), 1);
@@ -1015,9 +1021,9 @@ mod tests {
 
         // Empty testlist → authoring item keyed by the group label.
         let (root2, test_dir2) = setup("authoring-empty");
-        write_marker(&root2, "test/testgroup.iter.md", "test");
+        write_node(&root2, "");
         let group = TestGroup { label: "Empty".into(), ..Default::default() };
-        std::fs::write(test_dir2.join("testgroup.iter.md"), testgroups::update("# tests\n", &[group])).unwrap();
+        std::fs::write(test_dir2.join("comp.testgroup.iter.md"), testgroups::update("# tests\n", &[group])).unwrap();
         let report3 = sweep(&root2, &cfg, &SweepOptions::default());
         assert_eq!(report3.items_created, 1);
         let items2 = Queue::new(&root2, &cfg).load();
@@ -1028,9 +1034,9 @@ mod tests {
     }
 
     #[test]
-    fn red_group_births_one_todo_item_scoped_by_the_marker() {
+    fn red_group_births_one_todo_item_scoped_by_codedirs() {
         let (root, test_dir) = setup("red");
-        write_marker(&root, "test/testgroup.iter.md", "test");
+        write_node(&root, "");
         write_group(&test_dir, "G", &[("t1.sh", "exit 0\n"), ("t2.sh", "exit 1\n")], false);
         let cfg = Config::default();
 
@@ -1047,11 +1053,12 @@ mod tests {
         assert_eq!(item.source, SOURCE);
         assert_eq!(item.source_testgroup, "G");
         assert_eq!(item.source_tests, vec!["t2"]);
-        assert_eq!(item.codepath, "comp", "codepath = the marker file's directory");
+        assert_eq!(item.codepath, "comp", "codepath = the node's default codedir (thisfiledir)");
+        assert_eq!(item.codepaths, vec!["comp"], "codedirs ride as the codepaths list");
         assert_eq!(item.codepath_ignore, vec!["test/"]);
         assert!(item.mainwork.contains("--broken"));
         assert!(item.mainwork.contains("--fixed"));
-        assert!(item.context.iter().any(|c| c.ends_with("comp.marker.iter.md")), "marker rides along as context");
+        assert!(item.context.iter().any(|c| c.ends_with("comp.code.iter.md")), "declaring node rides along as context");
 
         // Second sweep: dedup, no duplicate item.
         let report2 = sweep(&root, &cfg, &SweepOptions::default());
@@ -1060,15 +1067,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Two groups in ONE testgroup.iter.md, swept concurrently. `run_group`
-    /// records a result by rewriting the whole file, so if both ran in parallel
-    /// the later write — built from content read before the earlier one landed —
-    /// would erase the first group's lastrun/result/counts, and that group would
-    /// look like it had never run. The sweep buckets by file to prevent it.
+    /// Two groups in ONE testgroup.iter.md, swept concurrently: bucketing by
+    /// file keeps every file single-writer so neither run's record vanishes.
     #[test]
     fn sibling_groups_in_one_file_both_record_their_run() {
         let (root, test_dir) = setup("siblings");
-        write_marker(&root, "test/testgroup.iter.md", "test");
+        write_node(&root, "");
         for (file, body) in [("a.sh", "exit 0\n"), ("b.sh", "exit 0\n")] {
             std::fs::write(test_dir.join(file), body).unwrap();
         }
@@ -1077,12 +1081,10 @@ mod tests {
             TestGroup { label: "A".into(), testlist: vec![entry("a.sh")], ..Default::default() },
             TestGroup { label: "B".into(), testlist: vec![entry("b.sh")], ..Default::default() },
         ];
-        let tg_file = test_dir.join("testgroup.iter.md");
+        let tg_file = test_dir.join("comp.testgroup.iter.md");
         std::fs::write(&tg_file, testgroups::update("# tests\n", &groups)).unwrap();
 
         let cfg = Config::default();
-        // Concurrency high enough that both groups would run at once if the
-        // sweep still handed out groups rather than files.
         let report = sweep(&root, &cfg, &SweepOptions { concurrency: 4, ..SweepOptions::default() });
         assert_eq!(report.ran, 2);
         assert_eq!(report.green, 2);
@@ -1098,66 +1100,33 @@ mod tests {
     }
 
     #[test]
-    fn no_testgroups_key_means_deliberately_untested() {
-        let (root, test_dir) = setup("nokey");
-        // Marker WITHOUT a testgroups: key + a testgroup.iter.md sitting right there.
-        std::fs::write(root.join("comp/comp.marker.iter.md"), "---\nname: \"Comp\"\nlevel: component\n---\nbody\n").unwrap();
-        write_group(&test_dir, "G", &[("t1.sh", "exit 1\n")], false);
+    fn no_matching_testgroups_means_deliberately_untested_for_code() {
+        let (root, _test_dir) = setup("nokey");
+        // Node whose default glob matches nothing (groups live elsewhere,
+        // unlinked) — deliberately untested; the stray file is orphanage
+        // business, named in the notes. (A group INSIDE test/ would be picked
+        // up by the default fuzzy link — that is the V2 design.)
+        std::fs::write(
+            root.join("comp/comp.code.iter.md"),
+            "---\nname: \"Comp\"\nlevel: context\ndescription: d\nchildren:\n  bizreqs: []\n---\nbody\n",
+        )
+        .unwrap();
+        let elsewhere = root.join("comp/othertests");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        write_group(&elsewhere, "G", &[("t1.sh", "exit 1\n")], false);
         let cfg = Config::default();
         let report = sweep(&root, &cfg, &SweepOptions::default());
         assert_eq!(report.ran, 0, "undeclared groups never run");
         assert_eq!(report.undeclared, 1);
-        assert!(report.notes.iter().any(|n| n.contains("unowned testgroup.iter.md")), "{:?}", report.notes);
+        assert!(report.notes.iter().any(|n| n.contains("orphaned testgroup")), "{:?}", report.notes);
         assert!(Queue::new(&root, &cfg).load().is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn declared_but_missing_file_is_reported() {
-        let (root, _test_dir) = setup("missing");
-        write_marker(&root, "test/testgroup.iter.md", "test");
-        // No testgroup.iter.md written.
-        let cfg = Config::default();
-        let report = sweep(&root, &cfg, &SweepOptions::default());
-        assert_eq!(report.ran, 0);
-        assert!(report.notes.iter().any(|n| n.contains("does not exist")), "{:?}", report.notes);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn pdy_layout_testgroups_beside_marker_scopes_correctly() {
-        // PDY-TECH-030: testgroup.iter.md at the C4 object's root, scripts in
-        // tests/iter/. The marker's declarations make scoping exact anyway.
-        let root = std::env::temp_dir().join(format!("iter-sweep-pdy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".iter/.engine")).unwrap();
-        std::fs::create_dir_all(root.join("repos/gateway/tests/iter")).unwrap();
-        std::fs::write(
-            root.join("repos/gateway/gateway.marker.iter.md"),
-            "---\nname: \"Gateway\"\nlevel: container\ntestgroup: testgroup.iter.md\ntest_dir: tests\n---\nbody\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("repos/gateway/tests/iter/t1.sh"), "exit 1\n").unwrap();
-        let group = TestGroup {
-            label: "G".into(),
-            testlist: vec![TestEntry { id: "t1".into(), name: "t1".into(), desc: String::new(), shell: "tests/iter/t1.sh".into() }],
-            ..Default::default()
-        };
-        std::fs::write(root.join("repos/gateway/testgroup.iter.md"), testgroups::update("# tg\n", &[group])).unwrap();
-        let cfg = Config::default();
-        let report = sweep(&root, &cfg, &SweepOptions::default());
-        assert_eq!(report.ran, 1, "{:?}", report.notes);
-        assert_eq!(report.red, 1);
-        let items = Queue::new(&root, &cfg).load();
-        assert_eq!(items[0].codepath, "repos/gateway", "scoped to the marker file's directory, NOT its parent");
-        assert_eq!(items[0].codepath_ignore, vec!["tests/"], "declared test_dir is the carve");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn auto_fix_true_queues_the_item() {
         let (root, test_dir) = setup("autofix");
-        write_marker(&root, "test/testgroup.iter.md", "test");
+        write_node(&root, "");
         write_group(&test_dir, "G", &[("t1.sh", "exit 1\n")], true);
         let cfg = Config::default();
         sweep(&root, &cfg, &SweepOptions::default());
@@ -1169,7 +1138,7 @@ mod tests {
     #[test]
     fn error_group_births_testwriter_repair_item() {
         let (root, test_dir) = setup("err");
-        write_marker(&root, "test/testgroup.iter.md", "test");
+        write_node(&root, "");
         write_group(&test_dir, "G", &[("t1.sh", "exit 9\n")], true);
         let cfg = Config::default();
         let report = sweep(&root, &cfg, &SweepOptions::default());
@@ -1184,7 +1153,7 @@ mod tests {
     #[test]
     fn green_group_auto_closes_unstarted_stale_item() {
         let (root, test_dir) = setup("stale");
-        write_marker(&root, "test/testgroup.iter.md", "test");
+        write_node(&root, "");
         let tg = write_group(&test_dir, "G", &[("t1.sh", "exit 1\n")], false);
         let cfg = Config::default();
         sweep(&root, &cfg, &SweepOptions::default()); // creates the fix item
@@ -1198,7 +1167,6 @@ mod tests {
         let closed = queue.load_closed();
         assert_eq!(closed.len(), 1);
         assert!(closed[0].output.contains("auto-closed by test sweep"));
-        // Group block records the green run.
         let groups = testgroups::parse(&std::fs::read_to_string(&tg).unwrap());
         assert!(groups[0].is_green());
         let _ = std::fs::remove_dir_all(&root);
@@ -1207,7 +1175,7 @@ mod tests {
     #[test]
     fn fresh_green_group_is_left_alone_and_started_items_are_kept() {
         let (root, test_dir) = setup("fresh");
-        write_marker(&root, "test/testgroup.iter.md", "test");
+        write_node(&root, "");
         write_group(&test_dir, "G", &[("t1.sh", "exit 0\n")], false);
         let cfg = Config::default();
         sweep(&root, &cfg, &SweepOptions::default()); // records green
@@ -1220,7 +1188,7 @@ mod tests {
         item.state = workitems::STATE_QUEUED.into();
         queue.append(&item).unwrap();
         // Force a re-run by making the green stale.
-        let tg = test_dir.join("testgroup.iter.md");
+        let tg = test_dir.join("comp.testgroup.iter.md");
         let content = std::fs::read_to_string(&tg).unwrap();
         let mut groups = testgroups::parse(&content);
         groups[0].lastrun = "2020-01-01T00:00:00Z".into();
@@ -1235,7 +1203,7 @@ mod tests {
     #[test]
     fn unstarted_item_source_tests_refresh_on_new_failures() {
         let (root, test_dir) = setup("refresh");
-        write_marker(&root, "test/testgroup.iter.md", "test");
+        write_node(&root, "");
         write_group(&test_dir, "G", &[("t1.sh", "exit 1\n"), ("t2.sh", "exit 0\n")], false);
         let cfg = Config::default();
         sweep(&root, &cfg, &SweepOptions::default());
@@ -1253,13 +1221,13 @@ mod tests {
     #[test]
     fn locked_object_dir_is_skipped() {
         let (root, test_dir) = setup("locked");
-        write_marker(&root, "test/testgroup.iter.md", "test");
+        write_node(&root, "");
         write_group(&test_dir, "G", &[("t1.sh", "exit 1\n")], false);
         let cfg = Config::default();
         let comp = root.join("comp").canonicalize().unwrap();
         let lock = locks::acquire_codepath_lock(&comp, "w-busy", "code", 600, &[]).unwrap();
         let report = sweep(&root, &cfg, &SweepOptions::default());
-        assert_eq!(report.ran, 0, "locked C4 object must be skipped");
+        assert_eq!(report.ran, 0, "locked node must be skipped");
         assert!(report.notes.iter().any(|n| n.contains("codepath busy")));
         drop(lock);
         let _ = std::fs::remove_dir_all(&root);

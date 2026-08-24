@@ -84,6 +84,12 @@ pub struct WorkItem {
     pub priority: i64,
     pub risk: i64,
     pub codepath: String,
+    /// structureV2: a code node may declare several `codedirs`, so an item may
+    /// carry several codepaths — ALL are locked and all feed the agent's
+    /// context. `codepath` stays the PRIMARY (first) path for compatibility;
+    /// `normalize()` keeps the two in sync whichever one a producer set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub codepaths: Vec<String>,
     /// Gitignore-like patterns (relative to codepath) carved OUT of this item's lock
     /// scope: the item neither locks nor may edit those subtrees, so another item can
     /// work there in parallel (e.g. code owns `pth/object/` ignoring `test/` while a
@@ -159,6 +165,7 @@ impl Default for WorkItem {
             priority: 5,
             risk: 0,
             codepath: ".".into(),
+            codepaths: Vec::new(),
             codepath_ignore: Vec::new(),
             source_testgroup: String::new(),
             source_tests: Vec::new(),
@@ -192,6 +199,31 @@ pub fn parse_iso(s: &str) -> Option<DateTime<Utc>> {
 }
 
 impl WorkItem {
+    /// Keep `codepath` (primary, legacy) and `codepaths` (structureV2 list)
+    /// consistent whichever one a producer wrote. Runs on every load/append so
+    /// old queue rows and new list-form rows read the same.
+    pub fn normalize_codepaths(&mut self) {
+        if self.codepaths.is_empty() {
+            if !self.codepath.trim().is_empty() {
+                self.codepaths = vec![self.codepath.clone()];
+            }
+        } else {
+            self.codepath = self.codepaths[0].clone();
+        }
+    }
+
+    /// Every codepath this item carries — the codepaths list, the legacy
+    /// scalar, or "." as the last resort. First entry = primary.
+    pub fn all_codepaths(&self) -> Vec<String> {
+        if !self.codepaths.is_empty() {
+            self.codepaths.clone()
+        } else if !self.codepath.trim().is_empty() {
+            vec![self.codepath.clone()]
+        } else {
+            vec![".".into()]
+        }
+    }
+
     /// Effective priority for ordering. Priorities are LOWER-IS-SOONER (P0 =
     /// most urgent, P10 = least, default 5 — inverted 2026-08-17 to match the
     /// industry P0..Pn convention). Error-sourced work gets a -2 boost, and
@@ -413,7 +445,10 @@ impl Queue {
                 continue;
             }
             match serde_json::from_str::<WorkItem>(line) {
-                Ok(item) => items.push(item),
+                Ok(mut item) => {
+                    item.normalize_codepaths();
+                    items.push(item);
+                }
                 Err(e) => eprintln!(
                     "warning: {}:{} is not a valid workitem ({}); line skipped",
                     self.open_path.display(),
@@ -479,6 +514,10 @@ impl Queue {
         text.lines()
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str::<WorkItem>(l).ok())
+            .map(|mut i| {
+                i.normalize_codepaths();
+                i
+            })
             .collect()
     }
 

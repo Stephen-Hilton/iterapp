@@ -1,0 +1,11 @@
+{
+  "mainfile": "{topdir}/main.iter.md",
+  "iterglob": "**/*.iter.md",
+  "topdir": "{thisfiledir}/../",
+  "url_slug": "",
+  "default_context": [
+    "{marker}",
+    "{ancestor_markers}",
+    "{interfaces}"
+  ]
+}

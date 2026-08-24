@@ -1,3 +1,10 @@
+---
+name: "test testgroup"
+description: "testgroup for test"
+children:
+  testpaths: ["{thisfiledir}/*.sh"]
+---
+
 # CSV Exporter — test groups
 
 **This object is parked out of the test sweep** — its marker carries

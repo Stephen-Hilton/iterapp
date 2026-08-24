@@ -1,3 +1,10 @@
+---
+name: "test testgroup"
+description: "testgroup for test"
+children:
+  testpaths: ["{thisfiledir}/*.sh"]
+---
+
 # Review the month — end-to-end tests
 
 The groups below are declared with **empty testlists**: this is the state a

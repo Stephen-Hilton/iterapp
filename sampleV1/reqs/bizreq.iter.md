@@ -1,3 +1,10 @@
+---
+name: "reqs bizreq"
+description: "bizreq for reqs"
+children:
+  reqpaths: []
+---
+
 # Business requirements — project-wide
 
 Global business requirements for **Sample Ledger**: rules that apply across the

@@ -609,8 +609,8 @@ const agentDefaults = (t) => {
 };
 let PROJECT_ROOT = '/Users/stephen.hilton/dev/iterapp/sample';   // replaced by /api/meta in LIVE mode
 let HOME = '/Users/stephen.hilton';                              // replaced by /api/meta in LIVE mode
-let GLOBAL_BIZREQ = '';   // the global bizreq file (globalsettings.global_bizreq_path, resolved) — replaced by /api/meta in LIVE mode
-let GLOBAL_TECHREQ = '';  // the global techreq file (globalsettings.global_techreq_path, resolved) — replaced by /api/meta in LIVE mode
+let MAINFILE = '';        // the main.iter.md project head (structureV2), from /api/meta in LIVE mode
+let CONTEXT_FILES = [];   // resolved globalcontextfiles — always in agent context; from /api/meta
 
 /* codepath is entered relative but always resolved and shown absolute */
 function normPath(p){
@@ -638,9 +638,7 @@ function resolveLine(line, codepathAbs){
   };
   if (placeholders[line]) return placeholders[line];
   let p = line.split('{codepath}').join(codepathAbs || '(codepath)');
-  // {reqs} = the dir holding the global bizreq (global_bizreq_path setting)
-  const reqsDir = GLOBAL_BIZREQ ? GLOBAL_BIZREQ.slice(0, GLOBAL_BIZREQ.lastIndexOf('/')) : '';
-  p = p.split('{reqs}').join(reqsDir || '(project-wide reqs dir)');
+  p = p.split('{topdir}').join(PROJECT_ROOT || '(topdir)');
   if (p === '~') p = HOME;
   else if (p.startsWith('~/')) p = HOME + '/' + p.slice(2);
   if (!p.startsWith('/') && !p.startsWith('(')) p = PROJECT_ROOT + '/' + p;
@@ -988,8 +986,8 @@ async function loadAll(){
     meta.prepostwork.forEach(p => PREPOST.push(typeof p === 'string' ? { name: p, exec: 'agent' } : p));
     PROJECT_ROOT = meta.code_root || meta.project_root;
     if (meta.home) HOME = meta.home;
-    if (meta.global_bizreq) GLOBAL_BIZREQ = meta.global_bizreq;
-    if (meta.global_techreq) GLOBAL_TECHREQ = meta.global_techreq;
+    if (meta.mainfile) MAINFILE = meta.mainfile;
+    if (meta.context_files) CONTEXT_FILES = meta.context_files;
     if (Array.isArray(meta.default_context) && meta.default_context.length) {
       DEFAULT_CONTEXT = meta.default_context;
     }
@@ -2046,15 +2044,10 @@ const CONFIG = {
   },
   globalsettings: {
     user_timezone: ['UTC', 'timezone for displaying timestamps — data stays UTC on disk; DST handled automatically'],
-    code_root: ['.', 'base dir for relative codepaths/context/testfiles — set e.g. .. or ~/dev/myproject when .iter lives in a subdir of the codebase; default . = where .iter lives'],
     critreview_max_rounds: [3, 'max critical-review rounds an agent runs per work item — substituted into _shared.md as {critreview_max_rounds}; each round is a synchronous critic session (minutes + spend), and agents stop earlier when a review has no material findings'],
     testwriter_min_tests_per_group: [20, 'minimum tests a testwriter agent produces per testgroup (floor)'],
     testwriter_max_tests_per_group: [100, 'maximum tests a testwriter agent produces per testgroup'],
     test_dir: ['test', 'the per-component test directory name — testwriter items lock <component>/<test_dir>, code items list it in codepath_ignore; exported to agents as ITER_TEST_DIR'],
-    usecase_default_path: ['{codepath}/usecases/', 'where NEW use-case files are created ({codepath} = the resolved code root) — creation only; the scanner finds *usecase.iter.md anywhere'],
-    interface_default_path: ['{codepath}/interfaces/', 'where NEW interface files are created (<id>.interface.iter.md, one file per id — shared contracts, 1:M with C4 objects) — creation only; the scanner finds *interface.iter.md anywhere; exported to agents as ITER_INTERFACE_DIR'],
-    global_bizreq_path: ['{codepath}/reqs/bizreq.iter.md', 'the GLOBAL business-requirements file surfaced to every agent ({codepath} = the resolved code root) — exactly this file, never its directory; exported to agents as ITER_BIZREQ'],
-    global_techreq_path: ['{codepath}/reqs/techreq.iter.md', 'the GLOBAL technical-requirements file surfaced to every agent ({codepath} = the resolved code root) — exactly this file, never its directory; exported to agents as ITER_TECHREQ'],
     log_default_path: ['./logs/{YYYYMMDD-hh}.log', 'engine log file pattern'],
     log_level: ['info', 'debug | info | warn | error'],
     log_max_size_mb: [10, 'rotate log at this size'],
@@ -2150,17 +2143,15 @@ function settingsLayout(){
       ['Logging', 'Engine log output and rotation',
         ['log_default_path','log_level','log_max_size_mb','log_max_files'].map(k => cfg('globalsettings', k))],
     ]],
-    ['Iterapp', 'project management and the C4 map: markers, file layout, display', [
-      ['Project identity', 'This server’s name and address — .iter/projects.json',
-        ['project_name','url_slug'].map(psi)],
-      ['Marker discovery', 'How the Projects scan finds iter files — .iter/projects.json',
-        ['scan_roots','marker_glob','testgroups_glob'].map(psi)],
-      ['Creation defaults', 'Where NEW iter files land, and the context new work items start with',
-        [psi('default_context'), cfg('globalsettings','usecase_default_path'), cfg('globalsettings','interface_default_path')]],
-      ['Global requirements', 'The two project-wide requirement files every agent is pointed at automatically — exactly these files, never a directory scan, so stray docs beside them can’t balloon agent context',
-        ['global_bizreq_path','global_techreq_path'].map(k => cfg('globalsettings', k))],
-      ['Display and layout', 'Timestamp display, and the code root every relative path resolves against',
-        [cfg('globalsettings','user_timezone'), cfg('globalsettings','code_root')]],
+    ['Iterapp', 'the project head and the structure map: the two head files, discovery, display', [
+      ['Project head', 'main.iter.md — the evolving project definition, FIRST file in every agent context (its frontmatter keys become {placeholders})',
+        ['projectname','projectdescription','globalcontextfiles'].map(psi)],
+      ['Discovery', 'The server half — .iter/config.iter.json: where the head lives, what gets scanned',
+        ['topdir','mainfile','iterglob','globalscandirs','url_slug'].map(psi)],
+      ['Global dirs & creation defaults', 'Where interfaces and use-cases live ({interfaces} / {usecases}), and the context new work items start with',
+        ['globalinterfacedir','globalusecasedir','default_context'].map(psi)],
+      ['Display', 'Timestamp display',
+        [cfg('globalsettings','user_timezone')]],
     ]],
   ];
 }
@@ -2176,8 +2167,15 @@ async function renderSettings(){
   const cfgVal = (section, key, fallback) =>
     live && live[section] && live[section][key] !== undefined ? live[section][key] : fallback;
   const psVal = (k, fallback) => {
-    if (!ps || ps[k] === undefined) return fallback;
-    return Array.isArray(ps[k]) ? ps[k].join('\n') : String(ps[k]);
+    // structureV2 head-file view: {server: {...}, project: {...}} (+ legacy aliases).
+    let v;
+    if (ps) {
+      if (ps.server && ps.server[k] !== undefined) v = ps.server[k];
+      else if (ps.project && ps.project[k] !== undefined) v = ps.project[k];
+      else if (ps[k] !== undefined) v = ps[k];
+    }
+    if (v === undefined || v === null || v === '') return fallback;
+    return Array.isArray(v) ? v.join('\n') : String(v);
   };
   const cfgRow = ({ section, key }) => {
     const [v, why] = CONFIG[section][key];
@@ -2201,23 +2199,24 @@ async function renderSettings(){
   };
   const row = (item) => item.src === 'cfg' ? cfgRow(item) : psRow(item);
   const legend = `<div class="sub" style="border:1px solid var(--border);border-radius:7px;padding:10px 12px;line-height:1.7">
-      <b>How iter files work:</b> any file matching <span class="mono">marker_glob</span> is iterapp-meaningful;
-      its <b>FILENAME declares its role</b> — the word right before <span class="mono">.iter.md</span> (any prefix allowed, e.g.
-      <span class="mono">gateway.marker.iter.md</span>):
-      <span class="mono">*marker.iter.md</span> → a node on the Projects map (frontmatter <span class="mono">level:</span> says which C4 level) ·
-      <span class="mono">*interface.iter.md</span> → a globally-aggregated interface contract ·
-      <span class="mono">*usecase.iter.md</span> → a use-case thread ·
-      <span class="mono">*testgroup.iter.md</span> → test definitions (owned via the marker's <span class="mono">testgroup:</span> key) ·
-      <span class="mono">*bizreq.iter.md</span> / <span class="mono">*techreq.iter.md</span> → requirement docs ·
-      any other name → a plain context doc. Stray frontmatter never changes a file's role — renaming the file is the only way.<br>
+      <b>How iter files work (structureV2):</b> any file matching <span class="mono">iterglob</span> is iterapp-meaningful;
+      its <b>FILENAME declares its nodetype</b> via the dot rule — <span class="mono">*.nodetype.iter.md</span>
+      (a dot before the nodetype unless the file has no prefix; lowercase):
+      <span class="mono">*.main.iter.md</span> → THE project head ·
+      <span class="mono">*.code.iter.md</span> → a code node (frontmatter <span class="mono">level:</span> = context | container | component) ·
+      <span class="mono">*.interface.iter.md</span> → a global interface contract ·
+      <span class="mono">*.usecase.iter.md</span> → a global use-case ·
+      <span class="mono">*.testgroup.iter.md</span> → test definitions (linked via <span class="mono">children.testgroups</span>) ·
+      <span class="mono">*.bizreq.iter.md</span> / <span class="mono">*.techreq.iter.md</span> → requirement docs ·
+      any other name → a plain context doc.<br>
+      <b>Nodes join the structure ONLY through explicit <span class="mono">children</span> links</b> (paths or globs;
+      directory nesting alone links nothing) — unlinked files land in the <b>Orphanage</b> on the Projects page.<br>
       <b>Placeholders in default_context:</b>
       <span class="mono">{marker}</span> = the clicked node’s own .iter.md file ·
-      <span class="mono">{ancestor_markers}</span> = markers of that node’s parent chain up to the project root ·
-      <span class="mono">{interfaces}</span> = the contract files for everything in the node’s uses:/provides: ·
-      <span class="mono">{codepath}</span> = the node’s directory (anchors a glob to the work item’s own tree) ·
-      <span class="mono">{reqs}</span> = the directory holding the global bizreq/techreq files
-      (<span class="mono">global_bizreq_path</span> / <span class="mono">global_techreq_path</span> settings, default <span class="mono">{codepath}/reqs/</span>;
-      exactly those two files are auto-surfaced to every agent — never the whole directory).
+      <span class="mono">{ancestor_markers}</span> = the node files of its parent chain ·
+      <span class="mono">{interfaces}</span> = the contract files for the node’s inputs/outputs ·
+      <span class="mono">{codepath}</span> = the node’s primary codedir ·
+      <span class="mono">{topdir}</span> = the project top directory.
     </div>`;
   // The Test group's one-click setup: a "Test Loop" scheduled workitem replaces
   // the old in-engine sweep loop and its config.json section. The knobs travel as
@@ -2230,7 +2229,7 @@ async function renderSettings(){
         One per project — the button refuses a duplicate.</div>
     </div></div>`;
   const groupHtml = ([name, sub, items]) => `<div class="setgroup"><h3>${name}</h3><div class="sub">${sub}</div>
-    ${name === 'Marker discovery' ? legend : ''}
+    ${name === 'Discovery' ? legend : ''}
     ${name === 'Test' ? testLoopSetup : ''}
     ${items.map(row).join('')}</div>`;
   const agentOptions = agents.map((a, i) =>
@@ -2267,7 +2266,8 @@ async function renderSettings(){
       <button class="btn primary" id="cfgSave">Save All</button>
     </div>
   </div>`;
-  wirePathHints('ps_scan_roots', 'ps_hint_scan_roots', null);
+  wirePathHints('ps_globalscandirs', 'ps_hint_globalscandirs', null);
+  wirePathHints('ps_globalcontextfiles', 'ps_hint_globalcontextfiles', null);
   wirePathHints('ps_default_context', 'ps_hint_default_context', null);
   $('setSearch').addEventListener('input', () => {
     const q = $('setSearch').value.trim().toLowerCase();
@@ -2324,18 +2324,19 @@ async function renderSettings(){
         input.dataset.bool === 'true' ? raw === 'true'
         : input.dataset.num === 'true' ? (Number(raw) || 0) : raw;
     });
-    const psOut = {};
+    const psOut = { server: {}, project: {} };
     document.querySelectorAll('[data-ps]').forEach(el => {
       const k = el.dataset.ps;
-      psOut[k] = PS_MULTILINE.includes(k)
+      const v = PS_MULTILINE.includes(k)
         ? el.value.split('\n').map(x => x.trim()).filter(Boolean)
         : el.value.trim();
+      (PS_SERVER.includes(k) ? psOut.server : psOut.project)[k] = v;
     });
     const applyTz = () => {
       USER_TZ = (cfgOut.globalsettings && cfgOut.globalsettings.user_timezone) || 'UTC';
       render();
     };
-    if (!LIVE) { applyTz(); toast('config.json + projects.json saved (mock) — engine applies config on its next tick'); return; }
+    if (!LIVE) { applyTz(); toast('config.json + head files saved (mock) — engine applies config on its next tick'); return; }
     Promise.all([
       api('/api/config', { method: 'PUT', body: JSON.stringify(cfgOut) }),
       api('/api/projectsettings', { method: 'PUT', body: JSON.stringify(psOut) }),
@@ -2354,7 +2355,7 @@ async function renderSettings(){
         for (const [k, [v]] of Object.entries(obj)) (defaults[section] = defaults[section] || {})[k] = v;
       }
       api('/api/config', { method: 'PUT', body: JSON.stringify(defaults) })
-        .then(() => { toast('Engine config reset to defaults and saved — projects.json untouched'); USER_TZ = 'UTC'; render(); renderSettings(); })
+        .then(() => { toast('Engine config reset to defaults and saved — head files untouched'); USER_TZ = 'UTC'; render(); renderSettings(); })
         .catch(e => toast('Reset failed: ' + e.message));
       return;
     }
@@ -2392,9 +2393,11 @@ async function renderSettings(){
 /* Fake scan results — in the wired version: GET /api/markers, built by scanning
    the configured roots for *.iter.md files, sorted into node / use-case / plain
    context by frontmatter (level: / participants: / neither). */
-const LEVELS = ['project','context','container','component'];
+const LEVELS = ['context','container','component'];
+let ORPHANS = [];
+let SCAN_NOTES = [];
 let MARKERS = [
-  { key:'',                              level:'project',   name:'Paydaay Core Product',            desc:'Wage-access platform: intake, novation, and payout orchestration', uses:[] },
+  { key:'',                              level:'context',   name:'Paydaay Core Product',            desc:'Wage-access platform: intake, novation, and payout orchestration', uses:[] },
   { key:'infra',                         level:'context',   name:'Shared Infrastructure',           desc:'Cross-product platform services shared by every container', uses:[] },
   { key:'infra/seccomm',                 level:'context',   name:'Security and Communications',     desc:'Identity, authorization, and edge traffic for all products', uses:[] },
   { key:'infra/seccomm/gateway',         level:'container', name:'API Gateway & JWTs (Kong)',       desc:'Single ingress; terminates TLS, mints and validates JWTs', uses:['kong','jwt'] },
@@ -2414,8 +2417,10 @@ let MARKERS = [
 MARKERS.forEach(m => {
   m.depth = m.key ? m.key.split('/').length : 0;
   m.dir = m.key ? `./${m.key}` : '.';
-  m.path = `${m.dir}/${(m.name.split(' ')[0] || 'node').toLowerCase().replace(/[^a-z0-9]/g,'')}.iter.md`;
+  m.path = `${m.dir}/${(m.name.split(' ')[0] || 'node').toLowerCase().replace(/[^a-z0-9]/g,'')}.code.iter.md`;
   m.provides = m.provides || [];
+  m.tsEff = 'included'; m.teststate = ''; m.testgroups = m.testgroups || [];
+  m.bizreqs = m.bizreqs || []; m.techreqs = m.techreqs || []; m.codedirs = [m.dir];
 });
 // mock interface stitching: provider/consumer ends referencing global interface ids
 MARKERS.find(m => m.key === 'core/intake/evidence-vault').provides = ['evidence-api'];
@@ -2503,6 +2508,13 @@ let USECASES = [
     body:'# Early payout\n\nA verified shift becomes an obligation, novates to the capital provider, and pays out over the selected rail.' },
 ];
 
+USECASES.forEach(u => {
+  u.codenode_keys = u.codenode_keys || Object.keys(u.steps || {});
+  u.codenodes = u.codenodes || [];
+  u.teststate = u.teststate || '';
+});
+INTERFACES.forEach(i => { i.teststate = i.teststate || ''; });
+
 let projUC = -1;          // -1 = no use-case filter
 let projIface = '';       // '' = no interface thread; else an interface id
 let openIface = -1;       // index into INTERFACES of the expanded contract row
@@ -2517,14 +2529,20 @@ async function loadProjects(){
   const scan = await api('/api/markers');
   MARKERS = scan.nodes.map(n => ({
     key: n.key, level: n.level || 'node', name: n.name, desc: n.description,
-    uses: n.uses || [], provides: n.provides || [], depth: n.depth,
+    uses: n.inputs || [], provides: n.outputs || [], depth: n.depth,
+    parent: n.parent || '', parents: n.parents || [],
     dir: n.dir, path: n.path, body: n.body || '',
-    testgroup: n.testgroup || '', test_dir: n.test_dir || '', test_loop: n.test_loop || '',
-    bizreq: n.bizreq || '', techreq: n.techreq || '',
+    codedirs: n.codedirs || [], codenodes: n.codenodes || [],
+    testgroups: n.testgroups || [], teststate: n.teststate || '',
+    tsEff: n.teststate_effective || 'included',
+    bizreqs: n.bizreqs || [], techreqs: n.techreqs || [],
   }));
-  USECASES = scan.usecases.map(u => ({ name: u.name, desc: u.description, file: u.file, steps: u.steps,
-    participants: u.participants || [], body: u.body || '', test_loop: u.test_loop || '' }));
-  INTERFACES = scan.interfaces.map(i => ({ id: i.id, kind: i.kind, endpoint: i.endpoint, description: i.description, file: i.file, body: i.body || '', test_loop: i.test_loop || '' }));
+  USECASES = scan.usecases.map(u => ({ name: u.name, desc: u.description, file: u.file,
+    codenodes: u.codenodes || [], codenode_keys: u.codenode_keys || [],
+    body: u.body || '', teststate: u.teststate || '' }));
+  INTERFACES = scan.interfaces.map(i => ({ id: i.id, kind: i.kind, endpoint: i.endpoint, description: i.description, file: i.file, body: i.body || '', teststate: i.teststate || '' }));
+  ORPHANS = scan.orphans || [];
+  SCAN_NOTES = scan.notes || [];
   projLoaded = true;
   return scan;
 }
@@ -2539,37 +2557,29 @@ function ifaceTouches(m, id){
   return (m.uses || []).includes(id) || (m.provides || []).includes(id);
 }
 
-/* Test-Loop gate (test_loop_flag.md) — client mirror of the engine's resolver:
-   blocked anywhere on the ancestor chain wins; else the NEAREST explicit
-   omit/include walking up decides; no flag anywhere = included. */
+/* teststate gate (structureV2) — the ENGINE resolves DAG ancestry and sends
+   teststate_effective with every node; this just parses it. */
 function effTestLoop(m){
-  const chain = MARKERS
-    .filter(n => n.key === m.key || n.key === '' || m.key.startsWith(n.key + '/'))
-    .sort((a,b) => b.key.length - a.key.length);
-  const blocked = chain.find(n => (n.test_loop || '').trim() === 'blocked');
-  if (blocked) return { state: 'omitted', value: 'blocked', by: blocked.key || '.' };
-  for (const n of chain) {
-    const v = (n.test_loop || '').trim();
-    if (v === 'omit') return { state: 'omitted', value: 'omit', by: n.key || '.' };
-    if (v === 'include') return { state: 'included' };
-  }
-  return { state: 'included' };
+  const eff = (m.tsEff || 'included').trim();
+  if (eff === 'included' || eff === '') return { state: 'included' };
+  const mm = eff.match(/^(\w+)\s+via\s+(.*)$/);
+  return { state: 'omitted', value: mm ? mm[1] : eff, by: mm ? mm[2] : '' };
 }
 
 function tlBadge(tl){
   if (tl.state !== 'omitted') return '';
-  const hard = tl.value === 'blocked';
+  const hard = tl.value === 'block' || tl.value === 'blocked';
   return `<span class="useb" style="background:var(--s-paused-bg);color:#fff"
-    title="Omitted from the Test Loop (test_loop: ${esc(tl.value)}${tl.by ? ' via ' + esc(tl.by) : ''})${hard ? ' — BLOCKED: outside/vendor setup missing; only editing the marker file lifts it' : ' — the sweep skips this object; agents may re-include it'}">⛔ ${hard ? 'blocked' : 'no test loop'}</span>`;
+    title="Omitted from the Test Loop (teststate: ${esc(tl.value)}${tl.by ? ' via ' + esc(tl.by) : ''})${hard ? ' — BLOCKED: outside/vendor setup missing; only editing the node file lifts it' : ' — the sweep skips this object; agents may re-include it'}">⛔ ${hard ? 'blocked' : 'no test loop'}</span>`;
 }
 
-/* The engine-owned toggle: POST /api/testloop shares `iter testloop`'s edit +
-   refusal rules (a blocked flag refuses everything but a human file edit). */
+/* The engine-owned toggle: POST /api/teststate shares `iter teststate`'s edit +
+   refusal rules (a block flag refuses everything but a human file edit). */
 async function tlApply(action, target){
-  if (!LIVE) { toast(`Mock mode — would set test_loop ${action} on ${target}`); return; }
+  if (!LIVE) { toast(`Mock mode — would set teststate ${action} on ${target}`); return; }
   try {
-    const r = await api('/api/testloop', { method: 'POST', body: JSON.stringify({ target, action }) });
-    toast(r.summary || `test_loop ${action} applied`);
+    const r = await api('/api/teststate', { method: 'POST', body: JSON.stringify({ target, action }) });
+    toast(r.summary || `teststate ${action} applied`);
     projLoaded = false;
     await renderProjects();
   } catch (e) { toast('Test loop: ' + e.message); }
@@ -2577,13 +2587,13 @@ async function tlApply(action, target){
 
 function tlButtons(ref, own, effOmitted){
   own = (own || '').trim();
-  if (own === 'blocked') {
-    return `<span class="useb" title="test_loop: blocked — outside/vendor setup missing. Agent-proof: only a human editing the file lifts it.">⛔ blocked (edit the file to lift)</span>`;
+  if (own === 'block' || own === 'blocked') {
+    return `<span class="useb" title="teststate: block — outside/vendor setup missing. Agent-proof: only a human editing the file lifts it.">⛔ blocked (edit the file to lift)</span>`;
   }
   return (effOmitted
       ? `<button class="btn" data-tlact="include" data-tlref="${esc(ref)}" title="Re-enter the Test Loop (works under an omitted ancestor — nearest flag wins)">Include in Test Loop</button>`
       : `<button class="btn" data-tlact="omit" data-tlref="${esc(ref)}" title="Park this out of the Test Loop — the sweep skips it (and everything beneath it) until re-included">Omit from Test Loop</button>`)
-    + (own ? `<button class="btn" data-tlact="clear" data-tlref="${esc(ref)}" title="Remove this file's own test_loop flag; ancestors/default apply again">Clear flag</button>` : '')
+    + (own && own !== 'inherit' ? `<button class="btn" data-tlact="clear" data-tlref="${esc(ref)}" title="Remove this file's own teststate flag; ancestors/default apply again">Clear flag</button>` : '')
     + `<button class="btn" data-tlact="block" data-tlref="${esc(ref)}" title="Hard park: outside/vendor setup missing. Agents cannot re-include it — only a human editing the file can.">Block (vendor)</button>`;
 }
 
@@ -2609,7 +2619,7 @@ async function renderProjects(){
   const rows = orderedMarkers()
     .filter(m => projDepth === null || LEVELS.indexOf(m.level) <= projDepth)
     .map(m => {
-      const step = uc ? uc.steps[m.key]
+      const step = uc ? ((uc.codenode_keys || []).includes(m.key) ? '•' : '')
         : (projIface && ifaceTouches(m, projIface)
             ? (m.provides.includes(projIface) ? 'prov' : 'uses') : '');
       const dim = threaded && !step;
@@ -2627,14 +2637,14 @@ async function renderProjects(){
       </div>
       ${open ? `<div class="pdetail">
         ${c4DetailRows(m)}
-        <div class="dlabel">Use-cases</div><div>${USECASES.filter(u=>u.steps[m.key]).map(u=>`${esc(u.name)} <b class="mono">(${u.steps[m.key]})</b>`).join('<br>') || '<span style="color:var(--text-dim)">not a participant</span>'}</div>
+        <div class="dlabel">Use-cases</div><div>${USECASES.filter(u=>(u.codenode_keys||[]).includes(m.key)).map(u=>esc(u.name)).join('<br>') || '<span style="color:var(--text-dim)">not linked from any use-case</span>'}</div>
         <div class="actions">
           <button class="btn primary" data-mkworkitem="${esc(m.path)}">Create WorkItem here</button>
           <button class="btn" data-reqlb="bizreq" data-node="${esc(m.path)}">Biz Requirements</button>
           <button class="btn" data-reqlb="techreq" data-node="${esc(m.path)}">Tech Requirements</button>
           <button class="btn" data-testlb data-node="${esc(m.path)}">Testing</button>
           <button class="btn" data-viewmarker="${esc(m.path)}">View Marker File</button>
-          ${tlButtons(m.path, m.test_loop, tl.state === 'omitted')}
+          ${tlButtons(m.path, m.teststate, tl.state === 'omitted')}
         </div>
       </div>` : ''}`;
     }).join('');
@@ -2665,7 +2675,7 @@ async function renderProjects(){
       <div class="dlabel">Consumers</div><div>${consumers.length ? consumers.map(m => `<span class="useb">${esc(m.name)}</span>`).join(' ') : '<span style="color:var(--text-dim)">none declared</span>'}</div>
       <div class="dlabel">Contract</div>
       <div class="textblock mono" style="max-height:60vh">${esc(i.body || '(no contract body in the marker yet — the file is frontmatter only)')}</div>
-      <div class="actions">${tlButtons(i.file, i.test_loop, ['omit','blocked'].includes((i.test_loop || '').trim()))}</div>
+      <div class="actions">${tlButtons(i.file, i.teststate, ['omit','block','blocked'].includes((i.teststate || '').trim()))}</div>
     </div>` : ''}`;
   }).join('');
 
@@ -2674,36 +2684,54 @@ async function renderProjects(){
   const ucRows = USECASES.map((u, idx) => {
     const on = projUC === idx;
     const open = openUC === idx;
-    const plist = (u.participants || []).map(line => {
-      const sp = line.trim().split(/\s+/);
-      const step = sp[0] || '';
-      const key = (sp.slice(1).join(' ') || '') === '.' ? '' : sp.slice(1).join(' ');
-      const node = MARKERS.find(m => m.key === key);
-      return `<div><b class="mono">${esc(step)}</b> ${node ? esc(node.name) : `<span class="mono">${esc(key || '(project root)')}</span>`}
-        <span class="mono" style="color:var(--text-dim)">${node ? '· ' + esc(key || '(project root)') : key ? '— no node with this key' : ''}</span></div>`;
+    const plist = (u.codenodes || []).map((path, pi) => {
+      const key = (u.codenode_keys || [])[pi];
+      const node = key !== undefined ? MARKERS.find(m => m.key === key) : null;
+      return `<div>${node ? esc(node.name) : `<span class="mono">${esc(path)}</span>`}
+        <span class="mono" style="color:var(--text-dim)">${node ? '· ' + esc(key) : '— resolves to no linked code node'}</span></div>`;
     }).join('');
-    const utl = (u.test_loop || '').trim();
-    const uOmit = utl === 'omit' || utl === 'blocked';
+    const utl = (u.teststate || '').trim();
+    const uOmit = utl === 'omit' || utl === 'block' || utl === 'blocked';
     return `<div class="prow ${on?'participant':''}" data-ucrow="${idx}" role="button" tabindex="0"
         aria-expanded="${open}" title="Click to expand and thread this use-case's participants in the tree">
       <span class="chev">${open ? '▾' : '▸'}</span>
       <span class="pname">${esc(u.name)}</span>
       ${uOmit ? tlBadge({ state: 'omitted', value: utl, by: '' }) : ''}
       <span class="pdesc">${esc(u.desc)}</span>
-      <span class="uses"><span class="useb">${Object.keys(u.steps || {}).length} participant${Object.keys(u.steps || {}).length===1?'':'s'}</span></span>
+      <span class="uses"><span class="useb">${(u.codenodes || []).length} code node${(u.codenodes || []).length===1?'':'s'}</span></span>
     </div>
     ${open ? `<div class="pdetail">
       <div class="dlabel">File</div><div class="mono">${esc(u.file)}</div>
-      <div class="dlabel">Participants</div><div>${plist || '<span style="color:var(--text-dim)">none</span>'}</div>
+      <div class="dlabel">Code nodes</div><div>${plist || '<span style="color:var(--text-dim)">none linked yet — an Ingest agent (or Edit) fills codenodes</span>'}</div>
       <div class="dlabel">Story</div>
       <div class="textblock" style="max-height:50vh">${esc(u.body || '(no body yet — click Edit to write the narrative)')}</div>
       <div class="actions">
         <button class="btn primary" data-ucedit="${idx}">Edit</button>
         <button class="btn" data-ucdel="${idx}">Delete</button>
-        ${tlButtons(u.file, u.test_loop, uOmit)}
+        ${tlButtons(u.file, u.teststate, uOmit)}
       </div>
     </div>` : ''}`;
   }).join('');
+
+  // Orphanage rows: per orphan, a parent picker (code nodes + use cases +
+  // interfaces) and a Link button — POST /api/orphans/link appends the file to
+  // the parent's matching children sub-key.
+  const parentOptions = [
+    ...MARKERS.map(m => `<option value="${esc(m.key)}">${esc(m.level)}: ${esc(m.name)} (${esc(m.key)})</option>`),
+    ...USECASES.map(u => `<option value="${esc(u.file)}">usecase: ${esc(u.name)}</option>`),
+    ...INTERFACES.map(i => `<option value="${esc(i.file)}">interface: ${esc(i.id)}</option>`),
+  ].join('');
+  const orphanRows = (ORPHANS || []).map((o, oi) => `
+    <div class="prow" style="cursor:default">
+      <span class="lvltag" style="background:var(--s-paused-bg);color:#fff">${esc(o.role)}</span>
+      <span class="pname mono" style="font-size:12px">${esc(o.path)}</span>
+      <span class="pdesc">${esc(o.reason)}</span>
+      <span class="uses" style="display:flex;gap:6px;align-items:center">
+        <select data-orphansel="${oi}" style="max-width:260px">${parentOptions}</select>
+        <button class="btn" data-orphanlink="${oi}" title="Add this file to the selected parent's children links">Link</button>
+        <button class="btn" data-viewmarker-path="${esc(o.path)}" title="View the file">View</button>
+      </span>
+    </div>`).join('');
 
   $('view-projects').innerHTML = `
     <div class="projtools">
@@ -2718,21 +2746,24 @@ async function renderProjects(){
           <option value="level" ${projOrder==='level'?'selected':''}>Level</option>
           <option value="name" ${projOrder==='name'?'selected':''}>Name</option>
         </select></label>
-      <button class="btn" id="rescan" style="margin-left:auto">Rescan Markers</button>
+      <button class="btn" id="rescan" style="margin-left:auto">Rescan</button>
     </div>
     ${uc ? `<div class="sub" style="color:var(--text-dim);margin:0 0 8px;font-size:12.5px"><b style="color:var(--thread)">USE-CASE:</b> ${esc(uc.desc)} · participants numbered, others dimmed · <span class="mono">${esc(uc.file)}</span></div>` : ''}
     ${projIface ? `<div class="sub" style="color:var(--text-dim);margin:0 0 8px;font-size:12.5px"><b style="color:var(--thread)">INTERFACE THREAD:</b> <span class="mono">${esc(projIface)}</span> · ▲ providers and consumers highlighted — a derived thread, no authoring needed · click the interface again to clear</div>` : ''}
     <div class="legendbar">
       ${LEVELS.map((l,i) => `<button class="lvlchip ${projDepth===i?'active':''}" data-depth="${i}"
         style="background:var(--lvl-${l}-bg);color:var(--lvl-${l}-fg)">${l} · ${counts[i]}</button>`).join('')}
-      <span class="lhint">click a level to collapse below it · nodes: <span class="mono">**/*marker.iter.md</span> (level: in frontmatter says which C4 level)</span>
+      <span class="lhint">click a level to collapse below it · nodes: <span class="mono">*.code.iter.md</span> linked by <span class="mono">children.codenodes</span> (contexts attach to the head)</span>
     </div>
-    <div class="ptree">${rows || '<div class="empty">No markers found — check scan roots in Settings.</div>'}</div>
-    <h3 style="margin:16px 0 6px;font-size:13.5px">Interfaces <span style="color:var(--text-dim);font-weight:500;font-size:12px">— global: aggregated across all scan roots, referenced by nodes via <span class="mono">provides:</span> / <span class="mono">uses:</span>, never owned by the tree</span></h3>
-    <div class="ptree">${ifaceRows || '<div class="empty">No interfaces declared yet — add a marker with <span class="mono">interface:</span> frontmatter.</div>'}</div>
-    <h3 style="margin:16px 0 6px;font-size:13.5px">Use-Cases <span style="color:var(--text-dim);font-weight:500;font-size:12px">— <span class="mono">participants:</span> markers threading scenarios through the tree; one-way, nodes never mention them</span>
+    <div class="ptree">${rows || '<div class="empty">No code nodes found — check globalscandirs in Settings, and the Orphanage below for unlinked files.</div>'}</div>
+    <h3 style="margin:16px 0 6px;font-size:13.5px">Interfaces <span style="color:var(--text-dim);font-weight:500;font-size:12px">— global objects under <span class="mono">{interfaces}</span>, linked from code nodes via <span class="mono">children.inputs</span> / <span class="mono">children.outputs</span></span></h3>
+    <div class="ptree">${ifaceRows || '<div class="empty">No interfaces declared yet — add a <span class="mono">*.interface.iter.md</span> under the interfaces dir.</div>'}</div>
+    <h3 style="margin:16px 0 6px;font-size:13.5px">Use-Cases <span style="color:var(--text-dim);font-weight:500;font-size:12px">— global objects under <span class="mono">{usecases}</span>, linked to code via <span class="mono">children.codenodes</span> (required key; may start empty)</span>
       <button class="btn" data-ucnew style="float:right;margin-top:-4px">New Use-Case</button></h3>
-    <div class="ptree">${ucRows || '<div class="empty">No use-cases yet — click New Use-Case, or drop a marker with <span class="mono">participants:</span> frontmatter anywhere in the tree.</div>'}</div>`;
+    <div class="ptree">${ucRows || '<div class="empty">No use-cases yet — click New Use-Case.</div>'}</div>
+    <h3 style="margin:16px 0 6px;font-size:13.5px">Orphanage <span style="color:var(--text-dim);font-weight:500;font-size:12px">— files matching the naming rules that NO children link claims; link them to a parent, leave them, or retire them (a daily scheduled workitem also reviews this list)</span></h3>
+    <div class="ptree">${orphanRows || '<div class="empty">Empty — every discovered node file is linked into the DAG.</div>'}</div>
+    ${SCAN_NOTES.length ? `<div class="sub" style="color:var(--s-paused-bg);margin-top:8px;font-size:12px">Scan notes:<br>${SCAN_NOTES.map(esc).join('<br>')}</div>` : ''}`;
 
   $('projUc').addEventListener('change', e => { projUC = +e.target.value; projIface = ''; openIface = -1; renderProjects(); });
   $('projOrder').addEventListener('change', e => { projOrder = e.target.value; renderProjects(); });
@@ -2742,7 +2773,7 @@ async function renderProjects(){
       const scan = await api('/api/markers/rescan', { method: 'POST' });
       projLoaded = false;
       await renderProjects();
-      toast(`Scanned ${scan.roots.length} root(s): ${scan.nodes.length} nodes, ${scan.interfaces.length} interfaces, ${scan.usecases.length} use-cases, ${scan.plain.length} plain docs`);
+      toast(`Scanned ${scan.roots.length} root(s): ${scan.nodes.length} nodes, ${scan.interfaces.length} interfaces, ${scan.usecases.length} use-cases, ${scan.plain.length} plain docs, ${(scan.orphans||[]).length} orphan(s)`);
     } catch (e) { toast('Rescan failed: ' + e.message); }
   });
 }
@@ -2759,18 +2790,18 @@ function markerAncestors(key){
    default {codepath}/usecases/). */
 function ucForm(idx){
   const u = idx >= 0 ? USECASES[idx]
-    : { name:'', desc:'', file:'', participants:[], body:'' };
+    : { name:'', desc:'', file:'', codenodes:[], body:'' };
   openLb(idx >= 0 ? 'Edit Use-Case — ' + u.name : 'New Use-Case', `
     <div class="form">
       <span class="flabel">Name</span>
       <input type="text" id="uc_name" value="${esc(u.name)}" placeholder="Worker requests early wage payout">
       <span class="flabel">Description</span>
       <input type="text" id="uc_desc" value="${esc(u.desc)}" placeholder="one line: what happens, end to end">
-      <span class="flabel top-align">Participants</span>
+      <span class="flabel top-align">Code nodes</span>
       <div>
         <textarea id="uc_parts" rows="5" class="mono" style="width:100%"
-          placeholder="one per line: <step> <node key>   e.g.&#10;1 infra/gateway&#10;2.1 core/intake">${esc((u.participants||[]).join('\n'))}</textarea>
-        <div class="pathhint" style="opacity:.75">step numbers order the thread; the node key is the marker's directory relative to the project root (<span class="mono">.</span> = project root). Optional — the filename (*usecase.iter.md) is what makes it a use-case; participants only thread it through the tree.</div>
+          placeholder="one *.code.iter.md path per line   e.g.&#10;{topdir}/core/intake/intake.code.iter.md">${esc((u.codenodes||[]).join('\n'))}</textarea>
+        <div class="pathhint" style="opacity:.75">the REQUIRED children.codenodes link list — the code node files this journey needs. May start empty; agents can fill it later (via <span class="mono">iter usecase --add</span>).</div>
       </div>
       <span class="flabel top-align">Story</span>
       <textarea id="uc_body" rows="9" placeholder="The narrative: what happens at each step, requirements it exercises, edge cases.">${esc(u.body)}</textarea>
@@ -2782,11 +2813,11 @@ function ucForm(idx){
     const payload = {
       name: $('uc_name').value.trim(),
       description: $('uc_desc').value.trim(),
-      participants: $('uc_parts').value.split('\n').map(s=>s.trim()).filter(Boolean),
+      codenodes: $('uc_parts').value.split('\n').map(s=>s.trim()).filter(Boolean),
       body: $('uc_body').value,
     };
     if (!payload.name) { toast('A use-case needs a name'); return; }
-    // Participants are optional: the filename (*usecase.iter.md) declares the role.
+    // codenodes may be empty: the REQUIRED key is written either way.
     if (!LIVE) { toast('Mock mode — nothing saved'); closeLb(); return; }
     if (idx >= 0) payload.file = u.file;
     try {
@@ -2814,6 +2845,26 @@ async function ucDelete(idx){
 }
 
 function projClick(e){
+  const ol = e.target.closest('[data-orphanlink]');
+  if (ol) {
+    const oi = +ol.dataset.orphanlink;
+    const sel = document.querySelector(`[data-orphansel="${oi}"]`);
+    const o = ORPHANS[oi];
+    if (!o || !sel) return true;
+    if (!LIVE) { toast('Mock mode — nothing linked'); return true; }
+    api('/api/orphans/link', { method:'POST', body: JSON.stringify({ orphan: o.path, parent: sel.value }) })
+      .then(r => { toast(`Linked into ${r.key} of ${r.parent.split('/').pop()}`); projLoaded = false; renderProjects(); })
+      .catch(err => toast('Link failed: ' + err.message));
+    return true;
+  }
+  const ov = e.target.closest('[data-viewmarker-path]');
+  if (ov) {
+    if (!LIVE) { toast('Mock mode'); return true; }
+    api('/api/file/read', { method:'POST', body: JSON.stringify({ path: ov.dataset.viewmarkerPath }) })
+      .then(f => openLb('File — ' + f.path, `<div class="textblock mono" style="max-height:66vh">${esc(f.content)}</div>`))
+      .catch(err => toast('Read failed: ' + err.message));
+    return true;
+  }
   const tla = e.target.closest('[data-tlact]');
   if (tla) { tlApply(tla.dataset.tlact, tla.dataset.tlref); return true; }
   const mk_ = e.target.closest('[data-mkworkitem]');
@@ -2830,8 +2881,8 @@ function projClick(e){
         .forEach(i => ctx.push(i.file));
       else ctx.push(line);
     }
-    openForm('create', mk({ codepath: m.dir, context: [...new Set(ctx)],
-      testfiles: m.testgroup ? [`${m.dir}/${m.testgroup}`] : [], title: '', mainwork: '', source: 'user' }));
+    openForm('create', mk({ codepath: (m.codedirs && m.codedirs[0]) || m.dir, context: [...new Set(ctx)],
+      testfiles: (m.testgroups || []).slice(), title: '', mainwork: '', source: 'user' }));
     return true;
   }
   const ifr = e.target.closest('[data-ifacerow]');
@@ -2873,14 +2924,14 @@ function projClick(e){
     const m = markerByRef(vm.dataset.viewmarker);
     if (m.body) {
       // LIVE (or any marker whose body we hold): show the real file content.
-      const front = `---\nname: ${m.name}\nlevel: ${m.level}\ndescription: "${m.desc}"` +
-        (m.provides.length ? `\nprovides: [${m.provides.join(', ')}]` : '') +
-        (m.uses.length ? `\nuses: [${m.uses.join(', ')}]` : '') + '\n---\n\n';
-      openLb('Marker — ' + m.path,
+      const front = `---\nname: "${m.name}"\nlevel: ${m.level}\ndescription: "${m.desc}"` +
+        (m.provides.length ? `\n# outputs: [${m.provides.join(', ')}]` : '') +
+        (m.uses.length ? `\n# inputs: [${m.uses.join(', ')}]` : '') + '\n---\n\n';
+      openLb('Node — ' + m.path,
         `<div class="textblock mono" style="max-height:66vh">${esc(front + m.body)}</div>`);
       return true;
     }
-    openLb('Marker — ' + m.path, `<div class="textblock mono" style="max-height:60vh">${esc(
+    openLb('Node — ' + m.path, `<div class="textblock mono" style="max-height:60vh">${esc(
 `---
 name: ${m.name}
 level: ${m.level}
@@ -2946,8 +2997,8 @@ function refBtn(name){
 function upBoxesHtml(m){
   const none = '<span style="color:var(--text-dim);font-size:12px">—</span>';
   return `<div class="upgrid">
-    <div class="upbox"><div class="uphead">uses</div>${(m.uses||[]).map(refBtn).join('') || none}</div>
-    <div class="upbox"><div class="uphead">provides</div>${(m.provides||[]).map(refBtn).join('') || none}</div>
+    <div class="upbox"><div class="uphead">inputs</div>${(m.uses||[]).map(refBtn).join('') || none}</div>
+    <div class="upbox"><div class="uphead">outputs</div>${(m.provides||[]).map(refBtn).join('') || none}</div>
   </div>`;
 }
 
@@ -2960,9 +3011,9 @@ function c4DetailRows(m){
     <div class="dlabel">Long desc</div>
     <div><div class="longdesc ${ld?'':'tbd'}">${esc(ld || 'TBD — this marker has no Long Description yet. Click Edit to write one: plain language, no jargon, acronyms defined on first use ("three letter acronym (TLA)").')}</div>
       <button class="btn" style="margin-top:6px" data-editlong="${esc(m.path)}">Edit Long Description</button></div>
-    <div class="dlabel">Marker</div><div class="mono">${esc(m.path)}</div>
-    <div class="dlabel">CodePath</div><div class="mono">${esc(absCodepath(m.dir))}</div>
-    <div class="dlabel">Uses / Provides</div><div>${upBoxesHtml(m)}</div>`;
+    <div class="dlabel">Node file</div><div class="mono">${esc(m.path)}</div>
+    <div class="dlabel">CodeDirs</div><div class="mono">${esc((m.codedirs && m.codedirs.length ? m.codedirs : [absCodepath(m.dir)]).join(' · '))}</div>
+    <div class="dlabel">Inputs / Outputs</div><div>${upBoxesHtml(m)}</div>`;
 }
 
 /* ------------------------- breadcrumb lightbox stack (replace, don't stack) */
@@ -3054,24 +3105,28 @@ async function reqLb(ref, kind){
   const m = markerByRef(ref);
   if (!m) return;
   const label = kind === 'bizreq' ? 'Business Requirements' : 'Technical Requirements';
-  // The marker file may declare where its requirement files live; fall back to
-  // the conventional name beside the marker.
-  const declared = kind === 'bizreq' ? m.bizreq : m.techreq;
-  const localPath = absCodepath(m.dir) + '/' + (declared || kind + '.iter.md');
-  const globalPath = (kind === 'bizreq' ? GLOBAL_BIZREQ : GLOBAL_TECHREQ) || '(global path unknown — mock mode)';
+  // The node's children links resolve its requirement files; fall back to the
+  // conventional default beside the node file.
+  const declaredList = kind === 'bizreq' ? (m.bizreqs || []) : (m.techreqs || []);
+  const localPath = declaredList[0] || (absCodepath(m.dir) + '/' + kind + '.iter.md');
+  const globalFiles = (CONTEXT_FILES || []);
+  const globalPath = MAINFILE ? MAINFILE + (globalFiles.length > 1 ? ` (+${globalFiles.length - 1} context file${globalFiles.length > 2 ? 's' : ''})` : '') : '(mock mode)';
   let local = { content: '', exists: false };
   let globalTxt = '';
   if (LIVE) {
     try { const r = await api('/api/file/read', { method:'POST', body: JSON.stringify({ path: localPath }) }); local = { content: r.content, exists: true }; } catch (e) {}
-    try { const g = await api('/api/file/read', { method:'POST', body: JSON.stringify({ path: globalPath }) }); globalTxt = g.content; } catch (e) { globalTxt = '(no global file found at this path)'; }
+    for (const gf of globalFiles) {
+      try { const g = await api('/api/file/read', { method:'POST', body: JSON.stringify({ path: gf }) }); globalTxt += `===== ${gf} =====\n` + g.content + '\n\n'; } catch (e) {}
+    }
+    if (!globalTxt) globalTxt = '(no global context files resolve — set globalcontextfiles in Settings)';
   } else { globalTxt = '(mock mode — open via iter start for live content)'; }
   lbNav({ label, title: `${label} — ${m.name}`,
     build: () => `
       <div class="reqpathrow"><span><b>LOCAL — specific to this ${esc(m.level)}</b> (editable): <span class="mono">${esc(localPath)}</span>${local.exists ? '' : ' — <i>does not exist yet; saving creates it</i>'}</span></span></div>
       <textarea id="reqLocal" class="reqlocal">${esc(local.content)}</textarea>
       <div class="reqpathrow" title="drag the bottom edge of the box above to adjust the boundary">
-        <span><b>GLOBAL — generic, project-wide</b> (read-only): <span class="mono">${esc(globalPath)}</span></span>
-        <span>global requirements are edited on disk, deliberately — this path is shown so they’re easy to find</span></div>
+        <span><b>GLOBAL — the project head + context files</b> (read-only): <span class="mono">${esc(globalPath)}</span></span>
+        <span>main.iter.md is edited in Settings; global context files are edited on disk, deliberately</span></div>
       <div class="reqglobal">${esc(globalTxt)}</div>`,
     foot: `<button class="btn" data-lbclose>Close</button>
            <button class="btn primary" id="reqSave">Save Local ${esc(kind)}.iter.md</button>`,
@@ -3109,7 +3164,7 @@ async function testingLb(ref){
   tg.missing = mine.filter(f => f.missing);
   tg.entries = mine
     .filter(f => !f.missing)
-    .flatMap(f => f.groups.map(g => ({ ...g, file: f.file, test_dir: f.test_dir, c4_key: f.c4_key, c4_name: f.c4_name, test_loop: f.test_loop })));
+    .flatMap(f => f.groups.map(g => ({ ...g, file: f.file, test_dir: f.test_dir, c4_key: f.c4_key, c4_name: f.c4_name, teststate: f.teststate })));
   tg.orphans = data.orphans || [];
   tg.undeclared = data.undeclared || [];
   tg.sel = 0; tg.logOpen = null;
@@ -3128,15 +3183,15 @@ async function tgLoadRuns(){
 function tgNotesHtml(){
   let out = '';
   for (const f of (tg.missing || [])) {
-    out += `<p style="color:var(--s-failed-bg);font-size:12px;margin:8px 0 0">${esc(f.c4_name)}'s marker file declares
-      <span class="mono">${esc(f.file)}</span> but the file does not exist — a testwriter item should create it.</p>`;
+    out += `<p style="color:var(--s-failed-bg);font-size:12px;margin:8px 0 0">${esc(f.c4_name)}'s children.testgroups link resolves to
+      <span class="mono">${esc(f.file)}</span> but no file matches — a testwriter item should create it.</p>`;
   }
   if (!tg.node && (tg.undeclared || []).length) {
-    out += `<p style="color:var(--text-dim);font-size:12px;margin:8px 0 0">${tg.undeclared.length} C4 object(s) have no
-      <span class="mono">testgroup:</span> key in their marker file — deliberately outside the sweep.</p>`;
+    out += `<p style="color:var(--text-dim);font-size:12px;margin:8px 0 0">${tg.undeclared.length} code node(s) resolve no
+      <span class="mono">children.testgroups</span> files — deliberately outside the sweep.</p>`;
   }
   if (!tg.node && (tg.orphans || []).length) {
-    out += `<p style="color:var(--s-paused-bg);font-size:12px;margin:8px 0 0">Unowned (no marker file declares them):
+    out += `<p style="color:var(--s-paused-bg);font-size:12px;margin:8px 0 0">Orphaned (no node's children link claims them):
       <span class="mono">${tg.orphans.map(esc).join(' · ')}</span></p>`;
   }
   return out;
@@ -3144,10 +3199,10 @@ function tgNotesHtml(){
 
 function tgBuild(){
   if (!tg.entries.length) {
-    return `<p style="color:var(--text-dim)">No declared testgroups found${tg.node ? ' for ' + esc(tg.node.name) : ''}.
-      A C4 object's marker file names its testgroup.iter.md with a <span class="mono">testgroup:</span> frontmatter
-      key — no key means deliberately untested. The plan agent writes the definitions; the testwriter registers the
-      tests (and adds the key + file when missing).</p>` + tgNotesHtml();
+    return `<p style="color:var(--text-dim)">No linked testgroups found${tg.node ? ' for ' + esc(tg.node.name) : ''}.
+      A node's <span class="mono">children.testgroups</span> links name its testgroup files — a link matching nothing
+      means deliberately untested. The plan agent writes the definitions; the testwriter registers the
+      tests (creating files where the links will find them).</p>` + tgNotesHtml();
   }
   const e = tgEntrySel();
   const left = tg.entries.map((g, i) => `
@@ -3171,7 +3226,7 @@ function tgBuild(){
         <span class="chip" style="background:${tgResultColor(e.result)};color:#fff">${esc(e.result || 'never run')}</span>
         <span class="chip kv mono">${esc(e.counts || '–')}</span>
         <span class="chip meta mono">last run: <b>${e.lastrun ? esc(fmtTs(e.lastrun)) : '—'}</b></span>
-        ${e.test_loop && e.test_loop.state === 'omitted' ? `<span class="chip" style="background:var(--s-paused-bg);color:#fff" title="Parked by test_loop: ${esc(e.test_loop.value)}${e.test_loop.by ? ' via ' + esc(e.test_loop.by) : ''} — the sweep skips this group and auto-closes its unstarted fix items">⛔ omitted from test loop</span>` : ''}
+        ${e.teststate && e.teststate.state === 'omitted' ? `<span class="chip" style="background:var(--s-paused-bg);color:#fff" title="Parked by teststate: ${esc(e.teststate.value)}${e.teststate.by ? ' via ' + esc(e.teststate.by) : ''} — the sweep skips this group and auto-closes its unstarted fix items">⛔ omitted from test loop</span>` : ''}
         ${openItem ? `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="An open work item exists for this group (dedup guard active)">fix item: ${esc(openItem.state)} · ${esc(shortId(openItem))}</span>` : ''}
       </p>
       <p style="margin:0 0 10px;color:var(--text-dim);font-size:12.5px">${esc(e.desc || '(no group description — add "desc" in the testgroups block)')}</p>
@@ -3232,14 +3287,22 @@ document.addEventListener('click', (e) => {
 
 /* --------------------------------------------------------- project settings */
 const PROJSET = {
-  project_name: ['Paydaay Core Product', 'display name: sidebar, Projects root row'],
-  url_slug: ['pdy-dev', 'hostname + tab title + favicon tint: http://pdy-dev.localhost:{port}/'],
-  scan_roots: ['.', 'directories searched for markers — one per line; may be outside this repo'],
-  marker_glob: ['**/*.iter.md', 'ONE glob finds every iterapp file; the FILENAME suffix declares each file’s role (see legend above)'],
-  testgroups_glob: ['**/*testgroup.iter.md', 'testgroup files (singular suffix; ownership is declared by each marker file)'],
-  default_context: ['{marker}\n{ancestor_markers}\n{interfaces}', 'context prefilled on Create-WorkItem-from-node — one entry per line; placeholders in the legend above'],
+  // main.iter.md frontmatter (the project half)
+  projectname: ['Paydaay Core Product', 'display name: sidebar, browser tab — main.iter.md frontmatter'],
+  projectdescription: ['', 'one line on the project, for UI purposes — main.iter.md frontmatter'],
+  globalscandirs: ['{topdir}/', 'directories the engine scans (with iterglob) for node files — one per line'],
+  globalinterfacedir: ['{topdir}/interfaces/', 'the global folder of *.interface.iter.md files — the {interfaces} placeholder'],
+  globalusecasedir: ['{topdir}/usecases/', 'the global folder of *.usecase.iter.md files — the {usecases} placeholder'],
+  globalcontextfiles: ['', 'file globs ALWAYS loaded into new agent context (absorbed the old global bizreq/techreq settings) — one per line'],
+  // .iter/config.iter.json (the server half)
+  mainfile: ['{topdir}/main.iter.md', 'path to the main.iter.md project head — config.iter.json'],
+  iterglob: ['**/*.iter.md', 'ONE glob finds every iter node file; the FILENAME dot rule (*.nodetype.iter.md) declares each file’s type'],
+  topdir: ['{thisfiledir}/../', 'the singular top directory — the {topdir} every default hangs off ({thisfiledir} = the .iter/ folder)'],
+  url_slug: ['', 'hostname + tab title + favicon tint (empty = derived from the project name): http://<slug>.localhost:{port}/'],
+  default_context: ['{marker}\n{ancestor_markers}\n{interfaces}', 'context prefilled on Create-WorkItem-from-node — one entry per line'],
 };
-const PS_MULTILINE = ['scan_roots', 'default_context'];
+const PS_MULTILINE = ['globalscandirs', 'globalcontextfiles', 'default_context'];
+const PS_SERVER = ['mainfile', 'iterglob', 'topdir', 'url_slug', 'default_context'];
 if (!LIVE) DEFAULT_CONTEXT = PROJSET.default_context[0].split('\n');
 
 /* -------------------------------------------------- multi-server identity */

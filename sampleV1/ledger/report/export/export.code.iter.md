@@ -2,9 +2,13 @@
 name: "CSV Exporter"
 level: component
 description: "Writes the same report as a comma-separated file a spreadsheet can open."
-test_loop: omit
-testgroup: test/testgroup.iter.md
-test_dir: test
+owner: bespoke
+teststate: omit
+children:
+  codedirs:   ["{thisfiledir}/"]
+  bizreqs:   ["{thisfiledir}/*.bizreq.iter.md"]
+  techreqs:   ["{thisfiledir}/*.techreq.iter.md"]
+  testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---
 
 # Long Description

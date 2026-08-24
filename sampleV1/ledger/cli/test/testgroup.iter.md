@@ -1,3 +1,10 @@
+---
+name: "test testgroup"
+description: "testgroup for test"
+children:
+  testpaths: ["{thisfiledir}/*.sh"]
+---
+
 # Ledger CLI — test groups
 
 The CLI holds no rules, so its tests do not re-check them. They check the two

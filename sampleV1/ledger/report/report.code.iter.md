@@ -2,9 +2,14 @@
 name: "Report Renderer"
 level: container
 description: "Reads the log back out and turns it into something a person can read."
-uses: [entry-recorded]
-testgroup: test/testgroup.iter.md
-test_dir: test
+owner: bespoke
+children:
+  codedirs:   ["{thisfiledir}/"]
+  codenodes:  ["{thisfiledir}/export/export.code.iter.md"]
+  inputs:     ["{topdir}/interfaces/entry-recorded/entry-recorded.interface.iter.md"]
+  bizreqs:   ["{thisfiledir}/*.bizreq.iter.md"]
+  techreqs:   ["{thisfiledir}/*.techreq.iter.md"]
+  testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---
 
 # Long Description

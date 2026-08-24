@@ -1,9 +1,12 @@
 ---
-interface: entry-recorded
+name: "entry-recorded"
 kind: event
 description: "The notice that one money movement has been written down for good, and what it was."
-testgroup: test/testgroup.iter.md
-test_dir: test
+owner: bespoke
+children:
+  bizreqs:    ["{thisfiledir}/{thisfilestem}/*.bizreq.iter.md"]
+  techreqs:   ["{thisfiledir}/{thisfilestem}/*.techreq.iter.md"]
+  testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---
 
 # entry-recorded — contract

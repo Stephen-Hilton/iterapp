@@ -41,7 +41,9 @@ fn with_lock(f: impl FnOnce(&mut Vec<ServerRow>)) {
 }
 
 pub fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
+    // Absolute path: a server spawned with a stripped env (no PATH — e.g.
+    // Playwright's webServer) must still see itself as alive.
+    std::process::Command::new("/bin/kill")
         .args(["-0", &pid.to_string()])
         .stderr(std::process::Stdio::null())
         .status()

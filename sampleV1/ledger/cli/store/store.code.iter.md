@@ -2,10 +2,14 @@
 name: "Entry Store"
 level: component
 description: "Writes each movement of money into the log for good, and announces that it did."
-uses: [ledger-command]
-provides: [entry-recorded]
-testgroup: test/testgroup.iter.md
-test_dir: test
+owner: bespoke
+children:
+  codedirs:   ["{thisfiledir}/"]
+  inputs:     ["{topdir}/interfaces/ledger-command/ledger-command.interface.iter.md"]
+  outputs:    ["{topdir}/interfaces/entry-recorded/entry-recorded.interface.iter.md"]
+  bizreqs:   ["{thisfiledir}/*.bizreq.iter.md"]
+  techreqs:   ["{thisfiledir}/*.techreq.iter.md"]
+  testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---
 
 # Long Description

@@ -45,17 +45,18 @@ impl Default for EngineConfig {
     }
 }
 
+/// Engine-side tunables that survived the structureV2 settings audit. All
+/// PATHING settings moved to the two head files (`.iter/config.iter.json` +
+/// `main.iter.md` — see project.rs): the old code_root / usecase_default_path /
+/// interface_default_path / global_bizreq_path / global_techreq_path are gone
+/// ({topdir}, {globalusecasedir}, {globalinterfacedir}, and globalcontextfiles
+/// replaced them).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GlobalSettings {
     /// IANA timezone (e.g. "America/Los_Angeles") used by the webapp to display
     /// timestamps. Data stays UTC on disk; this is display-only.
     pub user_timezone: String,
-    /// Base directory for resolving relative codepaths, context patterns, and
-    /// testfiles. Relative values (including the default ".") resolve against the
-    /// engine home — the directory holding .iter/. Supports ~. Set this (e.g. "..")
-    /// when iter lives in a subdirectory of the codebase it works on.
-    pub code_root: String,
     /// Testwriter output bounds: how many tests a testwriter agent produces per
     /// testgroup (floor / ceiling). Read by agents from config.json directly.
     #[serde(alias = "test_min")]
@@ -63,34 +64,13 @@ pub struct GlobalSettings {
     #[serde(alias = "test_max")]
     pub testwriter_max_tests_per_group: u32,
     /// Max critical-review rounds per work item — substituted into the shared
-    /// agent instructions (`{critreview_max_rounds}` in _shared.md), so the
-    /// cap agents obey is a setting, not prompt-frozen prose. Each round is a
-    /// synchronous critic session (minutes of wall clock plus spend).
+    /// agent instructions (`{critreview_max_rounds}` in _shared.md).
     pub critreview_max_rounds: u32,
     /// The per-component test directory name (relative to a component's root).
-    /// Definitive, not a guess: testwriter items scope their codepath/lock to
-    /// `<component>/<test_dir>` and code items list `<test_dir>/` in codepath_ignore
-    /// so the two can run in parallel. Exported to agents as ITER_TEST_DIR.
+    /// Testwriter items scope their codepath/lock to `<component>/<test_dir>`
+    /// and code items list `<test_dir>/` in codepath_ignore so the two can run
+    /// in parallel. Exported to agents as ITER_TEST_DIR.
     pub test_dir: String,
-    /// Where NEW use-case files are created (webapp CRUD, starter seed). Creation
-    /// only — the scanner finds `*usecase.iter.md` anywhere, so there is no
-    /// preferred read location. `{codepath}` expands to the resolved code root;
-    /// a relative path resolves against the engine home.
-    #[serde(alias = "usecase_default_location")]
-    pub usecase_default_path: String,
-    /// Where NEW interface files are created (`<id>.interface.iter.md`, one file
-    /// per interface id — shared logical contracts, 1:M with C4 objects). Creation
-    /// only — the scanner finds `*interface.iter.md` anywhere. Same expansion
-    /// rules as `usecase_default_path`. Exported to agents as ITER_INTERFACE_DIR.
-    pub interface_default_path: String,
-    /// The GLOBAL (project-wide) business/technical requirement files — the two
-    /// documents surfaced to EVERY work item's spin-up. Exactly these files, never
-    /// a directory scan, so stray docs beside them can't balloon agent context.
-    /// `{codepath}` expands to the resolved code root; `~` and relative-to-engine-
-    /// home work like the other path settings. Exported to agents as ITER_BIZREQ /
-    /// ITER_TECHREQ; their directory is `$ITER_REQS` / `{reqs}` in context patterns.
-    pub global_bizreq_path: String,
-    pub global_techreq_path: String,
     pub log_default_path: String,
     pub log_level: String,
     pub log_max_size_mb: u64,
@@ -101,15 +81,10 @@ impl Default for GlobalSettings {
     fn default() -> Self {
         GlobalSettings {
             user_timezone: "UTC".into(),
-            code_root: ".".into(),
             testwriter_min_tests_per_group: 20,
             testwriter_max_tests_per_group: 100,
             critreview_max_rounds: 3,
             test_dir: "test".into(),
-            usecase_default_path: "{codepath}/usecases/".into(),
-            interface_default_path: "{codepath}/interfaces/".into(),
-            global_bizreq_path: "{codepath}/reqs/bizreq.iter.md".into(),
-            global_techreq_path: "{codepath}/reqs/techreq.iter.md".into(),
             log_default_path: "./logs/{YYYYMMDD-hh}.log".into(),
             log_level: "info".into(),
             log_max_size_mb: 10,
@@ -171,81 +146,28 @@ pub fn engine_dir(project_root: &Path) -> std::path::PathBuf {
     project_root.join(".iter").join(".engine")
 }
 
-/// Resolve globalsettings.code_root to the absolute directory that relative
-/// codepaths/context/testfiles resolve against. `project_root` is the engine home
-/// (where .iter/ lives); the default "." keeps historical behavior.
-pub fn code_root(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
-    let raw = cfg.globalsettings.code_root.trim();
-    let raw = if raw.is_empty() { "." } else { raw };
-    let mut p = raw.to_string();
-    if let Some(home) = std::env::var_os("HOME") {
-        if let Some(rest) = p.strip_prefix("~/") {
-            p = format!("{}/{}", home.to_string_lossy(), rest);
-        } else if p == "~" {
-            p = home.to_string_lossy().into_owned();
-        }
-    }
-    let path = std::path::PathBuf::from(&p);
-    let abs = if path.is_absolute() { path } else { project_root.join(path) };
-    abs.canonicalize().unwrap_or(abs)
+/// The base directory relative codepaths, context patterns, and testfiles
+/// resolve against — structureV2's `{topdir}` (the parent of `.iter/` unless
+/// config.iter.json says otherwise). Replaces the old code_root setting.
+pub fn code_root(project_root: &Path, _cfg: &Config) -> std::path::PathBuf {
+    crate::project::Project::load(project_root).topdir
 }
 
-/// Directory where NEW use-case files are created
-/// (`globalsettings.usecase_default_path`, default `{codepath}/usecases/`).
-pub fn usecase_dir(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
-    default_dir(project_root, cfg, &cfg.globalsettings.usecase_default_path, "{codepath}/usecases/")
+/// Directory where NEW use-case files are created — `{globalusecasedir}`.
+pub fn usecase_dir(project_root: &Path, _cfg: &Config) -> std::path::PathBuf {
+    crate::project::Project::load(project_root).usecasedir
 }
 
-/// Directory where NEW interface files are created
-/// (`globalsettings.interface_default_path`, default `{codepath}/interfaces/`).
-pub fn interface_dir(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
-    default_dir(project_root, cfg, &cfg.globalsettings.interface_default_path, "{codepath}/interfaces/")
+/// Directory where NEW interface files are created — `{globalinterfacedir}`.
+pub fn interface_dir(project_root: &Path, _cfg: &Config) -> std::path::PathBuf {
+    crate::project::Project::load(project_root).interfacedir
 }
 
-/// Absolute path of the GLOBAL business requirements file
-/// (`globalsettings.global_bizreq_path`, default `{codepath}/reqs/bizreq.iter.md`).
-pub fn global_bizreq(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
-    default_dir(project_root, cfg, &cfg.globalsettings.global_bizreq_path, "{codepath}/reqs/bizreq.iter.md")
-}
-
-/// Absolute path of the GLOBAL technical requirements file
-/// (`globalsettings.global_techreq_path`, default `{codepath}/reqs/techreq.iter.md`).
-pub fn global_techreq(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
-    default_dir(project_root, cfg, &cfg.globalsettings.global_techreq_path, "{codepath}/reqs/techreq.iter.md")
-}
-
-/// The global requirement files that exist on disk, bizreq first — what the engine
-/// surfaces to every work item's spin-up. Exactly these two paths (the settings),
-/// never a directory scan.
-pub fn global_req_files(project_root: &Path, cfg: &Config) -> Vec<std::path::PathBuf> {
-    [global_bizreq(project_root, cfg), global_techreq(project_root, cfg)]
-        .into_iter()
-        .filter(|p| p.is_file())
-        .collect()
-}
-
-/// The project-wide reqs directory: where the global bizreq lives. Kept for the
-/// `{reqs}` placeholder in context/testfiles patterns and the `$ITER_REQS` env var
-/// — the precise file paths are `global_bizreq`/`global_techreq` ($ITER_BIZREQ /
-/// $ITER_TECHREQ); nothing scans this directory.
-pub fn reqs_dir(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
-    let biz = global_bizreq(project_root, cfg);
-    biz.parent().map(|p| p.to_path_buf()).unwrap_or(biz)
-}
-
-/// Expand a path setting: `{codepath}` → resolved code root, `~` → HOME, and a
-/// relative value resolves against the engine home. Empty falls back.
-fn default_dir(project_root: &Path, cfg: &Config, raw: &str, fallback: &str) -> std::path::PathBuf {
-    let raw = raw.trim();
-    let raw = if raw.is_empty() { fallback } else { raw };
-    let mut expanded = raw.replace("{codepath}", &code_root(project_root, cfg).to_string_lossy());
-    if let Some(home) = std::env::var_os("HOME") {
-        if let Some(rest) = expanded.strip_prefix("~/") {
-            expanded = format!("{}/{}", home.to_string_lossy(), rest);
-        }
-    }
-    let path = std::path::PathBuf::from(expanded);
-    if path.is_absolute() { path } else { project_root.join(path) }
+/// Every file pinned into ALL new agent context: main.iter.md first, then the
+/// resolved `globalcontextfiles` globs (which absorbed the old global
+/// bizreq/techreq settings).
+pub fn global_context_files(project_root: &Path) -> Vec<std::path::PathBuf> {
+    crate::project::Project::load(project_root).context_files()
 }
 
 pub fn load(project_root: &Path) -> Config {
@@ -283,34 +205,12 @@ mod tests {
     }
 
     #[test]
-    fn global_req_paths_default_to_codepath_reqs() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sampleV1");
+    fn code_root_is_topdir() {
+        let dir = std::env::temp_dir().join(format!("iter-cfg-topdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".iter")).unwrap();
         let cfg = Config::default();
-        let code = code_root(&root, &cfg);
-        assert_eq!(global_bizreq(&root, &cfg), code.join("reqs/bizreq.iter.md"));
-        assert_eq!(global_techreq(&root, &cfg), code.join("reqs/techreq.iter.md"));
-        assert_eq!(reqs_dir(&root, &cfg), code.join("reqs"));
-    }
-
-    #[test]
-    fn global_req_paths_honor_settings() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sampleV1");
-        let mut cfg = Config::default();
-        cfg.globalsettings.global_bizreq_path = "docs/biz.md".into();
-        cfg.globalsettings.global_techreq_path = "/abs/tech.md".into();
-        assert_eq!(global_bizreq(&root, &cfg), root.join("docs/biz.md"));
-        assert_eq!(global_techreq(&root, &cfg), Path::new("/abs/tech.md"));
-        assert_eq!(reqs_dir(&root, &cfg), root.join("docs"));
-    }
-
-    #[test]
-    fn global_req_files_lists_only_existing() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sampleV1");
-        let mut cfg = Config::default();
-        cfg.globalsettings.global_bizreq_path = "{codepath}/reqs/bizreq.iter.md".into();
-        cfg.globalsettings.global_techreq_path = "{codepath}/reqs/missing-techreq.iter.md".into();
-        let files = global_req_files(&root, &cfg);
-        assert_eq!(files.len(), 1, "only the existing file surfaces: {:?}", files);
-        assert!(files[0].ends_with("bizreq.iter.md"));
+        assert_eq!(code_root(&dir, &cfg), dir.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,12 +1,9 @@
 ---
 name: "Record a movement"
 description: "Someone spends or receives money and writes it down, then sees where that leaves them."
-participants:
-  - 1 ledger/cli
-  - 2 ledger/cli/parse
-  - 3 ledger/cli/store
-testgroup: test/testgroup.iter.md
-test_dir: test
+children:
+  codenodes:  ["{topdir}/ledger/cli/cli.code.iter.md", "{topdir}/ledger/cli/parse/parse.code.iter.md", "{topdir}/ledger/cli/store/store.code.iter.md"]
+  testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---
 
 # Record a movement

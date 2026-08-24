@@ -1,13 +1,9 @@
 ---
 name: "Review the month"
 description: "Someone looks back over everything they recorded, then takes it away as a spreadsheet."
-participants:
-  - 1 ledger/cli
-  - 2 ledger/cli/parse
-  - 3 ledger/report
-  - 4 ledger/report/export
-testgroup: test/testgroup.iter.md
-test_dir: test
+children:
+  codenodes:  ["{topdir}/ledger/cli/cli.code.iter.md", "{topdir}/ledger/cli/parse/parse.code.iter.md", "{topdir}/ledger/report/report.code.iter.md", "{topdir}/ledger/report/export/export.code.iter.md"]
+  testgroups: ["{thisfiledir}/test/testgroup.iter.md"]
 ---
 
 # Review the month

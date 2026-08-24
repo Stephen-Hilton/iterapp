@@ -1,3 +1,10 @@
+---
+name: "cli techreq"
+description: "techreq for cli"
+children:
+  reqpaths: []
+---
+
 # Ledger CLI — technical requirements
 
 - **CLI-TECH-001** — `ledger.sh` holds no rules of its own. Deciding what a

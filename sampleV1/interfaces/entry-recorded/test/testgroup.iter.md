@@ -1,3 +1,10 @@
+---
+name: "test testgroup"
+description: "testgroup for test"
+children:
+  testpaths: ["{thisfiledir}/*.sh"]
+---
+
 # entry-recorded — test groups
 
 An event contract has no reply to compare, so its worked examples prove less on

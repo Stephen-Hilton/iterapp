@@ -96,58 +96,41 @@ pub fn bind(project_root: &Path, want: Option<u16>) -> std::io::Result<(TcpListe
 }
 
 pub fn slug(project_root: &Path) -> String {
-    if let Some(s) = project_settings(project_root).get("url_slug").and_then(|s| s.as_str()) {
-        if !s.is_empty() {
-            return s.to_string();
-        }
-    }
-    let name = project_root
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "project".into());
-    let cleaned: String =
-        name.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    cleaned.trim_matches('-').to_string()
+    crate::project::Project::load(project_root).slug()
 }
 
-/// .iter/projects.json with defaults filled in (never errors).
+/// The structureV2 project head as one JSON view: the server config
+/// (.iter/config.iter.json), the main.iter.md frontmatter, and the resolved
+/// paths — what the Settings page renders and PUTs back.
 pub fn project_settings(project_root: &Path) -> Value {
-    let dirname = project_root
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "project".into());
-    let cleaned: String =
-        dirname.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    let mut settings = json!({
-        "project_name": dirname,
-        "url_slug": cleaned.trim_matches('-'),
-        "scan_roots": ["."],
-        "marker_glob": "**/*.iter.md",
-        "testgroups_glob": "**/*testgroup.iter.md",
-        "default_context": ["{marker}", "{ancestor_markers}", "{interfaces}"],
-    });
-    if let Ok(text) = std::fs::read_to_string(project_root.join(".iter/projects.json")) {
-        if let Ok(Value::Object(saved)) = serde_json::from_str::<Value>(&text) {
-            for (k, v) in saved {
-                settings[k] = v;
-            }
-        }
-    }
-    settings
+    let p = crate::project::Project::load(project_root);
+    json!({
+        "server": p.server,
+        "project": {
+            "projectname": p.config.projectname,
+            "projectdescription": p.config.projectdescription,
+            "globalscandirs": p.config.globalscandirs,
+            "globalinterfacedir": p.config.globalinterfacedir,
+            "globalusecasedir": p.config.globalusecasedir,
+            "globalcontextfiles": p.config.globalcontextfiles,
+        },
+        "resolved": {
+            "topdir": p.topdir.to_string_lossy(),
+            "mainfile": p.mainfile.to_string_lossy(),
+            "interfacedir": p.interfacedir.to_string_lossy(),
+            "usecasedir": p.usecasedir.to_string_lossy(),
+            "scandirs": p.scandirs.iter().map(|d| d.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        },
+        // Legacy aliases a few readers still use.
+        "project_name": p.projectname(),
+        "url_slug": p.slug(),
+        "default_context": p.server.default_context,
+    })
 }
 
-/// The project's marker scan roots (projects.json `scan_roots`) resolved to
-/// absolute paths — `~` expanded, relative values resolved against the project
-/// root. THE one resolution everything must share (API, sweep, validate,
-/// stubdesc): pdy's roots are written as `~/dev/pdy-dev/`, and a resolver that
-/// forgets `~` silently scans nothing.
+/// The project's scan roots — structureV2's resolved `globalscandirs`.
 pub fn scan_roots(project: &Path) -> Vec<PathBuf> {
-    project_settings(project)["scan_roots"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(expand_root(project)).collect())
-        .unwrap_or_else(|| vec![project.to_path_buf()])
+    crate::project::Project::load(project).scandirs
 }
 
 /* ------------------------------------------------------------ http plumbing */
@@ -288,11 +271,12 @@ fn route(req: &Req, engine: &Engine, port: u16) -> Resp {
         ("GET", ["api", "projectsettings"]) => json_resp(200, project_settings(project)),
         ("PUT", ["api", "projectsettings"]) => api_projectsettings_put(req, project),
         ("GET", ["api", "markers"]) | ("POST", ["api", "markers", "rescan"]) => api_markers(project),
+        ("POST", ["api", "orphans", "link"]) => api_orphan_link(req, project),
         ("POST", ["api", "file", "read"]) => api_file_read(req, project),
         ("PUT", ["api", "file"]) => api_file_write(req, project),
         ("GET", ["api", "testgroups"]) => api_testgroups(project),
         ("POST", ["api", "testgroups", "autofix"]) => api_testgroups_autofix(req, project),
-        ("POST", ["api", "testloop"]) => api_testloop(req, project),
+        ("POST", ["api", "teststate"]) | ("POST", ["api", "testloop"]) => api_teststate(req, project),
         ("POST", ["api", "testruns"]) => api_testruns(req, project),
         ("POST", ["api", "validate"]) => api_validate(req, project),
         ("POST", ["api", "usecases"]) => api_usecases(req, project, "create"),
@@ -411,21 +395,19 @@ fn api_meta(project: &Path) -> Resp {
         })
         .unwrap_or_default();
     prepost.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    let settings = project_settings(project);
-    let cfg = config::load(project);
-    let code_root = config::code_root(project, &cfg);
+    let p = crate::project::Project::load(project);
     json_resp(
         200,
         json!({
             "agents": agents,
             "prepostwork": prepost,
             "project_root": project.canonicalize().unwrap_or_else(|_| project.to_path_buf()).to_string_lossy(),
-            "code_root": code_root.to_string_lossy(),
-            "global_bizreq": config::global_bizreq(project, &cfg).to_string_lossy(),
-            "global_techreq": config::global_techreq(project, &cfg).to_string_lossy(),
-            "project_name": settings["project_name"],
-            "url_slug": settings["url_slug"],
-            "default_context": settings["default_context"],
+            "code_root": p.topdir.to_string_lossy(),
+            "mainfile": p.mainfile.to_string_lossy(),
+            "context_files": p.context_files().iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            "project_name": p.projectname(),
+            "url_slug": p.slug(),
+            "default_context": p.server.default_context,
             "home": std::env::var("HOME").unwrap_or_default(),
         }),
     )
@@ -740,8 +722,7 @@ fn api_tests(project: &Path, id: &str) -> Resp {
     } else {
         code_root.join(&item.codepath)
     };
-    let reqs = config::reqs_dir(project, &cfg);
-    let (files, _warnings) = context::resolve(&item.testfiles, &codepath, &code_root, &reqs);
+    let (files, _warnings) = context::resolve(&item.testfiles, &codepath, &code_root);
     let groups: Vec<Value> = files
         .iter()
         .filter_map(|f| {
@@ -950,52 +931,98 @@ fn api_agent_put(req: &Req, project: &Path, name: &str) -> Resp {
     json_resp(200, agent_json(project, &crate::agents::parse(name, &rewritten)))
 }
 
+/// PUT /api/projectsettings {server?: {...}, project?: {...}} — the server
+/// half lands in `.iter/config.iter.json`; the project half is a record-level
+/// frontmatter edit of main.iter.md (the body is never touched here). List
+/// values are written in the inline `key: ["a", "b"]` form the parser reads.
 fn api_projectsettings_put(req: &Req, project: &Path) -> Resp {
     let Ok(v @ Value::Object(_)) = serde_json::from_slice::<Value>(&req.body) else {
         return err_resp(400, "body must be a JSON object");
     };
-    let path = project.join(".iter/projects.json");
-    if std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default()).is_err() {
-        return err_resp(500, "cannot write projects.json");
+    if let Some(server) = v.get("server") {
+        let Ok(sc) = serde_json::from_value::<crate::project::ServerConfig>(server.clone()) else {
+            return err_resp(400, "server settings do not match config.iter.json's shape");
+        };
+        let path = crate::project::config_path(project);
+        let tmp = path.with_extension("json.tmp");
+        let text = serde_json::to_string_pretty(&sc).unwrap_or_default();
+        if std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+            return err_resp(500, "cannot write config.iter.json");
+        }
     }
-    json_resp(200, v)
+    if let Some(Value::Object(proj)) = v.get("project") {
+        // Reload AFTER a possible server write: topdir/mainfile may have moved.
+        let p = crate::project::Project::load(project);
+        if !p.mainfile.is_file() {
+            let _ = crate::project::ensure_head_files(project);
+        }
+        let p = crate::project::Project::load(project);
+        for key in [
+            "projectname",
+            "projectdescription",
+            "globalscandirs",
+            "globalinterfacedir",
+            "globalusecasedir",
+            "globalcontextfiles",
+        ] {
+            let Some(val) = proj.get(key) else { continue };
+            let rendered = match val {
+                Value::String(s) => {
+                    if s.trim().is_empty() { None } else { Some(format!("\"{}\"", s.replace('"', " "))) }
+                }
+                Value::Array(items) => {
+                    let parts: Vec<String> = items
+                        .iter()
+                        .filter_map(|i| i.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| format!("\"{}\"", s.replace('"', " ")))
+                        .collect();
+                    Some(format!("[{}]", parts.join(", ")))
+                }
+                Value::Null => None,
+                other => Some(other.to_string()),
+            };
+            if let Err(e) = markers::set_frontmatter_key(&p.mainfile, key, rendered.as_deref()) {
+                return err_resp(500, &format!("cannot update {}: {}", p.mainfile.display(), e));
+            }
+        }
+    }
+    json_resp(200, project_settings(project))
 }
 
 fn api_markers(project: &Path) -> Resp {
-    let settings = project_settings(project);
-    let roots = scan_roots(project);
-    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md");
-    let mut scan = markers::scan(project, &roots, glob);
-    if scan.usecases.is_empty() && seed_starter_usecase(project) {
-        scan = markers::scan(project, &roots, glob); // pick the seeded file up
+    let (proj, mut scan) = markers::scan_project(project);
+    if scan.usecases.is_empty() && seed_starter_usecase(project, &proj) {
+        scan = markers::scan(&proj); // pick the seeded file up
     }
     json_resp(200, serde_json::to_value(scan).unwrap_or(Value::Null))
 }
 
 /// A project with zero use-cases gets a starter: the getting-started story of this
 /// very app. Seeded ONCE (flag file) so deleting it is a real delete, not a respawn.
-fn seed_starter_usecase(project: &Path) -> bool {
+fn seed_starter_usecase(project: &Path, proj: &crate::project::Project) -> bool {
     let flag = config::engine_dir(project).join("usecases_seeded");
     if flag.exists() {
         return false;
     }
-    let dir = config::usecase_dir(project, &config::load(project));
+    let dir = &proj.usecasedir;
     let path = dir.join("install-iter-framework.usecase.iter.md");
-    if std::fs::create_dir_all(&dir).is_err() {
+    if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
     let stub = r#"---
 name: "Install iter framework"
 description: "Getting started: install iterapp, scaffold a project, and run the first loop"
-participants:
-  - 1 .
+children:
+  codenodes: []
+  testgroups: ["{thisfiledir}/{thisfilestem}/*.testgroup.iter.md"]
 ---
 
 # Install the iter framework
 
 The getting-started use-case for iterapp itself: from an empty directory to a
 running loop with agents picking up work. (This is a seeded starter — edit it,
-repoint the participants at your real nodes, or delete it.)
+point its codenodes at your real nodes, or delete it.)
 
 ## Steps
 
@@ -1004,15 +1031,15 @@ repoint the participants at your real nodes, or delete it.)
    `cp` + `mv`) — never overwrite a live executable in place.
 2. **Scaffold.** `iter init .` (or just `iter start` — missing pieces heal on
    boot) creates `.iter/` (agent personas in `agents/`, pre/post steps in
-   `prepostwork/`, engine config in `.engine/config.json`) and stubs the two
-   global requirement files at their configured paths (`global_bizreq_path` /
-   `global_techreq_path`, default `reqs/` at the code root).
-3. **Describe the project.** Drop a `level: project` marker (`*.iter.md`) at the
-   code root so the Projects map has a top; add component markers as you go.
-   Fill `reqs/bizreq.iter.md` and `reqs/techreq.iter.md` with the requirements
-   every agent should know.
+   `prepostwork/`, engine config in `.engine/config.json`) plus the two
+   structureV2 head files: `.iter/config.iter.json` (server settings) and a
+   stub `main.iter.md` at the top directory (the project definition, first
+   into every agent context).
+3. **Describe the project.** Fill in main.iter.md, then add `*.code.iter.md`
+   nodes as you go — a `level: context` node attaches to the project head,
+   and its `children.codenodes` links attach everything below it.
 4. **Tune.** Review `.iter/.engine/config.json` (models, budgets, agent caps)
-   and Project Settings in the webapp (scan roots, default context).
+   and Project Settings in the webapp (scan dirs, context files).
 5. **Run.** `iter start` launches the engine plus this webapp and prints the
    URL. `iter stop --wait` drains cleanly.
 6. **Feed it.** Create the first work item — from a Projects node, the New
@@ -1026,8 +1053,16 @@ repoint the participants at your real nodes, or delete it.)
     true
 }
 
-/// Shape a use-case marker file from its parts. Participants are "step key" lines.
-fn usecase_file_text(name: &str, description: &str, participants: &[String], body: &str, extra: &[(String, String)]) -> String {
+/// Shape a V2 use-case file from its parts. `codenodes` is the REQUIRED link
+/// list (may be empty); extra scalar keys the form doesn't own ride through.
+fn usecase_file_text(
+    name: &str,
+    description: &str,
+    codenodes: &[String],
+    testgroups: &[String],
+    body: &str,
+    extra: &[(String, String)],
+) -> String {
     let clean = |s: &str| s.replace(['"', '\n', '\r'], " ").trim().to_string();
     let mut t = format!("---\nname: \"{}\"\ndescription: \"{}\"\n", clean(name), clean(description));
     for (k, v) in extra {
@@ -1038,12 +1073,19 @@ fn usecase_file_text(name: &str, description: &str, participants: &[String], bod
             t.push_str(&format!("{}: {}\n", k, v));
         }
     }
-    t.push_str("participants:\n");
-    for p in participants {
-        let p = p.trim();
-        if !p.is_empty() {
-            t.push_str(&format!("  - {}\n", p));
-        }
+    let render_list = |items: &[String]| {
+        let parts: Vec<String> = items
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("\"{}\"", s.replace('"', " ")))
+            .collect();
+        format!("[{}]", parts.join(", "))
+    };
+    t.push_str("children:\n");
+    t.push_str(&format!("  codenodes: {}\n", render_list(codenodes)));
+    if !testgroups.is_empty() {
+        t.push_str(&format!("  testgroups: {}\n", render_list(testgroups)));
     }
     t.push_str("---\n\n");
     t.push_str(body.trim_end());
@@ -1088,11 +1130,13 @@ fn api_usecases(req: &Req, project: &Path, action: &str) -> Resp {
         return err_resp(400, "body must be a JSON object");
     };
     let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let participants: Vec<String> = body
-        .get("participants")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
-        .unwrap_or_default();
+    let list = |k: &str| -> Vec<String> {
+        body.get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+            .unwrap_or_default()
+    };
+    let codenodes = list("codenodes");
     match action {
         "delete" => match usecase_path(project, &s("file")) {
             Ok(path) => {
@@ -1124,23 +1168,25 @@ fn api_usecases(req: &Req, project: &Path, action: &str) -> Resp {
             }
             let cfg = config::load(project);
             // Frontmatter keys beyond the form's own fields ride through an
-            // update untouched (testgroup/test_dir/test_loop must survive an
-            // edit); a create declares its tests from day one.
+            // update untouched (teststate must survive an edit); a create
+            // declares its tests from day one.
             let mut extra: Vec<(String, String)> = Vec::new();
-            // Participants are optional: the FILENAME (*usecase.iter.md) classifies
-            // the file; participant lines only thread it through the tree.
+            let mut testgroups_link: Vec<String> = Vec::new();
             let path = if action == "update" {
                 let path = match usecase_path(project, &s("file")) {
                     Ok(p) => p,
                     Err(e) => return err_resp(400, &e),
                 };
                 if let Ok(prev) = std::fs::read_to_string(&path) {
-                    let (front, _, _) = markers::frontmatter(&prev);
+                    let front = markers::parse_front(&prev);
                     extra = front
+                        .scalars
+                        .clone()
                         .into_iter()
-                        .filter(|(k, _)| !matches!(k.as_str(), "name" | "description" | "participants"))
+                        .filter(|(k, _)| !matches!(k.as_str(), "name" | "description" | "participants" | "test_loop"))
                         .collect();
                     extra.sort();
+                    testgroups_link = front.child("testgroups").unwrap_or_default();
                 }
                 path
             } else {
@@ -1163,29 +1209,30 @@ fn api_usecases(req: &Req, project: &Path, action: &str) -> Resp {
                 }
                 // Starter testgroup: one empty-testlist E2E group — enough for
                 // the sweep to birth the testwriter authoring item.
-                let tg_path = folder.join(&test_dir).join("testgroup.iter.md");
+                let tg_path = folder.join(&test_dir).join(format!("{}.testgroup.iter.md", slug));
                 if !tg_path.exists() {
                     let group = crate::testgroups::TestGroup {
                         label: format!("{}-e2e", slug),
                         desc: format!(
-                            "End-to-end journey tests for use-case \"{}\": scripts that walk the actual user journey through the real participants",
+                            "End-to-end journey tests for use-case \"{}\": scripts that walk the actual user journey through the real linked code nodes",
                             name.trim()
                         ),
                         auto_fix: false,
                         ..Default::default()
                     };
-                    let header = format!("# {} — E2E journey test groups\n\nDefinitions only; the testwriter authors the scripts and fills the testlist.\n", name.trim());
+                    let header = format!(
+                        "---\nname: \"{} E2E tests\"\ndescription: \"End-to-end journey tests for this use-case\"\nchildren:\n  testpaths: [\"{{thisfiledir}}/*.sh\"]\n---\n\n# {} — E2E journey test groups\n\nDefinitions only; the testwriter authors the scripts and fills the testlist.\n",
+                        name.trim(),
+                        name.trim()
+                    );
                     if let Err(e) = std::fs::write(&tg_path, crate::testgroups::update(&header, &[group])) {
                         return err_resp(500, &format!("cannot write {}: {}", tg_path.display(), e));
                     }
                 }
-                extra = vec![
-                    ("testgroup".into(), format!("{}/testgroup.iter.md", test_dir)),
-                    ("test_dir".into(), test_dir),
-                ];
+                testgroups_link = vec![format!("{{thisfiledir}}/{}/*.testgroup.iter.md", test_dir)];
                 p
             };
-            match std::fs::write(&path, usecase_file_text(&name, &description, &participants, &s("body"), &extra)) {
+            match std::fs::write(&path, usecase_file_text(&name, &description, &codenodes, &testgroups_link, &s("body"), &extra)) {
                 Ok(()) => json_resp(if action == "create" { 201 } else { 200 }, json!({ "file": path.to_string_lossy() })),
                 Err(e) => err_resp(500, &format!("cannot write {}: {}", path.display(), e)),
             }
@@ -1208,20 +1255,94 @@ fn body_str<'a>(body: &'a Value, key: &str) -> &'a str {
     body.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
-/// True when `path` IS one of the two GLOBAL requirement files (settings
-/// global_bizreq_path / global_techreq_path) — exactly those files, not their
-/// directory; neighbors in the same folder stay ordinary editable docs.
-fn is_global_req(project: &Path, path: &Path) -> bool {
-    let cfg = config::load(project);
-    [config::global_bizreq(project, &cfg), config::global_techreq(project, &cfg)]
-        .iter()
-        .any(|g| g.canonicalize().unwrap_or_else(|_| g.clone()) == path)
+/// POST /api/orphans/link {orphan, parent} — the Orphanage's quick-link: add
+/// the orphaned file to `parent`'s matching `children` sub-key (codenodes for
+/// code orphans, testgroups/bizreqs/techreqs for the rest). Parent = node
+/// key/name, use-case name, interface id, or declaring-file path suffix.
+/// When the sub-key was riding on defaults, the defaults are written out
+/// first so existing links survive the edit.
+fn api_orphan_link(req: &Req, project: &Path) -> Resp {
+    let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    let orphan_path = body_str(&body, "orphan").to_string();
+    let parent_ref = body_str(&body, "parent").trim().to_string();
+    if orphan_path.is_empty() || parent_ref.is_empty() {
+        return err_resp(400, "orphan (file path) and parent (node key / usecase name / interface id) are required");
+    }
+    let (proj, scan) = markers::scan_project(project);
+    let Some(orphan) = scan.orphans.iter().find(|o| o.path == orphan_path) else {
+        return err_resp(404, "no such orphan (rescan — it may already be linked)");
+    };
+    // (declaring file, is_code_node, default patterns per sub-key)
+    struct ParentRef {
+        file: String,
+        kind: &'static str,
+    }
+    let mut parents: Vec<ParentRef> = Vec::new();
+    for n in &scan.nodes {
+        if n.key == parent_ref || n.name == parent_ref || n.path.ends_with(&parent_ref) {
+            parents.push(ParentRef { file: n.path.clone(), kind: "code" });
+        }
+    }
+    for u in &scan.usecases {
+        if u.name == parent_ref || u.file.ends_with(&parent_ref) {
+            parents.push(ParentRef { file: u.file.clone(), kind: "usecase" });
+        }
+    }
+    for i in &scan.interfaces {
+        if i.id == parent_ref || i.file.ends_with(&parent_ref) {
+            parents.push(ParentRef { file: i.file.clone(), kind: "interface" });
+        }
+    }
+    parents.dedup_by(|a, b| a.file == b.file);
+    let parent = match parents.len() {
+        0 => return err_resp(404, "parent matches no node, use case, or interface"),
+        1 => parents.pop().expect("one"),
+        n => return err_resp(409, &format!("parent is ambiguous ({} matches) — use the node key or file path", n)),
+    };
+    let (sub_key, default_patterns): (&str, Vec<String>) = match (orphan.role.as_str(), parent.kind) {
+        ("code", "code") => ("codenodes", vec![]),
+        ("code", _) => ("codenodes", vec![]),
+        ("testgroup", "code") => ("testgroups", vec!["{thisfiledir}/test/*.testgroup.iter.md".into()]),
+        ("testgroup", _) => ("testgroups", vec!["{thisfiledir}/{thisfilestem}/*.testgroup.iter.md".into()]),
+        ("bizreq", "code") => ("bizreqs", vec!["{thisfiledir}/*.bizreq.iter.md".into()]),
+        ("bizreq", _) => ("bizreqs", vec!["{thisfiledir}/{thisfilestem}/*.bizreq.iter.md".into()]),
+        ("techreq", "code") => ("techreqs", vec!["{thisfiledir}/*.techreq.iter.md".into()]),
+        ("techreq", _) => ("techreqs", vec!["{thisfiledir}/{thisfilestem}/*.techreq.iter.md".into()]),
+        _ => return err_resp(400, &format!("a {} orphan cannot be linked here", orphan.role)),
+    };
+    if orphan.role == "code" && parent.kind == "interface" {
+        return err_resp(400, "interfaces do not own code nodes — link it under a code node or use case");
+    }
+    // {topdir}-relative entry keeps the link portable.
+    let entry = Path::new(&orphan.path)
+        .strip_prefix(&proj.topdir)
+        .map(|r| format!("{{topdir}}/{}", r.display()))
+        .unwrap_or_else(|_| orphan.path.clone());
+    let parent_file = PathBuf::from(&parent.file);
+    let front = std::fs::read_to_string(&parent_file)
+        .map(|t| markers::parse_front(&t))
+        .unwrap_or_default();
+    let mut values = front.child(sub_key).unwrap_or(default_patterns);
+    if !values.contains(&entry) {
+        values.push(entry.clone());
+    }
+    match markers::set_children_key(&parent_file, sub_key, &values) {
+        Ok(()) => json_resp(200, json!({ "linked": entry, "parent": parent.file, "key": sub_key })),
+        Err(e) => err_resp(500, &e),
+    }
+}
+
+/// True when `path` IS the project's main.iter.md — the head file is edited
+/// through Settings (frontmatter) or on disk deliberately, never the generic
+/// file editor; every other doc stays ordinarily editable.
+fn is_head_file(project: &Path, path: &Path) -> bool {
+    let main = crate::project::Project::load(project).mainfile;
+    main.canonicalize().unwrap_or(main) == path
 }
 
 /// POST /api/file/read {path} → {path, content, readonly}. Read-only surface for
-/// the UI's lightboxes: markdown (markers, requirements), run logs, and test
-/// scripts. The two global requirement files are flagged readonly — the
-/// global bizreq/techreq are never edited through the UI.
+/// the UI's lightboxes: markdown (nodes, requirements), run logs, and test
+/// scripts. main.iter.md is flagged readonly — the head is edited via Settings.
 fn api_file_read(req: &Req, project: &Path) -> Resp {
     let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
         return err_resp(400, "body must be a JSON object");
@@ -1243,14 +1364,14 @@ fn api_file_read(req: &Req, project: &Path) -> Resp {
         Ok(t) => t,
         Err(e) => return err_resp(500, &format!("cannot read: {}", e)),
     };
-    let readonly = is_global_req(project, &path) || !name.ends_with(".md");
+    let readonly = is_head_file(project, &path) || !name.ends_with(".md");
     json_resp(200, json!({ "path": path.to_string_lossy(), "content": content, "readonly": readonly }))
 }
 
 /// PUT /api/file {path, content} — markdown only, inside the project/code root,
-/// and NEVER one of the two global requirement files (the global bizreq/techreq
-/// are read-only by design; edit them on disk deliberately). The file may be new
-/// (e.g. a component's first local bizreq.iter.md): the parent must exist.
+/// and NEVER main.iter.md (the head is edited through Settings, or on disk
+/// deliberately). The file may be new (e.g. a component's first local
+/// bizreq file): the parent must exist.
 fn api_file_write(req: &Req, project: &Path) -> Resp {
     let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
         return err_resp(400, "body must be a JSON object");
@@ -1275,8 +1396,8 @@ fn api_file_write(req: &Req, project: &Path) -> Resp {
     if !path_contained(project, &path) {
         return err_resp(400, "path is outside the project");
     }
-    if is_global_req(project, &path) {
-        return err_resp(403, &format!("global requirements are read-only in the UI — edit {} on disk deliberately", path.display()));
+    if is_head_file(project, &path) {
+        return err_resp(403, &format!("main.iter.md is edited through Settings — or edit {} on disk deliberately", path.display()));
     }
     let tmp = path.with_extension("md.tmp");
     if std::fs::write(&tmp, content).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
@@ -1285,140 +1406,129 @@ fn api_file_write(req: &Req, project: &Path) -> Resp {
     json_resp(200, json!({ "path": path.to_string_lossy() }))
 }
 
-/// POST /api/testloop {target, action: omit|include|block|clear} — the webapp's
-/// Test-Loop gate toggle, through the same engine-owned edit path as
-/// `iter testloop`. Refusals (unknown/ambiguous target, blocked flag) come
-/// back as 409 with the reason.
-fn api_testloop(req: &Req, project: &Path) -> Resp {
+/// POST /api/teststate {target, action: omit|include|block|clear} — the
+/// webapp's teststate gate toggle, through the same engine-owned edit path as
+/// `iter teststate`. Refusals (unknown/ambiguous target, blocked flag) come
+/// back as 409 with the reason. (/api/testloop is the V1 alias.)
+fn api_teststate(req: &Req, project: &Path) -> Resp {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     let Some(target) = body.get("target").and_then(|t| t.as_str()).filter(|t| !t.trim().is_empty()) else {
         return err_resp(400, "target (node key/name, use-case name, interface id, or file path) is required");
     };
     let action = match body.get("action").and_then(|a| a.as_str()) {
-        Some("omit") => markers::TestLoopAction::Omit,
-        Some("include") => markers::TestLoopAction::Include,
-        Some("block") => markers::TestLoopAction::Block,
-        Some("clear") => markers::TestLoopAction::Clear,
+        Some("omit") => markers::TestStateAction::Omit,
+        Some("include") => markers::TestStateAction::Include,
+        Some("block") | Some("blocked") => markers::TestStateAction::Block,
+        Some("clear") => markers::TestStateAction::Clear,
         _ => return err_resp(400, "action must be omit|include|block|clear"),
     };
-    let settings = project_settings(project);
-    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md");
-    let scan = markers::scan(project, &scan_roots(project), glob);
-    match markers::testloop_apply(&scan, target, action) {
+    let (_p, scan) = markers::scan_project(project);
+    match markers::teststate_apply(&scan, target, action) {
         Ok(summary) => json_resp(200, json!({ "summary": summary })),
         Err(e) => err_resp(409, &e),
     }
 }
 
-/// GET /api/testgroups — marker-driven, matching the sweep: each `level:` marker
-/// file's MANDATORY `testgroup:` key names its testgroup.iter.md (no key = that
-/// C4 object is deliberately untested). `test_dir` in the response is the
-/// directory holding the testgroup.iter.md — where the `runs/` history lives.
-/// testgroup.iter.md files no marker claims are listed as orphans.
+/// GET /api/testgroups — DAG-driven, matching the sweep: each node's resolved
+/// `children.testgroups` links name its testgroup files. `test_dir` in the
+/// response is the directory holding the testgroup.iter.md — where the `runs/`
+/// history lives. Unclaimed testgroup files are the Orphanage's.
 fn api_testgroups(project: &Path) -> Resp {
-    let settings = project_settings(project);
-    let glob = settings["marker_glob"].as_str().unwrap_or("**/*.iter.md");
-    let roots = scan_roots(project);
-    let scan = markers::scan(project, &roots, glob);
-    let mut claimed: Vec<PathBuf> = Vec::new();
-    // One row per declaring file with a testgroup: key — markers, and (2026-08-17,
-    // same universe the sweep walks) use-cases and interfaces. `kind` tells the UI
-    // which; `testgroup: none` (deliberate opt-out) is skipped like an empty key.
-    // (kind, dir, key, name, level, declaring path)
-    let mut declared_rows: Vec<(String, String, String, String, String, String)> = Vec::new();
-    for n in scan.nodes.iter().filter(|n| !n.testgroup.is_empty()) {
-        declared_rows.push(("object".into(), n.dir.clone(), n.key.clone(), n.name.clone(), n.level.clone(), n.path.clone()));
-    }
-    for u in scan.usecases.iter().filter(|u| !u.testgroup.is_empty() && u.testgroup.trim() != "none") {
-        let dir = Path::new(&u.file).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        declared_rows.push(("usecase".into(), dir, String::new(), u.name.clone(), "usecase".into(), u.file.clone()));
-    }
-    for i in scan.interfaces.iter().filter(|i| !i.testgroup.is_empty() && i.testgroup.trim() != "none") {
-        let dir = Path::new(&i.file).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        declared_rows.push(("interface".into(), dir, String::new(), i.id.clone(), "interface".into(), i.file.clone()));
-    }
-    let tg_of = |kind: &str, declaring: &str| -> String {
-        match kind {
-            "usecase" => scan.usecases.iter().find(|u| u.file == declaring).map(|u| u.testgroup.clone()),
-            "interface" => scan.interfaces.iter().find(|i| i.file == declaring).map(|i| i.testgroup.clone()),
-            _ => scan.nodes.iter().find(|n| n.path == declaring).map(|n| n.testgroup.clone()),
-        }
-        .unwrap_or_default()
-    };
-    // Test-Loop gate state per row (effective for objects — ancestry resolved;
-    // own flag for use-cases/interfaces), so parked groups show as omitted
-    // instead of silently vanishing.
-    let tl_of = |kind: &str, declaring: &str| -> Value {
-        let state = match kind {
-            "usecase" => scan
-                .usecases
-                .iter()
-                .find(|u| u.file == declaring)
-                .map(|u| markers::own_test_loop(&u.test_loop, &u.file)),
-            "interface" => scan
-                .interfaces
-                .iter()
-                .find(|i| i.file == declaring)
-                .map(|i| markers::own_test_loop(&i.test_loop, &i.file)),
-            _ => scan.nodes.iter().find(|n| n.path == declaring).map(|n| markers::effective_test_loop(n, &scan.nodes)),
-        };
+    let (_proj, scan) = markers::scan_project(project);
+    let ts_json = |state: markers::TestState| -> Value {
         match state {
-            Some(markers::TestLoopState::Omitted { value, by }) => {
-                json!({ "state": "omitted", "value": value, "by": by })
-            }
-            _ => json!({ "state": "included" }),
+            markers::TestState::Omitted { value, by } => json!({ "state": "omitted", "value": value, "by": by }),
+            markers::TestState::Included => json!({ "state": "included" }),
         }
     };
-    let files: Vec<Value> = declared_rows
-        .iter()
-        .map(|(kind, dir, key, name, level, declaring)| {
-            let object_dir = PathBuf::from(dir);
-            let declared = object_dir.join(tg_of(kind, declaring));
-            match declared.canonicalize().ok().and_then(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t))) {
-                Some((tg_file, text)) => {
-                    claimed.push(tg_file.clone());
-                    json!({
-                        "file": tg_file.to_string_lossy(),
-                        "test_dir": tg_file.parent().unwrap_or(&object_dir).to_string_lossy(),
-                        "kind": kind,
-                        "c4_dir": dir,
-                        "c4_key": key,
-                        "c4_name": name,
-                        "c4_level": level,
-                        "marker": declaring,
-                        "test_loop": tl_of(kind, declaring),
-                        "groups": testgroups::parse(&text),
-                    })
-                }
-                None => json!({
-                    "file": declared.to_string_lossy(),
-                    "missing": true,
-                    "kind": kind,
-                    "c4_dir": dir,
-                    "c4_key": key,
-                    "c4_name": name,
-                    "c4_level": level,
-                    "marker": declaring,
-                    "test_loop": tl_of(kind, declaring),
-                    "groups": [],
-                }),
+    let mut files: Vec<Value> = Vec::new();
+    // (kind, dir, key, name, level, declaring, teststate, tg files, missing entries)
+    let mut rows: Vec<(String, String, String, String, String, String, Value, Vec<String>, Vec<String>)> = Vec::new();
+    for n in &scan.nodes {
+        rows.push((
+            "object".into(),
+            n.dir.clone(),
+            n.key.clone(),
+            n.name.clone(),
+            n.level.clone(),
+            n.path.clone(),
+            ts_json(markers::effective_teststate(n, &scan.nodes)),
+            n.testgroups.clone(),
+            n.missing_testgroups.clone(),
+        ));
+    }
+    for u in &scan.usecases {
+        let dir = Path::new(&u.file).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        rows.push((
+            "usecase".into(),
+            dir,
+            String::new(),
+            u.name.clone(),
+            "usecase".into(),
+            u.file.clone(),
+            ts_json(markers::own_teststate(&u.teststate, &u.file)),
+            u.testgroups.clone(),
+            u.missing_testgroups.clone(),
+        ));
+    }
+    for i in &scan.interfaces {
+        let dir = Path::new(&i.file).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        rows.push((
+            "interface".into(),
+            dir,
+            String::new(),
+            i.id.clone(),
+            "interface".into(),
+            i.file.clone(),
+            ts_json(markers::own_teststate(&i.teststate, &i.file)),
+            i.testgroups.clone(),
+            i.missing_testgroups.clone(),
+        ));
+    }
+    let mut undeclared: Vec<Value> = Vec::new();
+    for (kind, dir, key, name, level, declaring, ts, tgs, missing) in rows {
+        if tgs.is_empty() && missing.is_empty() {
+            if kind == "object" {
+                undeclared.push(json!({ "c4_name": name, "c4_level": level, "marker": declaring }));
             }
-        })
-        .collect();
-    let code_root = config::code_root(project, &config::load(project));
-    let orphans: Vec<String> = testgroups::find_files(&code_root)
-        .into_iter()
-        .filter(|f| {
-            let canon = f.canonicalize().unwrap_or_else(|_| f.clone());
-            !claimed.contains(&canon)
-        })
-        .map(|f| f.to_string_lossy().into_owned())
-        .collect();
-    let undeclared: Vec<Value> = scan
-        .nodes
+            continue;
+        }
+        for tg in &tgs {
+            let tg_file = PathBuf::from(tg);
+            let Ok(text) = std::fs::read_to_string(&tg_file) else { continue };
+            files.push(json!({
+                "file": tg_file.to_string_lossy(),
+                "test_dir": tg_file.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| dir.clone()),
+                "kind": kind,
+                "c4_dir": dir,
+                "c4_key": key,
+                "c4_name": name,
+                "c4_level": level,
+                "marker": declaring,
+                "teststate": ts.clone(),
+                "groups": testgroups::parse(&text),
+            }));
+        }
+        for m in &missing {
+            files.push(json!({
+                "file": m,
+                "missing": true,
+                "kind": kind,
+                "c4_dir": dir,
+                "c4_key": key,
+                "c4_name": name,
+                "c4_level": level,
+                "marker": declaring,
+                "teststate": ts.clone(),
+                "groups": [],
+            }));
+        }
+    }
+    let orphans: Vec<String> = scan
+        .orphans
         .iter()
-        .filter(|n| n.testgroup.is_empty())
-        .map(|n| json!({ "c4_name": n.name, "c4_level": n.level, "marker": n.path }))
+        .filter(|o| o.role == "testgroup")
+        .map(|o| o.path.clone())
         .collect();
     json_resp(200, json!({ "files": files, "orphans": orphans, "undeclared": undeclared }))
 }
@@ -1512,18 +1622,6 @@ fn api_validate(req: &Req, project: &Path) -> Resp {
     }
 }
 
-fn expand_root(project: &Path) -> impl Fn(&str) -> PathBuf + '_ {
-    move |s: &str| {
-        if let Some(rest) = s.strip_prefix("~/") {
-            if let Some(home) = std::env::var_os("HOME") {
-                return PathBuf::from(home).join(rest);
-            }
-        }
-        let p = PathBuf::from(s);
-        if p.is_absolute() { p } else { project.join(p) }
-    }
-}
-
 /* ------------------------------------------------------------ SSE */
 
 /// Change feed: watch the queue + closed-file fingerprints, emit an event on change.
@@ -1611,22 +1709,28 @@ mod tests {
         std::fs::create_dir_all(dir.join(".iter")).unwrap();
         let s = slug(&dir);
         assert!(s.starts_with("my-project-"), "sanitized dirname, got {}", s);
-        std::fs::write(dir.join(".iter/projects.json"), r#"{"url_slug":"pdy-dev"}"#).unwrap();
+        std::fs::write(crate::project::config_path(&dir), r#"{"url_slug":"pdy-dev"}"#).unwrap();
         assert_eq!(slug(&dir), "pdy-dev");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn project_settings_defaults_and_overlay() {
+    fn project_settings_reflect_the_two_head_files() {
         let dir = std::env::temp_dir().join(format!("iter-ps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".iter")).unwrap();
         let d = project_settings(&dir);
-        assert_eq!(d["marker_glob"], "**/*.iter.md");
-        std::fs::write(dir.join(".iter/projects.json"), r#"{"project_name":"X","marker_glob":"**/*.x.md"}"#).unwrap();
+        assert_eq!(d["server"]["iterglob"], "**/*.iter.md");
+        std::fs::write(
+            dir.join("main.iter.md"),
+            "---\nprojectname: \"X\"\nglobalscandirs: [\"{topdir}/core/\"]\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("core")).unwrap();
         let d = project_settings(&dir);
-        assert_eq!(d["project_name"], "X");
-        assert_eq!(d["marker_glob"], "**/*.x.md");
-        assert_eq!(d["testgroups_glob"], "**/*testgroup.iter.md", "unset keys keep defaults");
+        assert_eq!(d["project"]["projectname"], "X");
+        assert_eq!(d["project_name"], "X", "legacy alias rides along");
+        assert!(d["resolved"]["scandirs"][0].as_str().unwrap().ends_with("core"), "{}", d);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

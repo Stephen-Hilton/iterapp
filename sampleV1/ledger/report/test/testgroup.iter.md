@@ -1,3 +1,10 @@
+---
+name: "test testgroup"
+description: "testgroup for test"
+children:
+  testpaths: ["{thisfiledir}/*.sh"]
+---
+
 # Report Renderer — test groups
 
 The Renderer's whole job is reading, so its tests care about two things: that the

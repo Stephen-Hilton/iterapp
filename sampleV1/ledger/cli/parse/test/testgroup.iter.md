@@ -1,3 +1,10 @@
+---
+name: "test testgroup"
+description: "testgroup for test"
+children:
+  testpaths: ["{thisfiledir}/*.sh"]
+---
+
 # Command Parser — test groups
 
 The Parser is where every judgment about a typed request lives, so its tests are
