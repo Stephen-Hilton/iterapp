@@ -1112,7 +1112,7 @@ fn cmd_teststate(
     let mut edited = 0usize;
     for (action, refs) in edits {
         for target in refs {
-            match markers::teststate_apply(&scan_now(), target, action) {
+            match markers::teststate_apply(&scan_now(), target, action, false) {
                 Ok(summary) => {
                     println!("{}", summary);
                     edited += 1;

@@ -2573,8 +2573,9 @@ function tlBadge(tl){
     title="Omitted from the Test Loop (teststate: ${esc(tl.value)}${tl.by ? ' via ' + esc(tl.by) : ''})${hard ? ' — BLOCKED: outside/vendor setup missing; only editing the node file lifts it' : ' — the sweep skips this object; agents may re-include it'}">⛔ ${hard ? 'blocked' : 'no test loop'}</span>`;
 }
 
-/* The engine-owned toggle: POST /api/teststate shares `iter teststate`'s edit +
-   refusal rules (a block flag refuses everything but a human file edit). */
+/* The engine-owned edit: POST /api/teststate is the HUMAN surface, so any
+   change is allowed here — including lifting a block (the CLI, the agents'
+   path, still refuses to touch a block flag). */
 async function tlApply(action, target){
   if (!LIVE) { toast(`Mock mode — would set teststate ${action} on ${target}`); return; }
   try {
@@ -2585,16 +2586,23 @@ async function tlApply(action, target){
   } catch (e) { toast('Test loop: ' + e.message); }
 }
 
-function tlButtons(ref, own, effOmitted){
+/* ONE control: the file's OWN teststate flag as a selector. `inherit` is the
+   default (do whatever the parent chain does); the badge beside the row shows
+   the EFFECTIVE state after DAG resolution. Block is agent-proof, not
+   human-proof: picking anything else here lifts it. */
+function tlSelector(ref, own){
   own = (own || '').trim();
-  if (own === 'block' || own === 'blocked') {
-    return `<span class="useb" title="teststate: block — outside/vendor setup missing. Agent-proof: only a human editing the file lifts it.">⛔ blocked (edit the file to lift)</span>`;
-  }
-  return (effOmitted
-      ? `<button class="btn" data-tlact="include" data-tlref="${esc(ref)}" title="Re-enter the Test Loop (works under an omitted ancestor — nearest flag wins)">Include in Test Loop</button>`
-      : `<button class="btn" data-tlact="omit" data-tlref="${esc(ref)}" title="Park this out of the Test Loop — the sweep skips it (and everything beneath it) until re-included">Omit from Test Loop</button>`)
-    + (own && own !== 'inherit' ? `<button class="btn" data-tlact="clear" data-tlref="${esc(ref)}" title="Remove this file's own teststate flag; ancestors/default apply again">Clear flag</button>` : '')
-    + `<button class="btn" data-tlact="block" data-tlref="${esc(ref)}" title="Hard park: outside/vendor setup missing. Agents cannot re-include it — only a human editing the file can.">Block (vendor)</button>`;
+  if (own === 'blocked') own = 'block'; // V1 spelling
+  if (own === '') own = 'inherit';
+  const opt = (v, label, why) =>
+    `<option value="${v}" ${own === v ? 'selected' : ''} title="${esc(why)}">${label}</option>`;
+  return `<label class="useb" style="display:inline-flex;align-items:center;gap:6px;background:none;padding:0">teststate:
+    <select data-tlsel data-tlref="${esc(ref)}" title="This file's own teststate flag. The effective state (after parents) shows in the row badge.">
+      ${opt('inherit', 'inherit (default)', 'no opinion — do whatever the parent chain does')}
+      ${opt('omit', 'omit', 'park this (and everything beneath it) out of the Test Loop; agents may re-include')}
+      ${opt('include', 'include', 're-enter the Test Loop, even under an omitted ancestor (nearest flag wins)')}
+      ${opt('block', 'block', 'hard park — outside/vendor setup missing; AGENTS cannot lift this, only this selector (or a file edit) can')}
+    </select></label>`;
 }
 
 function orderedMarkers(){
@@ -2644,7 +2652,7 @@ async function renderProjects(){
           <button class="btn" data-reqlb="techreq" data-node="${esc(m.path)}">Tech Requirements</button>
           <button class="btn" data-testlb data-node="${esc(m.path)}">Testing</button>
           <button class="btn" data-viewmarker="${esc(m.path)}">View Marker File</button>
-          ${tlButtons(m.path, m.teststate, tl.state === 'omitted')}
+          ${tlSelector(m.path, m.teststate)}
         </div>
       </div>` : ''}`;
     }).join('');
@@ -2675,7 +2683,7 @@ async function renderProjects(){
       <div class="dlabel">Consumers</div><div>${consumers.length ? consumers.map(m => `<span class="useb">${esc(m.name)}</span>`).join(' ') : '<span style="color:var(--text-dim)">none declared</span>'}</div>
       <div class="dlabel">Contract</div>
       <div class="textblock mono" style="max-height:60vh">${esc(i.body || '(no contract body in the marker yet — the file is frontmatter only)')}</div>
-      <div class="actions">${tlButtons(i.file, i.teststate, ['omit','block','blocked'].includes((i.teststate || '').trim()))}</div>
+      <div class="actions">${tlSelector(i.file, i.teststate)}</div>
     </div>` : ''}`;
   }).join('');
 
@@ -2708,7 +2716,7 @@ async function renderProjects(){
       <div class="actions">
         <button class="btn primary" data-ucedit="${idx}">Edit</button>
         <button class="btn" data-ucdel="${idx}">Delete</button>
-        ${tlButtons(u.file, u.teststate, uOmit)}
+        ${tlSelector(u.file, u.teststate)}
       </div>
     </div>` : ''}`;
   }).join('');
@@ -2844,6 +2852,12 @@ async function ucDelete(idx){
   } catch (e) { toast('Delete failed: ' + e.message); }
 }
 
+document.addEventListener('change', (e) => {
+  if (!document.getElementById('view-projects').classList.contains('active')) return;
+  const sel = e.target.closest('[data-tlsel]');
+  if (sel) tlApply(sel.value, sel.dataset.tlref);
+});
+
 function projClick(e){
   const ol = e.target.closest('[data-orphanlink]');
   if (ol) {
@@ -2865,8 +2879,6 @@ function projClick(e){
       .catch(err => toast('Read failed: ' + err.message));
     return true;
   }
-  const tla = e.target.closest('[data-tlact]');
-  if (tla) { tlApply(tla.dataset.tlact, tla.dataset.tlref); return true; }
   const mk_ = e.target.closest('[data-mkworkitem]');
   if (mk_) {
     const m = markerByRef(mk_.dataset.mkworkitem);

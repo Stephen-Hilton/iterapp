@@ -1419,11 +1419,14 @@ fn api_teststate(req: &Req, project: &Path) -> Resp {
         Some("omit") => markers::TestStateAction::Omit,
         Some("include") => markers::TestStateAction::Include,
         Some("block") | Some("blocked") => markers::TestStateAction::Block,
+        Some("inherit") => markers::TestStateAction::Inherit,
         Some("clear") => markers::TestStateAction::Clear,
-        _ => return err_resp(400, "action must be omit|include|block|clear"),
+        _ => return err_resp(400, "action must be inherit|omit|include|block|clear"),
     };
+    // The webapp is the HUMAN surface: lifting a block here is the sanctioned
+    // path (the CLI — the agents' path — still refuses).
     let (_p, scan) = markers::scan_project(project);
-    match markers::teststate_apply(&scan, target, action) {
+    match markers::teststate_apply(&scan, target, action, true) {
         Ok(summary) => json_resp(200, json!({ "summary": summary })),
         Err(e) => err_resp(409, &e),
     }

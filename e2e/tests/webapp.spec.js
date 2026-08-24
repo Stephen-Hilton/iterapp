@@ -37,7 +37,7 @@ test.describe('projects view (the structureV2 DAG)', () => {
     await expect(page.locator('.pdetail').first()).toContainText('Node file');
     await expect(page.locator('.pdetail').first()).toContainText('CodeDirs');
     await expect(page.locator('.pdetail').first()).toContainText('Inputs / Outputs');
-    await expect(page.locator('[data-tlact]').first()).toBeVisible();
+    await expect(page.locator('[data-tlsel]').first()).toBeVisible();
     // "View Node File" shows the REAL file — the children mapping included,
     // never a synthesized frontmatter fragment (the V1 lightbox regression).
     await page.locator('[data-viewmarker]').first().click();
@@ -59,16 +59,24 @@ test.describe('projects view (the structureV2 DAG)', () => {
     await expect(page.locator('body')).toContainText('Stray Component');
   });
 
-  test('teststate omit/include round-trips through the engine', async ({ page }) => {
+  test('the teststate selector round-trips every state, block lift included', async ({ page }) => {
     await page.goto('/#/projects');
-    const row = page.locator('.prow', { hasText: 'Entry Store' }).first();
-    await row.click();
-    await page.locator('[data-tlact="omit"]').first().click();
+    await page.locator('.prow', { hasText: 'Entry Store' }).first().click();
+    const sel = () => page.locator('[data-tlsel]').first();
+    await sel().selectOption('omit');
     await expect(page.locator('body')).toContainText('teststate → omit');
-    // The detail re-renders in place: the badge shows and Include is offered.
-    await expect(page.locator('[data-tlact="include"]').first()).toBeVisible();
-    await page.locator('[data-tlact="include"]').first().click();
+    await expect(sel()).toHaveValue('omit');
+    await sel().selectOption('include');
     await expect(page.locator('body')).toContainText('teststate → include');
+    // Back to the default — no separate "clear flag" button anymore.
+    await sel().selectOption('inherit');
+    await expect(page.locator('body')).toContainText('teststate → inherit');
+    // Block is agent-proof, NOT human-proof: the selector lifts it.
+    await sel().selectOption('block');
+    await expect(page.locator('body')).toContainText('teststate → block');
+    await expect(sel()).toBeEnabled();
+    await sel().selectOption('inherit');
+    await expect(page.locator('body')).toContainText('teststate → inherit');
   });
 });
 

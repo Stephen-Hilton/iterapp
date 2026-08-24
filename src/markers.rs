@@ -1110,6 +1110,9 @@ pub enum TestStateAction {
     Omit,
     Include,
     Block,
+    /// Write `teststate: inherit` explicitly (the canonical default form).
+    Inherit,
+    /// Remove the key entirely (inherit by absence).
     Clear,
 }
 
@@ -1166,16 +1169,23 @@ fn resolve_teststate_target(scan: &Scan, target: &str) -> Result<TestStateTarget
     }
 }
 
-/// Apply one teststate edit. Refusals guard the `block` contract: an existing
-/// `block` survives everything except a human editing the file, and an
-/// `include` under a blocked ANCESTOR refuses too, since it could never take
-/// effect. Returns a one-line summary of what changed.
-pub fn teststate_apply(scan: &Scan, target: &str, action: TestStateAction) -> Result<String, String> {
+/// Apply one teststate edit. The `block` contract is AGENT-proof, not
+/// human-proof: with `lift_block: false` (the CLI — the agents' path) an
+/// existing `block` refuses everything except re-blocking, while
+/// `lift_block: true` (the webapp — a human at the controls) changes it
+/// freely. An `include` under a blocked ANCESTOR refuses on both paths,
+/// since it could never take effect. Returns a one-line summary.
+pub fn teststate_apply(
+    scan: &Scan,
+    target: &str,
+    action: TestStateAction,
+    lift_block: bool,
+) -> Result<String, String> {
     let t = resolve_teststate_target(scan, target)?;
-    if t.current == TS_BLOCK && action != TestStateAction::Block {
+    if t.current == TS_BLOCK && action != TestStateAction::Block && !lift_block {
         return Err(format!(
             "{} is teststate: block (outside/vendor setup missing) — refusing to change it; \
-             a human lifts a block by editing {}",
+             a human lifts the block in the webapp (or by editing {})",
             t.label, t.path
         ));
     }
@@ -1202,6 +1212,7 @@ pub fn teststate_apply(scan: &Scan, target: &str, action: TestStateAction) -> Re
         TestStateAction::Omit => Some(TS_OMIT),
         TestStateAction::Include => Some(TS_INCLUDE),
         TestStateAction::Block => Some(TS_BLOCK),
+        TestStateAction::Inherit => Some(TS_INHERIT),
         TestStateAction::Clear => None,
     };
     // Drop any legacy V1 key so old and new flags can never disagree.
@@ -1566,14 +1577,20 @@ prose here
         );
         let project = project_in(&dir);
         let s = scan(&project);
+        // The agents' path (lift_block: false): block refuses everything.
         for action in [TestStateAction::Include, TestStateAction::Omit, TestStateAction::Clear] {
-            let err = teststate_apply(&s, "Vendor", action).unwrap_err();
+            let err = teststate_apply(&s, "Vendor", action, false).unwrap_err();
             assert!(err.contains("block"), "{:?}: {}", action, err);
         }
-        let err = teststate_apply(&s, "Pay", TestStateAction::Include).unwrap_err();
+        let err = teststate_apply(&s, "Pay", TestStateAction::Include, false).unwrap_err();
         assert!(err.contains("blocked ancestor"), "{}", err);
-        assert!(teststate_apply(&s, "nope", TestStateAction::Omit).unwrap_err().contains("matches no"));
-        let summary = teststate_apply(&s, "Core", TestStateAction::Include).unwrap();
+        assert!(teststate_apply(&s, "nope", TestStateAction::Omit, false).unwrap_err().contains("matches no"));
+        // The human path (lift_block: true — the webapp): block lifts freely.
+        let summary = teststate_apply(&s, "Vendor", TestStateAction::Inherit, true).unwrap();
+        assert!(summary.contains("inherit"), "{}", summary);
+        let text = std::fs::read_to_string(dir.join("vendor/vendor.code.iter.md")).unwrap();
+        assert!(text.contains("teststate: inherit"), "{}", text);
+        let summary = teststate_apply(&s, "Core", TestStateAction::Include, false).unwrap();
         assert!(summary.contains("include"), "{}", summary);
         let text = std::fs::read_to_string(dir.join("core/core.code.iter.md")).unwrap();
         assert!(text.contains("teststate: include"), "{}", text);
