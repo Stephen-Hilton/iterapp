@@ -1,6 +1,7 @@
 mod agents;
 mod config;
 mod context;
+mod db;
 mod itersched;
 mod limits;
 mod locks;
@@ -126,14 +127,17 @@ enum Command {
         #[arg(long)]
         file: Option<PathBuf>,
     },
-    /// Synchronous critical review: runs the `_critic.md` persona as a subprocess
-    /// and prints its feedback to stdout — no work items involved
+    /// Synchronous critical review: runs the `_critic.md` persona as a subprocess,
+    /// prints its feedback to stdout, and records the round in the `critiques`
+    /// table. Run it again with --disposition to report what you did with the
+    /// feedback — that is what turns the table from "the critic spoke N times"
+    /// into "the critic caught something real N times".
     Critreview {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// File containing the material to review (plan text, change summary, …)
         #[arg(long)]
-        file: PathBuf,
+        file: Option<PathBuf>,
         /// Context file the critic should also read (repeatable)
         #[arg(long)]
         context: Vec<PathBuf>,
@@ -141,6 +145,15 @@ enum Command {
         /// exhaustion first; exhaustion aborts with exit 3 instead of retrying)
         #[arg(long, default_value_t = 1)]
         max_retry: u32,
+        /// Report back on a review that already ran, instead of running one:
+        /// revised (you changed the work because of it) | rejected (you
+        /// considered and disagreed — say why in your output) | no-findings
+        /// (the critic raised nothing actionable)
+        #[arg(long)]
+        disposition: Option<String>,
+        /// Which round --disposition refers to (default: this item's latest)
+        #[arg(long)]
+        round: Option<i64>,
     },
     /// Deterministic test runner: run a testgroup's shell scripts, log to
     /// <test_dir>/runs/, and update the group's lastrun/result/counts.
@@ -344,6 +357,27 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Dump one table of the project database as jsonl, for backup, grep, and
+    /// git-friendly inspection. The queue stopped being a text file when it
+    /// moved into SQLite; this and the `sqlite3` CLI are the replacement. An
+    /// exported `workitems` line is a valid work item that `iter add --file`
+    /// accepts, so a dump round-trips.
+    Export {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// workitems | critiques | questions | spend | sched_log
+        #[arg(long)]
+        table: String,
+        /// Write here instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// workitems only: just the archive
+        #[arg(long)]
+        archived: bool,
+        /// workitems only: just the open queue
+        #[arg(long)]
+        open: bool,
+    },
     /// Queue summary, active agents, and locks
     Status {
         #[arg(long, default_value = ".")]
@@ -374,8 +408,8 @@ fn main() {
             cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation, model, question)
         }
         Command::Ask { project, question, file } => cmd_ask(project, question, file),
-        Command::Critreview { project, file, context, max_retry } => {
-            cmd_critreview(project, file, context, max_retry)
+        Command::Critreview { project, file, context, max_retry, disposition, round } => {
+            cmd_critreview(project, file, context, max_retry, disposition, round)
         }
         Command::Runtests { project, group, test, broken, fixed, timeout_min } => {
             cmd_runtests(project, group, test, broken, fixed, timeout_min)
@@ -399,6 +433,9 @@ fn main() {
         Command::Stubdesc { project } => cmd_stubdesc(project),
         Command::Validate { project, file, fix, template } => cmd_validate(project, file, fix, template),
         Command::Tempsweep { project, dry_run } => cmd_tempsweep(project, dry_run),
+        Command::Export { project, table, out, archived, open } => {
+            cmd_export(project, table, out, archived, open)
+        }
         Command::Status { project } => cmd_status(project),
         Command::Stop { project, wait } => cmd_stop(project, wait),
         Command::Init { dest, from } => cmd_init(dest, from),
@@ -866,6 +903,12 @@ fn cmd_add(
     }
     match queue.append(&item) {
         Ok(()) => {
+            // An item BORN in `question` starts its wait now; one that arrived
+            // carrying an answer already (a clone, a hand-authored replay) never
+            // waited on anybody and would only pollute the timings.
+            if asks_question {
+                log_question(&project, &item.workid, item.question.trim());
+            }
             println!("added {} \"{}\" (type {}, priority {})", item.workid, item.title, item.item_type, item.priority);
             0
         }
@@ -887,7 +930,21 @@ fn cmd_add(
 /// running and this review is how it finishes its work — the engine throttles
 /// at agent start (max_agents_at_80/90/95), never mid-flight. The critic's spend
 /// is still recorded to the ledger as receipts; recording never throttles.
-fn cmd_critreview(project: PathBuf, file: PathBuf, context: Vec<PathBuf>, max_retry: u32) -> i32 {
+fn cmd_critreview(
+    project: PathBuf,
+    file: Option<PathBuf>,
+    context: Vec<PathBuf>,
+    max_retry: u32,
+    disposition: Option<String>,
+    round: Option<i64>,
+) -> i32 {
+    if let Some(d) = disposition {
+        return critreview_disposition(&project, &d, round, file.is_some());
+    }
+    let Some(file) = file else {
+        eprintln!("error: --file <material> is required (or --disposition to report on a review that already ran)");
+        return 2;
+    };
     // Heal so projects created before _critic.md existed still get the persona.
     let _ = template::ensure_project(&project);
     let critic_path = agents::agents_dir(&project).join("_critic.md");
@@ -937,7 +994,17 @@ fn cmd_critreview(project: PathBuf, file: PathBuf, context: Vec<PathBuf>, max_re
                         output_tokens: out.output_tokens,
                     },
                 );
+                let round = record_critique_round(&project, &file, out.text.trim());
                 println!("{}", out.text.trim());
+                if let Some(round) = round {
+                    // Told on stderr so the review on stdout stays exactly what
+                    // it was — several agents pipe this straight into a file.
+                    eprintln!(
+                        "critreview: recorded as round {}. When you have acted on it, report back with: \
+                         iter critreview --disposition <revised|rejected|no-findings> --round {}",
+                        round, round
+                    );
+                }
                 return 0;
             }
             Ok(_) => last_err = "critic returned empty output".into(),
@@ -1259,6 +1326,11 @@ fn cmd_ask(project: PathBuf, question: Option<String>, file: Option<PathBuf>) ->
     let path = scheduler::question_path(&project, &workid);
     match std::fs::write(&path, text) {
         Ok(()) => {
+            // Timed HERE, not when the engine notices the flag at the turn
+            // boundary: the clock this table exists to read is "how long did a
+            // decision wait on a human", and the wait starts the moment the
+            // agent stopped being able to proceed.
+            log_question(&project, &workid, text);
             println!(
                 "work item {} flagged with a question; the engine parks it in the `question` state at \
                  this turn's boundary, and it queues again when a human answers it in the webapp. \
@@ -1561,6 +1633,137 @@ fn cmd_invert_priorities(project: PathBuf) -> i32 {
     }
 }
 
+/// Start the clock on a question, in the `questions` table.
+///
+/// The question and its answer also live on the work item — that pair is what
+/// the agent reads when it resumes. This row is the other half: the item holds
+/// only the CURRENT question, so once a second one is asked (or the item is
+/// closed) the record of the first is gone, and "how long did each decision wait
+/// on a human" becomes unanswerable. The answer side is written by the server
+/// when a person submits it (`db::record_answer`).
+///
+/// Best-effort: bookkeeping must never be the reason an agent's question fails
+/// to reach a human.
+fn log_question(project: &Path, workid: &str, question: &str) {
+    if let Ok(conn) = db::open(project) {
+        db::record_question(&conn, workid, question, &workitems::now_iso());
+    }
+}
+
+/// The dispositions an agent may report, and what each one asserts.
+const DISPOSITIONS: &[&str] = &["revised", "rejected", "no-findings"];
+
+/// How much of the reviewed material is kept alongside the critique. Enough for
+/// a plan or a change summary; a cap exists because nothing stops an agent
+/// pointing the critic at a 10 MB file, and one row must not be able to bloat
+/// the database the whole project shares.
+const MATERIAL_CAP: usize = 64 * 1024;
+
+/// Write one review into the `critiques` table, returning its round number.
+///
+/// The engine writes this, not the agent — same idiom as `iter usecase` and
+/// `iter teststate`, and the reason is the same: an agent that has to remember
+/// to persist something eventually does not. It is also why the material is
+/// COPIED in rather than referenced by path: the material file lives in
+/// `.iter/temp/`, which the sweeper is entitled to delete, so a stored path
+/// decays into a dangling reference to the very evidence this table exists to
+/// keep. First line is the path, then a blank line, then the text.
+///
+/// `agent_type` comes from the CALLING work item's type, which is what "per
+/// agent type" in the reporting question means — a plan reviewed and a code
+/// change reviewed are different populations. Outside an engine run there is no
+/// calling item, and the row is still written with an empty workid: a review
+/// somebody ran by hand still happened.
+fn record_critique_round(project: &Path, material_path: &Path, critique: &str) -> Option<i64> {
+    let workid = std::env::var("ITER_WORKID").unwrap_or_default();
+    let cfg = config::load(project);
+    let agent_type = if workid.is_empty() {
+        String::new()
+    } else {
+        Queue::new(project, &cfg).get(&workid).map(|(i, _)| i.item_type).unwrap_or_default()
+    };
+    let mut material = std::fs::read_to_string(material_path).unwrap_or_default();
+    if material.len() > MATERIAL_CAP {
+        material.truncate(MATERIAL_CAP);
+        material.push_str("\n… [truncated at 64 KiB]");
+    }
+    let material = format!("{}\n\n{}", material_path.display(), material);
+
+    let conn = db::open(project).ok()?;
+    let round = db::next_critique_round(&conn, &workid);
+    db::record_critique(
+        &conn,
+        &workid,
+        round,
+        "_critic",
+        &agent_type,
+        &material,
+        critique,
+        &workitems::now_iso(),
+    )
+    .ok()?;
+    Some(round)
+}
+
+/// `iter critreview --disposition <d> [--round <n>]`: what the reviewed agent
+/// DID with the feedback. Without it the table answers "how often did the critic
+/// speak", which nobody asked; the question is "how often did it catch something
+/// real", and only the agent that consumed the review knows that.
+///
+/// Exit codes: 0 = recorded; 2 = bad invocation, including a round that has no
+/// row (a wrong round number recorded silently would be worse than a refusal —
+/// it would put a disposition on somebody else's review).
+fn critreview_disposition(project: &Path, disposition: &str, round: Option<i64>, had_file: bool) -> i32 {
+    if had_file {
+        eprintln!("error: --disposition reports on a review that already ran; do not pass --file");
+        return 2;
+    }
+    let disposition = disposition.trim();
+    if !DISPOSITIONS.contains(&disposition) {
+        eprintln!(
+            "error: --disposition must be one of {} (got \"{}\")",
+            DISPOSITIONS.join(", "),
+            disposition
+        );
+        return 2;
+    }
+    let workid = std::env::var("ITER_WORKID").unwrap_or_default();
+    let conn = match db::open(project) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot open the project database: {}", e);
+            return 2;
+        }
+    };
+    match db::set_critique_disposition(&conn, &workid, round, disposition) {
+        Ok(true) => {
+            println!(
+                "recorded disposition \"{}\" for {}",
+                disposition,
+                match round {
+                    Some(r) => format!("round {}", r),
+                    None => "the latest round".into(),
+                }
+            );
+            0
+        }
+        Ok(false) => {
+            eprintln!(
+                "error: no critique round to report on{} — run `iter critreview --file <material>` first",
+                match round {
+                    Some(r) => format!(" (no round {} for this work item)", r),
+                    None => String::new(),
+                }
+            );
+            2
+        }
+        Err(e) => {
+            eprintln!("error: cannot record the disposition: {}", e);
+            1
+        }
+    }
+}
+
 /// Flag the calling work item ($ITER_WORKID, injected by the engine) as failed.
 /// The scheduler consumes the flag at the next turn boundary. Manual CLI use
 /// (no ITER_WORKID) skips the flag — there is no item to fail.
@@ -1711,6 +1914,77 @@ fn cmd_tempsweep(project: PathBuf, dry_run: bool) -> i32 {
     if report.errors.is_empty() { 0 } else { 1 }
 }
 
+/// Dump one table as jsonl. Exit codes: 0 = dumped; 2 = unknown table or no
+/// project. The row count goes to STDERR, never stdout, so
+/// `iter export --table workitems > queue.jsonl` produces a file with nothing in
+/// it but work items.
+fn cmd_export(
+    project: PathBuf,
+    table: String,
+    out: Option<PathBuf>,
+    archived: bool,
+    open: bool,
+) -> i32 {
+    let Some(project) = project_or_bail(&project) else { return 2 };
+    let table = table.trim();
+    if !db::EXPORTABLE.contains(&table) {
+        eprintln!(
+            "error: unknown table \"{}\" — valid tables are: {}",
+            table,
+            db::EXPORTABLE.join(", ")
+        );
+        return 2;
+    }
+    if archived && open {
+        eprintln!("error: --archived and --open are opposite halves of the queue; pass one or neither");
+        return 2;
+    }
+    // The archive line only exists for work items; silently accepting the flag
+    // on a table that has no such split would export the whole table and look
+    // like a filter that did nothing.
+    if (archived || open) && table != "workitems" {
+        eprintln!("error: --archived/--open apply to workitems only (\"{}\" has no archive)", table);
+        return 2;
+    }
+    let scope = if archived {
+        db::ExportScope::Archived
+    } else if open {
+        db::ExportScope::Open
+    } else {
+        db::ExportScope::All
+    };
+    // Through Queue rather than db::open, so a project still on jsonl exports
+    // what those files held instead of an empty table.
+    let cfg = config::load(&project);
+    let _ = Queue::new(&project, &cfg);
+    let conn = match db::open(&project) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot open the project database: {}", e);
+            return 2;
+        }
+    };
+    let lines = match db::export_table(&conn, table, scope) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: cannot export {}: {}", table, e);
+            return 2;
+        }
+    };
+    let body: String = lines.iter().map(|l| format!("{}\n", l)).collect();
+    match &out {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &body) {
+                eprintln!("error: cannot write {}: {}", path.display(), e);
+                return 1;
+            }
+            eprintln!("exported {} row(s) from {} to {}", lines.len(), table, path.display());
+        }
+        None => print!("{}", body),
+    }
+    0
+}
+
 fn cmd_status(project: PathBuf) -> i32 {
     let Some(project) = project_or_bail(&project) else { return 2 };
     let cfg = config::load(&project);
@@ -1718,12 +1992,17 @@ fn cmd_status(project: PathBuf) -> i32 {
     let items = queue.load();
     let count = |s: &str| items.iter().filter(|i| i.state == s).count();
     println!("queue: {} open", items.len());
-    // What follows is a FILE read, not the running engine's memory. The stamp
-    // says how old it is — reading hours-stale states as current is how a
-    // session concluded four completed items were still parked in todo.
-    match queue.read_meta() {
-        Some(m) => println!("  snapshot written {} by pid {}", m.written, m.pid),
-        None => println!("  snapshot age unknown (no queue.meta.json — nothing has written the queue yet)"),
+    // Where these numbers came from. The old stale-snapshot warning is gone
+    // with the file it warned about: this is a live read of the same database
+    // the running engine writes, committed transaction by transaction, so
+    // "current or hours old?" is no longer a question anyone has to ask.
+    println!("  database: {}", db::db_path(&project).display());
+    if let Ok(conn) = db::open(&project) {
+        let rows: Vec<String> = db::EXPORTABLE
+            .iter()
+            .map(|t| format!("{} {}", db::table_count(&conn, t), t))
+            .collect();
+        println!("  rows: {} (iter export --table <name> dumps any of them as jsonl)", rows.join(", "));
     }
     for state in ["queued", "in-progress", "paused", "failed", "todo", "question"] {
         let n = count(state);

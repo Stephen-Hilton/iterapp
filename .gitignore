@@ -10,3 +10,13 @@ logs/
 
 # OS
 .DS_Store
+
+# SQLite storage (features/sqlite_storage.md). The database is per-machine
+# runtime state; sample projects ship their queue as jsonl seed data, which the
+# engine imports on first run — the *.imported files are that one-time rename's
+# leftovers, kept on disk as the escape hatch but never committed.
+**/.iter/.engine/iter.db
+**/.iter/.engine/iter.db-wal
+**/.iter/.engine/iter.db-shm
+*.jsonl.imported
+**/.iter/.engine/queue.meta.json

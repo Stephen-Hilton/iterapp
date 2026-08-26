@@ -105,11 +105,39 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+/// Put a work item straight into the project's queue. Storage is SQLite now, so
+/// this inserts a row rather than appending a jsonl line — and it lets the real
+/// binary create the schema first (one cheap `iter status`) instead of keeping a
+/// second copy of the CREATE TABLE here, which would drift the moment db.rs
+/// changed.
 fn seed(root: &Path, line: &str) {
-    use std::io::Write;
-    let path = root.join(".iter/.engine/workitems.jsonl");
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
-    writeln!(f, "{}", line).unwrap();
+    let db = root.join(".iter/.engine/iter.db");
+    if !db.exists() {
+        let _ = Command::new(BIN).args(["status", "--project", root.to_str().unwrap()]).output();
+    }
+    let v: serde_json::Value = serde_json::from_str(line).expect("seed line is a work item");
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let times = v.get("times").cloned().unwrap_or(serde_json::json!({}));
+    let t = |k: &str| times.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let conn = rusqlite::Connection::open(&db).expect("open the project database");
+    conn.execute(
+        "INSERT OR REPLACE INTO workitems
+           (workid, seq, archived, state, item_type, title, priority, source, created_by, added, closed, body)
+         VALUES (?1, (SELECT IFNULL(MAX(seq), 0) + 1 FROM workitems), 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            s("workid"),
+            s("state"),
+            s("type"),
+            s("title"),
+            v.get("priority").and_then(|x| x.as_i64()).unwrap_or(5),
+            s("source"),
+            s("created_by"),
+            t("added"),
+            t("closed"),
+            line,
+        ],
+    )
+    .expect("seed insert");
 }
 
 fn workitem_json(id: &str, typ: &str, title: &str, codepath: &str, mainwork: &str, prework: &str, postwork: &str) -> String {
@@ -159,20 +187,34 @@ fn run_engine(root: &Path, stub: &Path, timeout: Duration) -> String {
     }
 }
 
+/// Durable state lives in SQLite now (features/sqlite_storage.md), so the test
+/// helpers read the database rather than the retired jsonl files. `seed()` still
+/// WRITES jsonl: the engine imports it on first touch, which keeps the seeding
+/// idiom unchanged and exercises the importer on every run that uses it.
+fn items_where(root: &Path, archived: i64) -> Vec<serde_json::Value> {
+    let db = root.join(".iter/.engine/iter.db");
+    if !db.exists() {
+        return Vec::new();
+    }
+    let conn = rusqlite::Connection::open(db).expect("open the project database");
+    let mut stmt = conn
+        .prepare("SELECT body FROM workitems WHERE archived = ?1 ORDER BY seq, rowid")
+        .expect("workitems table exists");
+    let rows = stmt
+        .query_map([archived], |r| r.get::<_, String>(0))
+        .expect("query runs")
+        .flatten()
+        .map(|b| serde_json::from_str(&b).expect("stored body parses"))
+        .collect();
+    rows
+}
+
 fn closed_items(root: &Path) -> Vec<serde_json::Value> {
-    let text = std::fs::read_to_string(root.join(".iter/.engine/workitems_closed.jsonl")).unwrap_or_default();
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).expect("closed line parses"))
-        .collect()
+    items_where(root, 1)
 }
 
 fn open_items(root: &Path) -> Vec<serde_json::Value> {
-    let text = std::fs::read_to_string(root.join(".iter/.engine/workitems.jsonl")).unwrap_or_default();
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).expect("open line parses"))
-        .collect()
+    items_where(root, 0)
 }
 
 #[test]
@@ -290,7 +332,7 @@ fn ask_parks_for_a_human_then_the_answer_reaches_the_agent() {
     item["answer"] = serde_json::json!("Go with A, sqlite. ANSWERED_MARKER");
     item["state"] = serde_json::json!("queued");
     item["times"]["answered"] = serde_json::json!("2026-08-24T18:00:00Z");
-    std::fs::write(root.join(".iter/.engine/workitems.jsonl"), format!("{}\n", item)).unwrap();
+    seed(&root, &item.to_string()); // INSERT OR REPLACE — the same row, answered
 
     // --- the answered run
     run_engine(&root, &stub, Duration::from_secs(60));
@@ -830,9 +872,11 @@ fn closed_items_can_be_deleted_and_other_verbs_explain_themselves() {
     // Delete now reaches the archive.
     let del = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"delete"}"#));
     assert!(del.contains("deleted"), "a closed item must be deletable: {}", del);
-    let list = http(port, "GET", "/api/workitems", None);
+    // The archive is its own paginated endpoint now — the list ships open items
+    // only, which is the payload diet the SQLite move exists to deliver.
+    let list = http(port, "GET", "/api/workitems?archived=1&offset=0&limit=50", None);
     let parsed: serde_json::Value =
-        serde_json::from_str(list.split("\r\n\r\n").nth(1).unwrap_or("")).expect("list parses");
+        serde_json::from_str(list.split("\r\n\r\n").nth(1).unwrap_or("")).expect("archive page parses");
     assert!(
         !parsed["closed"].as_array().unwrap().iter().any(|i| i["workid"] == id.as_str()),
         "the archive entry is really gone"
@@ -1086,7 +1130,15 @@ fn critreview_success_abort_and_retry_paths() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("VERDICT: sound with fixes"), "{}", stdout);
-    let ledger = std::fs::read_to_string(root.join(".iter/.engine/spend.jsonl")).unwrap();
+    // The ledger is a table now; `iter export` is the text-file escape hatch.
+    let ledger = String::from_utf8_lossy(
+        &Command::new(BIN)
+            .args(["export", "--project", root.to_str().unwrap(), "--table", "spend"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
     assert!(ledger.contains("\"workid\":\"critreview\""), "critic spend is receipted: {}", ledger);
     assert!(take_flag().is_none(), "a delivered review must not flag failure");
 
@@ -1229,14 +1281,12 @@ fn third_plan_for_same_testgroup_is_held_todo_by_nonconvergence_guard() {
 #[test]
 fn invert_priorities_migrates_open_queue_once() {
     let (root, _stub) = setup_project("prioinv", 3, 10);
-    seed(&root, &workitem_json("e2e-inv-1", "code", "urgent old-style", "./src", "w", "", ""));
     // Old higher-is-sooner urgency 8 → new-scheme 2; default 5 stays 5.
-    let raw = std::fs::read_to_string(root.join(".iter/.engine/workitems.jsonl")).unwrap();
-    std::fs::write(
-        root.join(".iter/.engine/workitems.jsonl"),
-        raw.replace("\"priority\":5", "\"priority\":8"),
-    )
-    .unwrap();
+    seed(
+        &root,
+        &workitem_json("e2e-inv-1", "code", "urgent old-style", "./src", "w", "", "")
+            .replace("\"priority\":5", "\"priority\":8"),
+    );
     seed(&root, &workitem_json("e2e-inv-2", "code", "default", "./src", "w", "", ""));
 
     let out = Command::new(BIN)
@@ -1368,8 +1418,15 @@ fn itersched_fires_and_shell_executor_runs() {
     assert!(clone["output"].as_str().unwrap().contains("scheduled-run"));
 
     // Audit trail + engine log line.
-    let log = std::fs::read_to_string(root.join(".iter/.engine/sched_log.jsonl")).unwrap();
-    assert_eq!(log.lines().count(), 1, "{}", log);
+    let log = String::from_utf8_lossy(
+        &Command::new(BIN)
+            .args(["export", "--project", root.to_str().unwrap(), "--table", "sched_log"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
+    assert_eq!(log.lines().filter(|l| !l.trim().is_empty()).count(), 1, "{}", log);
     assert!(log.contains("e2e-sched-1"));
     assert!(stdout.contains("fired"), "{}", stdout);
 

@@ -268,7 +268,7 @@ fn route(req: &Req, engine: &Engine, port: u16) -> Resp {
         ("GET", ["api", "state"]) => api_state(project, engine, port),
         ("POST", ["api", "engine"]) => api_engine(req, engine),
         ("GET", ["api", "meta"]) => api_meta(project),
-        ("GET", ["api", "workitems"]) => api_list(project),
+        ("GET", ["api", "workitems"]) => api_list(req, project),
         ("POST", ["api", "workitems"]) => api_create(req, project),
         ("GET", ["api", "workitems", id]) => api_get(project, id),
         ("PATCH", ["api", "workitems", id]) => api_patch(req, project, id),
@@ -310,34 +310,41 @@ fn queue_for(project: &Path) -> Queue {
     Queue::new(project, &cfg)
 }
 
-/// The header's numbers, in one place because two producers must agree:
-/// /api/state answers a poll, the SSE delta ships them alongside the changed
-/// rows, and a client that mixed two different tallies would flicker between
-/// them. Every state the list can show gets a key — `failed` spans both files
-/// (a failed item is open while it still has retries left and archived once
-/// they run out), `complete` and the archive's share of `failed` come from the
-/// closed file alone.
-fn queue_counts(open: &[WorkItem], closed: &[WorkItem]) -> Value {
-    let count = |s: &str| open.iter().filter(|i| i.state == s).count();
+/// The header's numbers, shaped in one place because three producers must
+/// agree: /api/state answers a poll, /api/workitems ships them beside the rows,
+/// and the SSE delta carries them with every change — a client that mixed two
+/// tallies would flicker between them.
+///
+/// The tally itself is now `SELECT state, archived, COUNT(*)` (db::counts), NOT
+/// a count of the shipped array. That distinction became load-bearing the
+/// moment the list turned into a window: the response carries open rows and one
+/// page of the archive, so counting what was sent would report `complete: 50`
+/// on a project with five thousand finished items.
+///
+/// Every state the list can show gets a key even at zero, because the header
+/// renders a fixed set of chips and SQL only returns rows for states that
+/// exist — a missing key reads as a blank chip, not as a nought. `failed`
+/// spans both sides of the archive line (a failed item is open while it still
+/// has retries left and archived once they run out) and the GROUP BY adds the
+/// two together for free.
+fn queue_counts(counts: &HashMap<String, i64>) -> Value {
+    let n = |s: &str| counts.get(s).copied().unwrap_or(0);
     json!({
-        "queued": count(workitems::STATE_QUEUED),
-        "in-progress": count(workitems::STATE_IN_PROGRESS),
-        "todo": count(workitems::STATE_TODO),
-        "question": count(workitems::STATE_QUESTION),
-        "paused": count(workitems::STATE_PAUSED),
-        "scheduled": count(workitems::STATE_SCHEDULED),
-        "failed": count(workitems::STATE_FAILED)
-            + closed.iter().filter(|i| i.state == workitems::STATE_FAILED).count(),
-        "complete": closed.iter().filter(|i| i.state == workitems::STATE_COMPLETE).count(),
-        "open": open.len(),
-        "total": open.len() + closed.len(),
+        "queued": n(workitems::STATE_QUEUED),
+        "in-progress": n(workitems::STATE_IN_PROGRESS),
+        "todo": n(workitems::STATE_TODO),
+        "question": n(workitems::STATE_QUESTION),
+        "paused": n(workitems::STATE_PAUSED),
+        "scheduled": n(workitems::STATE_SCHEDULED),
+        "failed": n(workitems::STATE_FAILED),
+        "complete": n(workitems::STATE_COMPLETE),
+        "open": n("open"),
+        "total": n("total"),
     })
 }
 
 fn api_state(project: &Path, engine: &Engine, port: u16) -> Resp {
     let queue = queue_for(project);
-    let open = queue.load();
-    let closed = queue.load_closed();
     let cfg = config::load(project);
     json_resp(
         200,
@@ -357,7 +364,7 @@ fn api_state(project: &Path, engine: &Engine, port: u16) -> Resp {
                     "age_sec": u.age_sec(now),
                 })
             }).unwrap_or(Value::Null),
-            "counts": queue_counts(&open, &closed),
+            "counts": queue_counts(&queue.counts()),
         }),
     )
 }
@@ -439,17 +446,53 @@ fn api_meta(project: &Path) -> Resp {
     )
 }
 
+/// The fields a LIST row never renders, and therefore never carries. Each one
+/// is unbounded — free prose an agent wrote, or a resolved file list — and
+/// together they are almost all of what /api/workitems used to weigh: on
+/// pdy-dev the same items go from megabytes to tens of kilobytes. The client
+/// asks for them one item at a time, from GET /api/workitems/<id>, when a row
+/// is actually opened.
+const SUMMARY_OMIT: &[&str] =
+    &["mainwork", "output", "context", "testfiles", "prework", "postwork", "question", "answer"];
+
+/// One work item as the list ships it.
+///
+/// Built by SUBTRACTION from the full serialization rather than by naming the
+/// fields to keep: a field added to `WorkItem` then reaches the row without a
+/// second edit here, and the failure this avoids is the quiet one — a chip
+/// going blank in the UI because two lists drifted apart.
+///
+/// `question` and `answer` collapse to booleans. The row shows a chip for "this
+/// item is waiting on a human" and needs to know an answer is already saved;
+/// neither needs the text, which on a parked item is the largest field it has.
+/// `summary: true` rides along so a client holding a row can tell whether it is
+/// looking at the cheap shape or a fetched full item.
+fn summary_value(item: &WorkItem) -> Value {
+    let mut v = serde_json::to_value(item).expect("workitem serializes");
+    if let Some(obj) = v.as_object_mut() {
+        for key in SUMMARY_OMIT {
+            obj.remove(*key);
+        }
+    }
+    v["has_question"] = json!(!item.question.trim().is_empty());
+    v["has_answer"] = json!(!item.answer.trim().is_empty());
+    v["summary"] = json!(true);
+    v
+}
+
 /// Serialize the open queue the way the webapp expects to receive it. Both
 /// producers of open rows go through here — the full list and the SSE delta —
 /// so a row that arrives as a delta is byte-identical to the same row arriving
-/// from a refetch, and the client never has to reconcile two shapes.
+/// from a refetch, and the client never has to reconcile two shapes. That
+/// identity is why the delta ships summaries too: a client patching a full row
+/// with a summary (or the reverse) would flip fields in and out of existence.
 ///
 /// Dependency-gated items get their gate's live status injected (computed
-/// against the FULL closed archive, before any truncation), so the webapp can
-/// show the blocked-by chain without re-deriving engine semantics. `blocked`
-/// carries the picker's own skip reasons (written each tick): a dependency gate
-/// has always had a chip; a LOCK gate had nothing, so a queue full of runnable
-/// work with one agent on it looked like the engine ignoring it.
+/// against the closed archive), so the webapp can show the blocked-by chain
+/// without re-deriving engine semantics. `blocked` carries the picker's own
+/// skip reasons (written each tick): a dependency gate has always had a chip; a
+/// LOCK gate had nothing, so a queue full of runnable work with one agent on it
+/// looked like the engine ignoring it.
 fn open_item_values(
     open: &[WorkItem],
     closed: &[WorkItem],
@@ -457,7 +500,7 @@ fn open_item_values(
 ) -> Vec<Value> {
     open.iter()
         .map(|i| {
-            let mut v = serde_json::to_value(i).expect("workitem serializes");
+            let mut v = summary_value(i);
             if let Some(b) = blocked.get(&i.workid) {
                 v["lock_status"] = serde_json::to_value(b).unwrap_or(Value::Null);
             }
@@ -474,17 +517,61 @@ fn open_item_values(
         .collect()
 }
 
-fn api_list(project: &Path) -> Resp {
+/// The archive page size when the caller does not ask for one. 50 rows is about
+/// a screenful of history; the cap keeps a hand-typed `limit=100000` from
+/// rebuilding the response this endpoint exists to shrink.
+const CLOSED_PAGE_DEFAULT: i64 = 50;
+const CLOSED_PAGE_MAX: i64 = 500;
+
+/// `GET /api/workitems` → `{"open":[summary…],"counts":{…}}` — the OPEN queue
+/// as summaries plus the header's tally straight from SQL.
+///
+/// `GET /api/workitems?archived=1&offset=N&limit=M` →
+/// `{"closed":[summary…],"offset":N,"limit":M,"total":T}` — one page of the
+/// archive, newest first. The archive used to ride along on EVERY list fetch
+/// (its last 500 rows, full text included), which is most of why this response
+/// grew without bound; it is now a window the client asks for when it wants
+/// one. `total` is the archive's own size — `counts` spans both sides of the
+/// archive line, so it is `total - open`.
+fn api_list(req: &Req, project: &Path) -> Resp {
     let queue = queue_for(project);
-    let open = queue.load();
-    let closed = queue.load_closed();
-    let blocked = crate::scheduler::read_blocked(project);
-    let open_vals = open_item_values(&open, &closed, &blocked);
-    let mut closed = closed;
-    if closed.len() > 500 {
-        closed = closed.split_off(closed.len() - 500);
+    let counts = queue.counts();
+    // A bare `?archived` counts as asking for it; `archived=0` does not, so a
+    // client can build the query string unconditionally.
+    let wants_archive =
+        req.query.get("archived").map(|v| v != "0" && v != "false").unwrap_or(false);
+    if wants_archive {
+        let offset = req.query.get("offset").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0).max(0);
+        let limit = req
+            .query
+            .get("limit")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(CLOSED_PAGE_DEFAULT)
+            .clamp(1, CLOSED_PAGE_MAX);
+        let rows: Vec<Value> = queue.closed_page(offset, limit).iter().map(summary_value).collect();
+        let total = (counts.get("total").copied().unwrap_or(0)
+            - counts.get("open").copied().unwrap_or(0))
+        .max(0);
+        return json_resp(
+            200,
+            json!({ "closed": rows, "offset": offset, "limit": limit, "total": total }),
+        );
     }
-    json_resp(200, json!({ "open": open_vals, "closed": closed }))
+    let open = queue.load();
+    // The archive is read ONLY to judge dependency gates, and only when
+    // something is actually gated: `dep_status` is the single row field that
+    // cannot be answered from the open queue alone, and on most projects
+    // nothing is gated at all, so most list fetches never touch the archive.
+    let closed =
+        if open.iter().any(|i| !i.depends_on.is_empty()) { queue.load_closed() } else { Vec::new() };
+    let blocked = crate::scheduler::read_blocked(project);
+    json_resp(
+        200,
+        json!({
+            "open": open_item_values(&open, &closed, &blocked),
+            "counts": queue_counts(&counts),
+        }),
+    )
 }
 
 fn api_create(req: &Req, project: &Path) -> Resp {
@@ -560,17 +647,30 @@ fn api_create(req: &Req, project: &Path) -> Resp {
     if let Err(e) = queue.append(&item) {
         return err_resp(500, &format!("cannot append: {}", e));
     }
+    // An item created straight into `question` starts a wait on a human right
+    // here, so the wait gets its row here — the same record `iter ask` writes
+    // for the agent-raised case.
+    if item.state == workitems::STATE_QUESTION {
+        if let Ok(conn) = crate::db::open(project) {
+            crate::db::record_question(&conn, &item.workid, item.question.trim(), &item.times.asked);
+        }
+    }
     json_resp(201, json!({ "workid": item.workid, "warning": warning }))
 }
 
+/// One item by id from either side of the archive line, plus whether it is
+/// still open. Since storage moved to SQLite this is one indexed row lookup;
+/// it used to load the whole open queue and then the whole archive to answer
+/// the same question.
 fn find_item(project: &Path, id: &str) -> Option<(WorkItem, bool)> {
-    let queue = queue_for(project);
-    if let Some(i) = queue.load().into_iter().find(|i| i.workid == id) {
-        return Some((i, true));
-    }
-    queue.load_closed().into_iter().rev().find(|i| i.workid == id).map(|i| (i, false))
+    queue_for(project).get(id)
 }
 
+/// `GET /api/workitems/<id>` → the FULL item, mainwork/output/question/answer
+/// and all — the other half of the summary list. A row in the list carries only
+/// what its chips render; the client fetches this once when a row is opened and
+/// fills the detail panel from it. Archived items resolve here too, which is
+/// what lets a closed row expand exactly like an open one.
 fn api_get(project: &Path, id: &str) -> Resp {
     match find_item(project, id) {
         Some((item, open)) => json_resp(200, json!({ "item": item, "open": open })),
@@ -698,10 +798,10 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
     // a Retry click on a closed item read like a transient glitch and a Delete
     // click promised something no route implemented.
     if !open_now.iter().any(|i| i.workid == id) {
-        if let Some(archived) = queue.load_closed().into_iter().rev().find(|i| i.workid == id) {
-            return closed_item_action(project, &queue, &archived, action);
-        }
-        return err_resp(404, "no such open work item");
+        return match queue.get(id) {
+            Some((archived, false)) => closed_item_action(project, &queue, &archived, action),
+            _ => err_resp(404, "no such open work item"),
+        };
     }
 
     // Stop an IN-PROGRESS ("errantly started") item: the engine owns it, so
@@ -832,10 +932,35 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
                 }
                 return json_resp(200, json!({ "state": "complete" }));
             }
+            record_qa(project, &queue, id, action);
             json_resp(200, v)
         }
         Ok(Err((code, msg))) => err_resp(code, &msg),
         Err(e) => err_resp(500, &e.to_string()),
+    }
+}
+
+/// Mirror a question/answer transition into the `questions` table
+/// (features/Question_state.md). The pair still lives on the work item — that
+/// is what the agent reads — and this row is what makes "how long did this
+/// decision wait on a human" a query instead of a walk through archived JSON.
+///
+/// Read back from the item AFTER the transition committed rather than from the
+/// request body, so what is recorded is what actually landed: the answer as the
+/// engine will hand it to the agent, and `times.asked`/`times.answered` as
+/// stamped inside the record lock.
+///
+/// Bookkeeping only, so every failure here is swallowed: an unopenable database
+/// must never be the reason a human's answer does not reach the item that is
+/// waiting on it.
+fn record_qa(project: &Path, queue: &Queue, id: &str, action: &str) {
+    if !matches!(action, "answer" | "question") {
+        return;
+    }
+    let (Some((item, _)), Ok(conn)) = (queue.get(id), crate::db::open(project)) else { return };
+    match action {
+        "answer" => crate::db::record_answer(&conn, id, &item.answer, &item.times.answered),
+        _ => crate::db::record_question(&conn, id, item.question.trim(), &item.times.asked),
     }
 }
 
@@ -893,46 +1018,13 @@ fn closed_item_action(project: &Path, queue: &Queue, item: &WorkItem, action: &s
     }
 }
 
-/// Drop one row from `workitems_closed.jsonl` — whole-file rewrite under the
-/// same record lock `Queue::with_lock` takes on the open queue. Answers whether
-/// the id was there to remove. Issue 8: before this the archive was append-only
-/// forever, so a junk item sat in the `failed` count permanently and the only
-/// removal was hand-editing the file while hoping the engine stayed quiet.
-///
-/// `Queue::append_closed` archives WITHOUT taking this lock, so the lock alone
-/// cannot stop an engine appending in the millisecond between our read and our
-/// rename. The length re-check catches exactly that: a file that grew under us
-/// means an append landed, and we redo the rewrite rather than swallow it.
-fn remove_closed(project: &Path, queue: &Queue, workid: &str) -> std::io::Result<bool> {
-    let cfg = config::load(project);
-    let path = &queue.closed_path;
-    let len_of = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    for _ in 0..4 {
-        let _guard =
-            locks::acquire_file_lock(path, cfg.engine.queue_lock_retry_ms, cfg.engine.queue_lock_break_sec)?;
-        let before = len_of(path);
-        let items = queue.load_closed();
-        let kept: Vec<&WorkItem> = items.iter().filter(|i| i.workid != workid).collect();
-        if kept.len() == items.len() {
-            return Ok(false);
-        }
-        let mut text = String::new();
-        for item in kept {
-            text.push_str(&serde_json::to_string(item).expect("workitem serializes"));
-            text.push('\n');
-        }
-        if len_of(path) != before {
-            continue; // an append landed mid-rewrite — start over so it survives
-        }
-        let tmp = path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, &text)?;
-        std::fs::rename(&tmp, path)?;
-        return Ok(true);
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::WouldBlock,
-        "the closed archive kept changing under the rewrite",
-    ))
+/// Remove an archived item outright; answers whether the id was there to
+/// remove. Since storage moved to SQLite this is one row delete. The open/closed
+/// SPLIT is what made it a whole-file rewrite racing the engine's appends (and
+/// what left it unimplemented for so long) — `archived` is a column now, so an
+/// archived item deletes exactly the way an open one does.
+fn remove_closed(_project: &Path, queue: &Queue, workid: &str) -> std::io::Result<bool> {
+    queue.remove(workid)
 }
 
 /// Everything transitively created by `id` — the same `created_by` walk the
@@ -2040,7 +2132,17 @@ fn value_hash(v: &Value) -> u64 {
 fn queue_delta(project: &Path, prev: &mut QueueSnapshot) -> Value {
     let queue = queue_for(project);
     let open = queue.load();
-    let closed = queue.load_closed();
+    // Telling "this row got archived" from "this row got deleted" needs the
+    // archive's ID SET and nothing else, so it is one indexed column scan —
+    // never the bodies. Dependency status is the only thing here that needs
+    // real archived ITEMS, and only when some open item declares a dependency,
+    // so that load stays conditional the way the list endpoint's already is.
+    let next_closed = queue.archived_ids();
+    let closed = if open.iter().any(|i| !i.depends_on.is_empty()) {
+        queue.load_closed()
+    } else {
+        Vec::new()
+    };
     let blocked = crate::scheduler::read_blocked(project);
     let values = open_item_values(&open, &closed, &blocked);
 
@@ -2053,7 +2155,6 @@ fn queue_delta(project: &Path, prev: &mut QueueSnapshot) -> Value {
         }
         next_open.insert(item.workid.clone(), hash);
     }
-    let next_closed: HashSet<String> = closed.iter().map(|i| i.workid.clone()).collect();
 
     // An id that left the open queue either got ARCHIVED or got DELETED, and
     // the client does entirely different things with the two — one moves to the
@@ -2077,7 +2178,7 @@ fn queue_delta(project: &Path, prev: &mut QueueSnapshot) -> Value {
         }
     }
 
-    let counts = queue_counts(&open, &closed);
+    let counts = queue_counts(&queue.counts());
     prev.open = next_open;
     prev.closed = next_closed;
     if changed.len() + archived.len() + removed.len() > 50 {
@@ -2092,21 +2193,28 @@ fn queue_delta(project: &Path, prev: &mut QueueSnapshot) -> Value {
     })
 }
 
-/// Change feed: watch the two queue files plus the engine's stop signal, and on
+/// Change feed: watch the queue's storage plus the engine's stop signal, and on
 /// every change ship what actually changed. The keepalive stays a bare comment
 /// line — an EventSource with nothing to say still has to say it.
+///
+/// The two paths watched are the database and its write-ahead log. Both are
+/// needed: in WAL mode a commit lands in `iter.db-wal` and may leave the main
+/// file untouched until a checkpoint, so watching `iter.db` alone would let a
+/// whole engine run pass with this feed silent. (These used to be the two jsonl
+/// files, which the importer renames away on first open — a fingerprint frozen
+/// at `(0, None)` for the life of the process.)
 fn sse_events(mut stream: TcpStream, project: &Path) {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() {
         return;
     }
-    let open = config::engine_dir(project).join("workitems.jsonl");
-    let closed = config::engine_dir(project).join("workitems_closed.jsonl");
+    let db = crate::db::db_path(project);
+    let wal = db.with_extension("db-wal");
     let signal = scheduler::stop_signal_path(project);
     let fingerprint = |p: &Path| {
         std::fs::metadata(p).map(|m| (m.len(), m.modified().ok())).unwrap_or((0, None))
     };
-    let mut last = (fingerprint(&open), fingerprint(&closed), signal.exists());
+    let mut last = (fingerprint(&db), fingerprint(&wal), signal.exists());
     // Seeded from the queue as it stands at connect time — the client has just
     // fetched the same thing, so the first event carries what changed SINCE
     // then rather than the whole queue over again.
@@ -2115,7 +2223,7 @@ fn sse_events(mut stream: TcpStream, project: &Path) {
     let mut beats: u32 = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(700));
-        let now = (fingerprint(&open), fingerprint(&closed), signal.exists());
+        let now = (fingerprint(&db), fingerprint(&wal), signal.exists());
         let payload = if now != last {
             let engine_toggled = now.2 != last.2;
             last = now;
@@ -2180,6 +2288,17 @@ mod tests {
 
     fn item(id: &str, state: &str) -> WorkItem {
         WorkItem { workid: id.into(), state: state.into(), ..Default::default() }
+    }
+
+    /// A GET with a query string, built the way `read_request` would hand it
+    /// over — the handlers read `req.query`, so that is what a test supplies.
+    fn get(query: &[(&str, &str)]) -> Req {
+        Req {
+            method: "GET".into(),
+            path: String::new(),
+            query: query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            body: Vec::new(),
+        }
     }
 
     fn post_action(project: &Path, id: &str, verb: &str) -> Resp {
@@ -2344,6 +2463,11 @@ mod tests {
         let mut snap = QueueSnapshot { open: HashMap::new(), closed: HashSet::new() };
         let seed = queue_delta(&root, &mut snap);
         assert_eq!(seed["changed"].as_array().unwrap().len(), 2, "the seeding pass sees everything as new");
+        // The delta patches rows the list already put on screen, so it has to
+        // ship the SAME shape — a full row landing on a summary (or the
+        // reverse) would flip fields in and out of existence under the client.
+        assert_eq!(seed["changed"][0]["summary"], true);
+        assert!(seed["changed"][0].get("mainwork").is_none());
 
         let quiet = queue_delta(&root, &mut snap);
         assert!(quiet["changed"].as_array().unwrap().is_empty(), "a re-read with no writes says nothing");
@@ -2372,6 +2496,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The change detector must actually detect a change. It watched the two
+    /// jsonl files, which the SQLite importer renames away on first open — so
+    /// after the storage move both fingerprints sat at `(0, None)` forever and
+    /// the feed went permanently quiet. Watching the database plus its
+    /// write-ahead log is what makes a queue write visible again; the WAL half
+    /// matters because a commit can land there with `iter.db` untouched.
+    #[test]
+    fn the_change_detector_sees_a_queue_write() {
+        let root = tmp_project("fingerprint");
+        let queue = Queue::new(&root, &config::Config::default());
+        let db = crate::db::db_path(&root);
+        let wal = db.with_extension("db-wal");
+        let fingerprint = |p: &Path| {
+            std::fs::metadata(p).map(|m| (m.len(), m.modified().ok())).unwrap_or((0, None))
+        };
+        queue.append(&item("first", workitems::STATE_TODO)).unwrap();
+        let before = (fingerprint(&db), fingerprint(&wal));
+        queue.append(&item("second", workitems::STATE_QUEUED)).unwrap();
+        assert_ne!(before, (fingerprint(&db), fingerprint(&wal)), "a write must move one of the two");
+
+        // The retired paths are the trap: they are absent, so a detector still
+        // watching them would report "nothing happened" for every write above.
+        let engine = config::engine_dir(&root);
+        assert_eq!(fingerprint(&engine.join("workitems.jsonl")), (0, None));
+        assert_eq!(fingerprint(&engine.join("workitems_closed.jsonl")), (0, None));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_big_diff_falls_back_to_a_reload() {
         let root = tmp_project("bigdelta");
@@ -2388,22 +2540,192 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `failed` spans both files — open while retries remain, archived once the
-    /// budget is gone — and the header shows the two as one number.
+    /// `failed` spans both sides of the archive line — open while retries
+    /// remain, archived once the budget is gone — and the header shows the two
+    /// as one number. The tally comes from SQL, so a state nobody is in still
+    /// has to answer with a nought rather than a missing key.
     #[test]
     fn counts_span_the_open_queue_and_the_archive() {
-        let open = vec![
-            item("a", workitems::STATE_QUEUED),
-            item("b", workitems::STATE_FAILED),
-            item("s", workitems::STATE_SCHEDULED),
-        ];
-        let closed = vec![item("c", workitems::STATE_COMPLETE), item("d", workitems::STATE_FAILED)];
-        let counts = queue_counts(&open, &closed);
-        assert_eq!(counts["failed"], 2);
+        let root = tmp_project("counts");
+        let queue = Queue::new(&root, &config::Config::default());
+        queue.append(&item("a", workitems::STATE_QUEUED)).unwrap();
+        queue.append(&item("b", workitems::STATE_FAILED)).unwrap();
+        queue.append(&item("s", workitems::STATE_SCHEDULED)).unwrap();
+        queue.append_closed(&item("c", workitems::STATE_COMPLETE)).unwrap();
+        queue.append_closed(&item("d", workitems::STATE_FAILED)).unwrap();
+
+        let counts = queue_counts(&queue.counts());
+        assert_eq!(counts["failed"], 2, "the retrying one and the burned-out one are one number");
         assert_eq!(counts["complete"], 1);
         assert_eq!(counts["scheduled"], 1, "the list shows schedules, so the header counts them");
         assert_eq!(counts["open"], 3);
         assert_eq!(counts["total"], 5);
+        assert_eq!(counts["question"], 0, "an empty state is a nought, not an absent key");
+        assert_eq!(counts["in-progress"], 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The point of the whole payload change: a list row carries what its chips
+    /// render and nothing else. The omitted fields are the unbounded ones, so
+    /// this is the assertion that keeps the response flat as the queue grows.
+    #[test]
+    fn a_list_row_carries_its_chips_and_none_of_the_prose() {
+        let mut parked = item("q", workitems::STATE_QUESTION);
+        parked.title = "which database".into();
+        parked.mainwork = "a thousand words of instruction".into();
+        parked.output = "a thousand words of transcript".into();
+        parked.context = vec!["ctx.md".into()];
+        parked.prework = vec!["git-pull".into()];
+        parked.postwork = vec!["git-commit".into()];
+        parked.testfiles = vec!["t.sh".into()];
+        parked.question = "sqlite or postgres?".into();
+        parked.answer = "sqlite".into();
+
+        let v = summary_value(&parked);
+        for gone in SUMMARY_OMIT {
+            assert!(v.get(*gone).is_none(), "{} must not ride in the list", gone);
+        }
+        // Presence, not text: the chip only needs to know a human is owed a
+        // reply, and the question is the largest field a parked item carries.
+        assert_eq!(v["has_question"], true);
+        assert_eq!(v["has_answer"], true);
+        assert_eq!(v["summary"], true);
+        // Everything a row and its chips are drawn from survives.
+        assert_eq!(v["workid"], "q");
+        assert_eq!(v["title"], "which database");
+        assert_eq!(v["state"], workitems::STATE_QUESTION);
+        assert_eq!(v["type"], "");
+        assert_eq!(v["priority"], 5);
+        assert!(v.get("times").is_some() && v.get("attempts").is_some() && v.get("codepath").is_some());
+
+        let blank = summary_value(&item("plain", workitems::STATE_TODO));
+        assert_eq!(blank["has_question"], false, "no question is a false, never a missing key");
+        assert_eq!(blank["has_answer"], false);
+    }
+
+    /// The list is a WINDOW: open rows only, counts from SQL, and the archive
+    /// asked for separately. Deriving the header from the shipped array — which
+    /// is what a client did while the archive rode along — would now under-report.
+    #[test]
+    fn the_list_ships_open_summaries_and_sql_counts() {
+        let root = tmp_project("list");
+        let queue = Queue::new(&root, &config::Config::default());
+        let mut live = item("live", workitems::STATE_TODO);
+        live.mainwork = "big".into();
+        queue.append(&live).unwrap();
+        for n in 0..3 {
+            let mut done = item(&format!("done{}", n), workitems::STATE_COMPLETE);
+            done.output = "big".into();
+            done.times.closed = format!("2026-08-2{}T00:00:00Z", n);
+            queue.append_closed(&done).unwrap();
+        }
+
+        let body = body_of(&api_list(&get(&[]), &root));
+        let open = body["open"].as_array().unwrap();
+        assert_eq!(open.len(), 1, "only the open queue rides in the list");
+        assert_eq!(open[0]["summary"], true);
+        assert!(open[0].get("mainwork").is_none());
+        assert!(body.get("closed").is_none(), "the archive no longer rides along unasked");
+        assert_eq!(body["counts"]["complete"], 3, "the header still sees the archive it did not ship");
+        assert_eq!(body["counts"]["open"], 1);
+        assert_eq!(body["counts"]["total"], 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The archive paginates, newest first, and reports how many exist so the
+    /// UI can say "more below" rather than implying the page is all of it.
+    #[test]
+    fn the_archive_paginates_newest_first_with_its_own_total() {
+        let root = tmp_project("archive-page");
+        let queue = Queue::new(&root, &config::Config::default());
+        queue.append(&item("still-open", workitems::STATE_TODO)).unwrap();
+        for n in 0..5 {
+            let mut done = item(&format!("c{}", n), workitems::STATE_COMPLETE);
+            done.times.closed = format!("2026-08-0{}T00:00:00Z", n + 1);
+            queue.append_closed(&done).unwrap();
+        }
+
+        let first = body_of(&api_list(&get(&[("archived", "1"), ("limit", "2")]), &root));
+        let ids: Vec<&str> = first["closed"].as_array().unwrap().iter().map(|i| i["workid"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["c4", "c3"], "newest first");
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["limit"], 2);
+        // The archive's own size, not the queue's: the open item is not history.
+        assert_eq!(first["total"], 5);
+        assert_eq!(first["closed"][0]["summary"], true, "history renders from the same row shape");
+
+        let next = body_of(&api_list(&get(&[("archived", "1"), ("limit", "2"), ("offset", "2")]), &root));
+        let ids: Vec<&str> = next["closed"].as_array().unwrap().iter().map(|i| i["workid"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["c2", "c1"], "the page after");
+        assert_eq!(next["total"], 5, "the total does not move as the window does");
+
+        let past_end = body_of(&api_list(&get(&[("archived", "1"), ("offset", "99")]), &root));
+        assert!(past_end["closed"].as_array().unwrap().is_empty(), "walking off the end is empty, not an error");
+        assert_eq!(past_end["limit"], CLOSED_PAGE_DEFAULT, "an unasked-for page size is the default");
+
+        // A hand-typed limit cannot rebuild the response this endpoint shrinks.
+        let huge = body_of(&api_list(&get(&[("archived", "1"), ("limit", "100000")]), &root));
+        assert_eq!(huge["limit"], CLOSED_PAGE_MAX);
+        // `archived=0` is the plain list, so a client can build the query
+        // string unconditionally.
+        assert!(body_of(&api_list(&get(&[("archived", "0")]), &root)).get("open").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The full body is what the list left out — one fetch when a row opens,
+    /// and it answers for archived rows too, which is what lets a closed row
+    /// expand exactly like an open one.
+    #[test]
+    fn the_detail_fetch_carries_what_the_summary_dropped() {
+        let root = tmp_project("detail");
+        let queue = Queue::new(&root, &config::Config::default());
+        let mut done = item("gone", workitems::STATE_COMPLETE);
+        done.mainwork = "the instruction".into();
+        done.output = "the transcript".into();
+        queue.append_closed(&done).unwrap();
+
+        let body = body_of(&api_get(&root, "gone"));
+        assert_eq!(body["open"], false);
+        assert_eq!(body["item"]["mainwork"], "the instruction");
+        assert_eq!(body["item"]["output"], "the transcript");
+        assert!(body["item"].get("summary").is_none(), "a full item is not flagged as a summary");
+        assert_eq!(api_get(&root, "never-existed").status, 404);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// features/Question_state.md: the pair lives on the item AND in the
+    /// questions table, so "how long did this decision wait on a human" is a
+    /// query. The server owns the answer half, so the server writes that row.
+    #[test]
+    fn parking_and_answering_leave_a_row_in_the_questions_table() {
+        let root = tmp_project("qa-rows");
+        let queue = Queue::new(&root, &config::Config::default());
+        let mut asked = item("q", workitems::STATE_TODO);
+        asked.question = "sqlite or postgres?".into();
+        queue.append(&asked).unwrap();
+
+        assert_eq!(post_action(&root, "q", "question").status, 200);
+        let answered = Req {
+            method: "POST".into(),
+            path: String::new(),
+            query: HashMap::new(),
+            body: br#"{"action":"answer","answer":"sqlite"}"#.to_vec(),
+        };
+        assert_eq!(api_action(&answered, &root, "q").status, 200);
+
+        let conn = crate::db::open(&root).unwrap();
+        let row: (String, String, String, String) = conn
+            .query_row(
+                "SELECT question, answer, asked_at, answered_at FROM questions WHERE workid = 'q'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("one row for one decision");
+        assert_eq!(row.0, "sqlite or postgres?");
+        assert_eq!(row.1, "sqlite");
+        // Both stamps are what makes the wait measurable at all.
+        assert!(!row.2.is_empty() && !row.3.is_empty(), "asked {:?} answered {:?}", row.2, row.3);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

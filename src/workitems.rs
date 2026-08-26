@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::locks;
 
 pub const STATE_TODO: &str = "todo";
 pub const STATE_QUEUED: &str = "queued";
@@ -62,7 +61,7 @@ pub struct Sched {
     /// IANA timezone; empty = globalsettings.user_timezone.
     pub tz: String,
     /// ISO timestamp of the last fire (clone creation) — the durable restart
-    /// memory; the audit trail is .iter/.engine/sched_log.jsonl.
+    /// memory; the audit trail is the `sched_log` table (`iter export`).
     pub last_fired: String,
 }
 
@@ -490,99 +489,107 @@ pub struct QueueMeta {
     pub pid: u32,
 }
 
-/// The work-item queue: `.iter/.engine/workitems.jsonl` plus the append-only
-/// `workitems_closed.jsonl`. All writes go through the record-lock protocol; within
-/// this process an additional mutex (held by the caller, see scheduler) serializes use.
+/// The work-item queue, stored in SQLite (`db.rs`). This type keeps the exact
+/// API its jsonl-backed predecessor had — `load`, `with_lock`, `append`,
+/// `close`, `mutate` — because every caller in the engine, the CLI and the
+/// server is written against it; only the storage underneath changed. The
+/// record-lock sentinel files are gone: SQLite's WAL mode and `busy_timeout`
+/// serialize writers across processes, which is what those files were
+/// hand-rolling.
 pub struct Queue {
-    pub open_path: PathBuf,
-    pub closed_path: PathBuf,
+    project_root: PathBuf,
+    #[allow(dead_code)]
     cfg: Config,
 }
 
 impl Queue {
     pub fn new(project_root: &Path, cfg: &Config) -> Queue {
-        let dir = crate::config::engine_dir(project_root);
-        Queue {
-            open_path: dir.join("workitems.jsonl"),
-            closed_path: dir.join("workitems_closed.jsonl"),
-            cfg: cfg.clone(),
+        let queue = Queue { project_root: project_root.to_path_buf(), cfg: cfg.clone() };
+        // First touch of a project migrates whatever the files held; already
+        // migrated projects skip it, so this is safe on every construction.
+        if let Ok(mut conn) = crate::db::open(project_root) {
+            let _ = crate::db::import_jsonl(&mut conn, project_root);
         }
+        queue
+    }
+
+    fn conn(&self) -> Option<rusqlite::Connection> {
+        crate::db::open(&self.project_root).ok()
     }
 
     pub fn load(&self) -> Vec<WorkItem> {
-        let text = std::fs::read_to_string(&self.open_path).unwrap_or_default();
-        let mut items = Vec::new();
-        for (i, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<WorkItem>(line) {
-                Ok(mut item) => {
-                    item.normalize_codepaths();
-                    items.push(item);
-                }
-                Err(e) => eprintln!(
-                    "warning: {}:{} is not a valid workitem ({}); line skipped",
-                    self.open_path.display(),
-                    i + 1,
-                    e
-                ),
-            }
-        }
-        items
+        self.conn().map(|c| crate::db::load_items(&c, false)).unwrap_or_default()
+    }
+
+    pub fn load_closed(&self) -> Vec<WorkItem> {
+        self.conn().map(|c| crate::db::load_items(&c, true)).unwrap_or_default()
+    }
+
+    /// One item by id from either side of the archive line, with whether it is
+    /// still open. The lookup that the two-file layout could not do in one step.
+    pub fn get(&self, workid: &str) -> Option<(WorkItem, bool)> {
+        self.conn().and_then(|c| crate::db::get_item(&c, workid))
+    }
+
+    /// `state -> count` plus `open`/`total`, computed in SQLite instead of by
+    /// parsing every item.
+    pub fn counts(&self) -> std::collections::HashMap<String, i64> {
+        self.conn().map(|c| crate::db::counts(&c)).unwrap_or_default()
+    }
+
+    /// The archived side's id set — a membership question the change-detector
+    /// asks on every tick, answered without loading a single body.
+    pub fn archived_ids(&self) -> std::collections::HashSet<String> {
+        self.conn().map(|c| crate::db::archived_ids(&c)).unwrap_or_default()
+    }
+
+    /// A page of the archive, newest first — the list view never needs all of it.
+    pub fn closed_page(&self, offset: i64, limit: i64) -> Vec<WorkItem> {
+        self.conn().map(|c| crate::db::closed_page(&c, offset, limit)).unwrap_or_default()
     }
 
     /// (byte length, mtime) fingerprint used for cheap change detection.
     #[allow(dead_code)]
     pub fn fingerprint(&self) -> (u64, Option<std::time::SystemTime>) {
-        match std::fs::metadata(&self.open_path) {
+        match std::fs::metadata(crate::db::db_path(&self.project_root)) {
             Ok(m) => (m.len(), m.modified().ok()),
             Err(_) => (0, None),
         }
     }
 
-    /// The ONE mutation path: hold the record lock across load → modify → write, so
-    /// concurrent writers (engine workers, the API server, `iter add` from agents)
-    /// can never save over each other's changes.
+    /// The ONE mutation path: the caller gets the open queue as a vector, edits
+    /// it freely (add, mutate, remove), and the whole set is written back inside
+    /// a single transaction — so concurrent writers can never save over each
+    /// other's changes. Same contract as the old load-modify-rewrite under a
+    /// file lock, with the transaction doing the work the lock used to.
     pub fn with_lock<T>(&self, f: impl FnOnce(&mut Vec<WorkItem>) -> T) -> std::io::Result<T> {
-        let _guard = locks::acquire_file_lock(
-            &self.open_path,
-            self.cfg.engine.queue_lock_retry_ms,
-            self.cfg.engine.queue_lock_break_sec,
-        )?;
-        let mut items = self.load();
+        let mut conn = self
+            .conn()
+            .ok_or_else(|| std::io::Error::other("cannot open the project database"))?;
+        let mut items = crate::db::load_items(&conn, false);
         let result = f(&mut items);
-        let mut text = String::new();
-        for item in &items {
-            text.push_str(&serde_json::to_string(item).expect("workitem serializes"));
-            text.push('\n');
-        }
-        let tmp = self.open_path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, &text)?;
-        std::fs::rename(&tmp, &self.open_path)?;
-        // Still under the lock, so the stamp can never describe a write that
-        // another process has already replaced. Best-effort: a queue write must
-        // not fail because its sidecar could not be written.
+        crate::db::replace_open(&mut conn, &items).map_err(std::io::Error::other)?;
+        // Best-effort: a queue write must not fail because its sidecar could not
+        // be written.
         let _ = self.write_meta(items.len());
         Ok(result)
     }
 
-    /// The freshness sidecar's path — beside the queue, in `.iter/.engine/`.
+    /// The freshness sidecar's path — beside the database, in `.iter/.engine/`.
     pub fn meta_path(&self) -> PathBuf {
-        self.open_path.with_file_name("queue.meta.json")
+        crate::config::engine_dir(&self.project_root).join("queue.meta.json")
     }
 
     fn write_meta(&self, open: usize) -> std::io::Result<()> {
         let meta = QueueMeta { written: now_iso(), open, pid: std::process::id() };
         let text = serde_json::to_string(&meta).expect("queue meta serializes");
-        // Same tmp+rename as the queue itself: a reader polling this file must
-        // never catch it half-written.
+        // tmp+rename: a reader polling this file must never catch it half-written.
         let tmp = self.meta_path().with_extension("json.tmp");
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, self.meta_path())
     }
 
-    /// How fresh the on-disk queue is, or None before the first locked write.
+    /// How fresh the queue is, or None before the first write.
     pub fn read_meta(&self) -> Option<QueueMeta> {
         let text = std::fs::read_to_string(self.meta_path()).ok()?;
         serde_json::from_str(&text).ok()
@@ -594,41 +601,32 @@ impl Queue {
         self.with_lock(move |list| *list = replacement)
     }
 
-    /// Append one item under the record-lock protocol (external-producer path).
+    /// Append one item (the external-producer path).
     pub fn append(&self, item: &WorkItem) -> std::io::Result<()> {
         let item = item.clone();
         self.with_lock(move |items| items.push(item))
     }
 
-    /// Archive one item. Takes the record lock on the CLOSED file (a different
-    /// lock from the open queue's, so a worker archiving and another mutating
-    /// the queue never wait on each other). The lock matters because deleting a
-    /// closed item rewrites this whole file: an unlocked append landing mid-
-    /// rewrite would be dropped when the rewritten copy was renamed into place.
+    /// Archive one item: the same row, flipped to `archived`. In the two-file
+    /// era this was an append to a second file, which is what made archived
+    /// items invisible to every lookup that searched only the open one.
     pub fn append_closed(&self, item: &WorkItem) -> std::io::Result<()> {
-        let _guard = locks::acquire_file_lock(
-            &self.closed_path,
-            self.cfg.engine.queue_lock_retry_ms,
-            self.cfg.engine.queue_lock_break_sec,
-        )?;
-        let mut line = serde_json::to_string(item).expect("workitem serializes");
-        line.push('\n');
-        append_to(&self.closed_path, &line)
+        let conn = self
+            .conn()
+            .ok_or_else(|| std::io::Error::other("cannot open the project database"))?;
+        crate::db::put_item(&conn, item, true).map_err(std::io::Error::other)
     }
 
-    pub fn load_closed(&self) -> Vec<WorkItem> {
-        let text = std::fs::read_to_string(&self.closed_path).unwrap_or_default();
-        text.lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str::<WorkItem>(l).ok())
-            .map(|mut i| {
-                i.normalize_codepaths();
-                i
-            })
-            .collect()
+    /// Remove one item outright, whichever side it is on. Deleting an archived
+    /// item is now the same operation as deleting an open one.
+    pub fn remove(&self, workid: &str) -> std::io::Result<bool> {
+        let conn = self
+            .conn()
+            .ok_or_else(|| std::io::Error::other("cannot open the project database"))?;
+        crate::db::delete_item(&conn, workid).map_err(std::io::Error::other)
     }
 
-    /// Apply `f` to the item with `workid` under the lock. Returns false if not found.
+    /// Apply `f` to the item with `workid`. Returns false if not found.
     pub fn mutate(&self, workid: &str, f: impl FnOnce(&mut WorkItem)) -> std::io::Result<bool> {
         self.with_lock(|items| match items.iter_mut().find(|i| i.workid == workid) {
             Some(item) => {
@@ -639,7 +637,7 @@ impl Queue {
         })
     }
 
-    /// Close an item out: remove from the open queue, append to the closed file.
+    /// Close an item out: it leaves the open queue and becomes an archive row.
     pub fn close(&self, item: &WorkItem) -> std::io::Result<()> {
         self.with_lock(|items| items.retain(|i| i.workid != item.workid))?;
         self.append_closed(item)
@@ -739,8 +737,14 @@ mod tests {
         done.state = STATE_COMPLETE.into();
         queue.close(&done).unwrap();
         assert_eq!(queue.load().len(), 1);
-        let closed = std::fs::read_to_string(&queue.closed_path).unwrap();
-        assert!(closed.contains("\"w1\""));
+        let closed = queue.load_closed();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].workid, "w1");
+        // Archived items are reachable by id — the lookup the two-file layout
+        // could not do, and the reason retry and delete were broken on them.
+        let (found, open) = queue.get("w1").expect("an archived item is still addressable");
+        assert_eq!(found.state, STATE_COMPLETE);
+        assert!(!open, "reported as archived, not open");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -789,12 +793,10 @@ mod tests {
         queue.close(&done).unwrap();
         assert_eq!(queue.read_meta().unwrap().open, 1);
 
-        // The stamp is its own file — the jsonl stays parseable line-for-line.
+        // The stamp is its own small file beside the database, so a reader can
+        // check freshness without opening SQLite at all.
         assert!(queue.meta_path().ends_with("queue.meta.json"));
-        let raw = std::fs::read_to_string(&queue.open_path).unwrap();
-        for line in raw.lines().filter(|l| !l.trim().is_empty()) {
-            serde_json::from_str::<WorkItem>(line).expect("every line is still a work item");
-        }
+        assert!(crate::db::db_path(&root).is_file(), "durable state lives in the database");
         let _ = std::fs::remove_dir_all(&root);
     }
 

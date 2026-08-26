@@ -6,9 +6,9 @@
 //! run. The clone carries `source_schedule: <template workid>` — the dedup
 //! key: while any clone of a schedule is still open (queued, in-progress, or
 //! failed-awaiting-retry), the schedule never fires again, so duplicates are
-//! impossible. The template's `sched.last_fired` (persisted in
-//! workitems.jsonl) is the restart memory; `.iter/.engine/sched_log.jsonl` is
-//! the append-only audit trail.
+//! impossible. The template's `sched.last_fired` (persisted on the work item's
+//! own row) is the restart memory; the `sched_log` table is the append-only
+//! audit trail — `iter export --table sched_log` dumps it back to jsonl.
 //!
 //! Missed clock-anchored occurrences (daily/weekly) while the engine was down
 //! are SKIPPED, never backfired (user decision 2026-08-17): an occurrence only
@@ -155,19 +155,28 @@ pub fn clone_from(parent: &WorkItem, now_iso: &str) -> WorkItem {
     c
 }
 
+/// Append one fire to the audit trail (the `sched_log` table). The record is
+/// stored as the same JSON object the file form held on one line, so
+/// `iter export --table sched_log` still produces the trail people already know
+/// how to read; only `ts` is lifted into a column, to order and window it.
+///
+/// Best-effort, like the append it replaces: a schedule that fired must not be
+/// reported as failing because its audit line could not be written.
 fn log_fire(project_root: &Path, parent: &WorkItem, clone_id: &str, reason: &str) {
+    let ts = workitems::now_iso();
     let line = serde_json::json!({
-        "ts": workitems::now_iso(),
+        "ts": ts,
         "schedule": parent.workid,
         "title": parent.title,
         "kind": parent.sched.kind,
         "clone": clone_id,
         "reason": reason,
     });
-    let path = crate::config::engine_dir(project_root).join("sched_log.jsonl");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", line);
+    if let Ok(mut conn) = crate::db::open(project_root) {
+        // Carry any pre-database trail in before appending, so the log stays one
+        // continuous history rather than restarting at the upgrade.
+        let _ = crate::db::import_sched_log_jsonl(&mut conn, project_root);
+        let _ = crate::db::record_sched(&conn, &ts, &line.to_string());
     }
 }
 
@@ -384,8 +393,59 @@ mod tests {
         assert!(fire(&dir, &cfg, "sched-1", "test").unwrap().is_none());
         // check() also suppresses (and the audit log recorded exactly one fire)
         assert!(check(&dir, &cfg).is_empty());
-        let log = std::fs::read_to_string(dir.join(".iter/.engine/sched_log.jsonl")).unwrap();
-        assert_eq!(log.lines().count(), 1, "{}", log);
+        let conn = crate::db::open(&dir).unwrap();
+        let log = crate::db::export_table(&conn, "sched_log", crate::db::ExportScope::All).unwrap();
+        assert_eq!(log.len(), 1, "{:?}", log);
+        assert!(log[0].contains("sched-1"), "{}", log[0]);
+        assert!(log[0].contains("nightly cleanup"), "the trail names the schedule: {}", log[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project upgraded mid-life keeps its audit trail: the pre-database
+    /// `sched_log.jsonl` is imported once, the file is renamed rather than
+    /// deleted, and the next fire appends to the same continuous history.
+    #[test]
+    fn existing_sched_log_imports_once_and_keeps_appending() {
+        let dir = std::env::temp_dir().join(format!("itersched-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".iter/.engine")).unwrap();
+        let path = dir.join(".iter/.engine/sched_log.jsonl");
+        std::fs::write(
+            &path,
+            "{\"ts\":\"2026-08-01T00:00:00Z\",\"schedule\":\"old-1\",\"reason\":\"due\"}\n\
+             {\"ts\":\"2026-08-02T00:00:00Z\",\"schedule\":\"old-2\",\"reason\":\"due\"}\n",
+        )
+        .unwrap();
+
+        let cfg = Config::default();
+        let queue = Queue::new(&dir, &cfg);
+        let mut tpl = WorkItem {
+            workid: "sched-9".into(),
+            title: "after the upgrade".into(),
+            item_type: "code".into(),
+            state: STATE_SCHEDULED.into(),
+            ..Default::default()
+        };
+        tpl.sched = Sched { kind: "every".into(), every_min: 5, ..Default::default() };
+        queue.append(&tpl).unwrap();
+        fire(&dir, &cfg, "sched-9", "test").unwrap().expect("fires");
+
+        let conn = crate::db::open(&dir).unwrap();
+        let log = crate::db::export_table(&conn, "sched_log", crate::db::ExportScope::All).unwrap();
+        assert_eq!(log.len(), 3, "two imported plus one new: {:?}", log);
+        assert!(log[0].contains("old-1"), "history comes first, in order");
+        assert!(log[2].contains("sched-9"));
+        // Exported verbatim: the imported lines are byte-identical to the file's.
+        assert_eq!(log[0], "{\"ts\":\"2026-08-01T00:00:00Z\",\"schedule\":\"old-1\",\"reason\":\"due\"}");
+        assert!(!path.exists());
+        assert!(dir.join(".iter/.engine/sched_log.jsonl.imported").is_file());
+
+        // Idempotent: a second fire must not re-import the (renamed) file.
+        std::fs::write(&path, "{\"ts\":\"2026-08-03T00:00:00Z\",\"schedule\":\"decoy\"}\n").unwrap();
+        log_fire(&dir, &tpl, "clone-2", "test");
+        let log = crate::db::export_table(&conn, "sched_log", crate::db::ExportScope::All).unwrap();
+        assert_eq!(log.len(), 4, "the decoy file is not imported into a populated table");
+        assert!(!log.iter().any(|l| l.contains("decoy")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

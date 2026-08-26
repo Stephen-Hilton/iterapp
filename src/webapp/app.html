@@ -328,6 +328,12 @@
   .toast.show { opacity: 1; }
 
   .empty { text-align: center; color: var(--text-dim); padding: 46px 0 30px; }
+  /* The foot of the list, where the archive says how much of itself is on
+     screen. Centred and quiet: it is a boundary marker, not an action the
+     reader is being pushed toward. */
+  .loadolder { display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+               gap: 10px; padding: 16px 0 6px; }
+  .loadolder .hint { color: var(--text-dim); font-size: 12px; }
 
   /* ---------- views / router ---------- */
   .view { display: none; }
@@ -995,6 +1001,141 @@ let openIds = new Set(LIVE ? [] : [MOCK_ITEMS[1].workid]);
 let engineRunning = true;
 let sortBy = 'state';
 
+/* The header's numbers as the SERVER counted them (SELECT state, COUNT(*) over
+   the whole table), or null before it has answered — the offline demo never
+   sets it and derives from the array instead. See summaryCounts(). */
+let stateCounts = null;
+
+/* ---------------------------------------------------- summaries and bodies
+
+   /api/workitems ships SUMMARIES: everything a row and its chips need, with the
+   bulk text left out (mainwork, output, context, testfiles, prework, postwork,
+   and the question/answer bodies). On pdy-dev that is the difference between a
+   ~2MB response and a few tens of KB, and it was paid on every refresh. The
+   whole record for ONE item is fetched when its row is expanded.
+
+   The fetched text is merged INTO the item already sitting in `items` rather
+   than parked in a map beside it, so every reader downstream — the detail
+   panel, the Context lightbox, Clone's prefill, the answer box — still sees one
+   whole work item and never has to ask which half it is holding. */
+const BODY_FIELDS = ['mainwork','output','context','testfiles','prework','postwork','question','answer'];
+const bodyLoaded  = new Set();   // workids whose text on the item is real and current
+const bodyPending = new Map();   // workid -> the in-flight GET, so two openers share one fetch
+const bodyError   = new Map();   // workid -> why the fetch failed; shown in the row, cleared on re-open
+
+/* A row that arrived without its text. `summary` is the server's own marker;
+   the mainwork test is the fallback that keeps this page honest against a whole
+   item — the offline demo's mocks, an archive page, an older `iter start`. */
+function isSummary(it){ return it.summary === true || it.mainwork === undefined; }
+
+/* Everything on this page was written against a complete work item and would
+   throw on a missing array (`item.prework.map`, `item.context.map`). A row is
+   normalized on arrival so the omitted fields read as empty rather than as
+   undefined — and empty is the honest answer until the body lands. */
+function normItem(it){
+  if (!it || typeof it !== 'object') return it;
+  it.times = it.times || {};
+  for (const k of ['prework','postwork','context','testfiles','codepath_ignore','depends_on'])
+    if (!Array.isArray(it[k])) it[k] = [];
+  return it;
+}
+
+/* The chips ask "is there a question / an answer", never "what does it say", so
+   a summary answers with a boolean and the row renders identically. */
+function hasQuestion(it){ return !!(it.has_question || it.question); }
+function hasAnswer(it){ return !!(it.has_answer || it.answer); }
+
+/* One GET per expanded row, once, shared between concurrent callers. Only the
+   fields the summary OMITS are copied across: the summary is the fresher record
+   for state and timings — it comes from the same store but through the delta
+   stream, and an optimistic click may have moved the row since — so a body
+   arriving late must never roll a row back to what it said when it left. */
+function ensureBody(id){
+  if (!LIVE) return Promise.resolve(true);   // the demo has no server; its items are already whole
+  if (bodyLoaded.has(id)) return Promise.resolve(true);
+  if (bodyPending.has(id)) return bodyPending.get(id);
+  const p = fetchBody(id).finally(() => { bodyPending.delete(id); render(); });
+  bodyPending.set(id, p);
+  return p;
+}
+
+async function fetchBody(id){
+  try {
+    const r = await api(`/api/workitems/${id}`);
+    const full = normItem(r && r.item ? r.item : r);
+    const cur = items.find(i => i.workid === id);
+    if (!cur || !full || !full.workid) return false;
+    for (const k of BODY_FIELDS) if (k in full) cur[k] = full[k];
+    // Anything else the summary simply did not carry rides along too (a field
+    // added to the item shape after BODY_FIELDS was written); a key the summary
+    // DID send is the fresher of the two and is left alone.
+    for (const k of Object.keys(full)) if (cur[k] === undefined) cur[k] = full[k];
+    cur.summary = false;
+    bodyError.delete(id);
+    bodyLoaded.add(id);
+    return true;
+  } catch (e) {
+    bodyError.set(id, e.message);
+    return false;
+  }
+}
+
+/* Called from render(): an expanded row needs its text, and this is the single
+   place that decides so. A row opened by a click, a row left open while a delta
+   invalidated its body, and a row opened by saving a new item all arrive here
+   the same way, so no caller has to remember to fetch. A row whose fetch FAILED
+   is skipped rather than retried on every repaint — collapsing and re-opening
+   it clears the error and asks again. */
+function syncBodies(){
+  if (!LIVE) return;
+  for (const id of openIds) {
+    if (bodyLoaded.has(id) || bodyPending.has(id) || bodyError.has(id)) continue;
+    if (items.some(i => i.workid === id)) ensureBody(id);
+  }
+}
+
+/* ---- the archive is a window now ----------------------------------------
+   The list response carries the OPEN queue; the closed archive is pulled a page
+   at a time from /api/workitems?archived=1&offset=&limit=. `archiveOffset` is
+   the CURSOR, not a count of what is on screen: an item that closes while you
+   read shifts the whole window down by one, so the cursor advances by what each
+   page asked for and the merge dedups by workid rather than re-reading rows. */
+const ARCHIVE_PAGE = 50;
+let archiveOffset = 0;    // how far into the archive the cursor has walked
+let archiveTotal  = 0;    // T from the page response — the size of the whole archive
+let archiveBusy   = false;
+
+/* Archive pages are FULL items (closed_page returns whole rows), so their text
+   is already in hand and the body cache records it: expanding an archived row
+   costs no fetch at all. */
+function mergeArchive(page){
+  const rows = (page && page.closed) || [];
+  for (const raw of rows) {
+    const it = normItem(raw);
+    if (!it || !it.workid) continue;
+    const at = items.findIndex(i => i.workid === it.workid);
+    if (at >= 0) items[at] = it; else items.push(it);
+    if (isSummary(it)) bodyLoaded.delete(it.workid); else bodyLoaded.add(it.workid);
+  }
+  archiveOffset = (typeof page.offset === 'number' ? page.offset : archiveOffset) + rows.length;
+  if (typeof page.total === 'number') archiveTotal = page.total;
+  // An empty page is the end of the archive whatever the total says: without
+  // this the button would survive its own last click and never advance again.
+  if (!rows.length) archiveTotal = archiveOffset;
+}
+
+async function loadArchivePage(limit = ARCHIVE_PAGE){
+  if (!LIVE || archiveBusy) return;
+  archiveBusy = true; render();
+  try {
+    mergeArchive(await api(`/api/workitems?archived=1&offset=${archiveOffset}&limit=${limit}`));
+  } catch (e) {
+    toast('Archive: ' + e.message);
+  } finally {
+    archiveBusy = false; render();
+  }
+}
+
 /* ------------------------------------------------- bulk state change */
 let bulkMode = false;
 let bulkSel = new Set();
@@ -1122,7 +1263,24 @@ async function loadAll(){
     if (Array.isArray(meta.default_context) && meta.default_context.length) {
       DEFAULT_CONTEXT = meta.default_context;
     }
-    items = [...list.open, ...list.closed.slice().reverse()];
+    // Keep the reader where they paged to: a structural event fires a full
+    // reload, and yanking five pages of archive out from under someone who
+    // walked back through it would make "Load older" feel broken.
+    const depth = Math.max(ARCHIVE_PAGE, archiveOffset);
+    archiveOffset = 0; archiveTotal = 0;
+    // Every row is a summary again, so every cached body is stale by
+    // construction — the open rows refetch through render()'s syncBodies().
+    bodyLoaded.clear(); bodyError.clear();
+    items = (list.open || []).map(normItem);
+    // A row that arrived WHOLE (an older server, or any future one that decides
+    // an open item is small enough to ship entire) needs no per-row fetch —
+    // record that its text is already in hand so syncBodies() leaves it alone.
+    for (const it of items) if (!isSummary(it)) bodyLoaded.add(it.workid);
+    stateCounts = list.counts || null;
+    // An older `iter start` still answers the un-paginated shape and ships the
+    // whole archive inline. Take it and there is nothing left to page.
+    const inlineArchive = Array.isArray(list.closed);
+    if (inlineArchive) mergeArchive({ closed: list.closed, offset: 0, total: list.closed.length });
     firstLoad = false; loadError = '';
     const brand = document.querySelector('.projbrand');
     brand.querySelector('b').textContent = meta.project_name;
@@ -1130,6 +1288,9 @@ async function loadAll(){
     document.title = `${meta.url_slug} · IterLoop`;
     setFavicon(meta.url_slug || 'iter');
     render();
+    // The queue paints first and the archive follows: the open items are what
+    // anyone came here for, and they should not wait on history.
+    if (!inlineArchive) await loadArchivePage(depth);
   } catch (e) {
     // A failed first load still releases the skeleton — held forever it reads
     // as a hung page, and the row area says what actually went wrong.
@@ -1149,12 +1310,13 @@ async function loadAll(){
    changed items themselves and this patches them into `items`, with no fetch of
    any kind. render() is the same call it always was, so the rule that a focused
    answer box holds the rebuild holds for deltas too.
-   The event's `counts` block is deliberately NOT used for the summary bar: it
-   is computed over the FULL closed archive while /api/workitems ships only the
-   last 500 archived items, so a header fed from it would disagree with the list
-   underneath it (click Complete, see 500 of 3000 rows). Every count here is
-   derived from `items`, the same array the rows come from, so the bar and the
-   list always tell the same story.
+   The event's `counts` block IS the summary bar now. It used to be refused, and
+   rightly: it tallies the whole table while the list shipped a truncated
+   archive, so the header and the rows underneath told different stories. The
+   archive is explicitly paginated today — the list is a declared window with its
+   own "N older still in the archive" line — so the SQL tally is the only one
+   that can be right, and deriving from `items` would under-report every closed
+   state by however many pages the reader has not asked for.
    Resolves false when the delta cannot be completed and the caller must fall
    back to the full load. */
 const DELTA_MAX_FETCHES = 10;
@@ -1162,8 +1324,22 @@ const DELTA_MAX_FETCHES = 10;
 async function applyDelta(msg){
   const put = (fresh) => {
     if (!fresh || !fresh.workid) return;
+    normItem(fresh);
     const at = items.findIndex(i => i.workid === fresh.workid);
-    if (at >= 0) items[at] = fresh; else items.unshift(fresh);
+    if (at < 0) { items.unshift(fresh); if (!isSummary(fresh)) bodyLoaded.add(fresh.workid); return; }
+    if (isSummary(fresh)) {
+      /* The delta is a summary, so it carries no mainwork or output. Hand the
+         body we already fetched across, so an expanded row does not blink empty
+         while it reloads — then drop it from the cache, because the change may
+         well have BEEN the output, and stale text under a fresh state is worse
+         than a moment of "loading". render() sees an open row with no valid
+         body and refetches exactly that one item. */
+      for (const k of BODY_FIELDS) if (!(k in fresh) && k in items[at]) fresh[k] = items[at][k];
+      bodyLoaded.delete(fresh.workid);
+    } else {
+      bodyLoaded.add(fresh.workid);
+    }
+    items[at] = fresh;
   };
 
   (msg.changed || []).forEach(put);
@@ -1171,7 +1347,9 @@ async function applyDelta(msg){
     items = items.filter(i => i.workid !== id);
     openIds.delete(id);
     gatedCounts.delete(id);
+    bodyLoaded.delete(id); bodyError.delete(id);
   }
+  if (msg.counts) stateCounts = msg.counts;
   /* `changed` carries OPEN rows only, so an item that just moved to the archive
      arrives as a bare id: we know it closed but not with what state, output, or
      close stamp, and guessing any of those would put a fiction on screen.
@@ -1254,14 +1432,22 @@ function depChip(item){
    answered the chip flips to the decision, so the record stays visible on the
    item long after it has run. */
 function questionChip(item){
-  if (!item.question) return '';
+  if (!hasQuestion(item)) return '';
+  // The list ships `has_question`/`has_answer` and leaves the text behind, so
+  // the chip is drawn from the boolean and the hover shows the words only once
+  // the row has been opened and its body fetched.
   if (item.state === 'question') {
     const waited = ago(item.times.asked || item.times.added);
+    const preview = item.question
+      ? '\n\n' + esc(item.question.slice(0,400))
+      : '';
     return `<span class="chip" style="background:var(--s-question-bg);color:var(--s-question-fg)"
-      title="Blocked on your answer — open the row and press Answer…\n\n${esc(item.question.slice(0,400))}">
+      title="Blocked on your answer — open the row and press Answer…${preview}">
       ? awaiting your answer${waited ? ' · ' + waited : ''}</span>`;
   }
-  return `<span class="chip kv mono" title="Answered ${esc(item.times.answered ? fmtTs(item.times.answered) : '')}: ${esc((item.answer||'').slice(0,300))}">✓ answered</span>`;
+  const answered = item.times.answered ? fmtTs(item.times.answered) : '';
+  const body = item.answer ? ': ' + esc(item.answer.slice(0,300)) : ' — open the row to read it';
+  return `<span class="chip kv mono" title="Answered ${esc(answered)}${body}">✓ answered</span>`;
 }
 /* A queued item can be perfectly runnable and still never start because another
    item holds a lock covering its codepath. The dependency gate always had a
@@ -1301,9 +1487,9 @@ function blocksChip(item){
   return n ? `<span class="chip kv mono" title="Open work items gated on this one finishing">blocks: ${n}</span>` : '';
 }
 
-/* An item in the ARCHIVE (workitems_closed.jsonl). times.closed is the queue's
-   own marker for it — the engine stamps it when it moves the record out of the
-   open file, and /api/workitems returns the two lists concatenated. */
+/* An item in the ARCHIVE. times.closed is the queue's own marker for it — the
+   engine stamps it as it flips the row's `archived` column — and the list is
+   the open queue plus however many pages of the archive have been pulled. */
 function isClosed(item){ return !!(item.times && item.times.closed); }
 
 /* issue 7b — `todo` conflates three different situations, and they need three
@@ -1357,9 +1543,25 @@ function sourceLabel(src){
   return m ? m[1][0].toUpperCase() + m[1].slice(1) : src;
 }
 
+/* The header is fed by the server's SELECT state, COUNT(*) over the whole
+   table, never by a count of `items`. `items` is a WINDOW — the open queue plus
+   however many archive pages have been asked for — so counting it would report
+   "complete: 50" on a project with five thousand finished items, and the number
+   people glance at to see whether the day moved would be the number of rows
+   that happened to be downloaded. Only the offline demo counts its own array,
+   because there the array genuinely IS the whole queue. */
 function summaryCounts(){
-  const c = { total: items.length };
-  for (const s of Object.keys(STATES)) c[s] = items.filter(i => i.state === s).length;
+  if (!stateCounts) {
+    const c = { total: items.length };
+    for (const s of Object.keys(STATES)) c[s] = items.filter(i => i.state === s).length;
+    return c;
+  }
+  const c = {};
+  let sum = 0;
+  for (const s of Object.keys(STATES)) { c[s] = stateCounts[s] || 0; sum += c[s]; }
+  // A state this build does not know about still belongs in Total, so the
+  // fallback adds up what the server sent rather than what STATES lists.
+  c.total = typeof stateCounts.total === 'number' ? stateCounts.total : sum;
   return c;
 }
 
@@ -1470,16 +1672,38 @@ function pillRow(assigned, editable, phase){
   return `<div class="pills">${pool.join('')}${lits.join('')}</div>`;
 }
 
+/* The foot of the list. The archive is a window, and a window has to say so:
+   with three thousand finished items and fifty on screen, a bare "No work items
+   match this filter" under the Completed chip reads as "this project has never
+   finished anything". The numbers come from the page cursor and the total the
+   server sent with it, so they describe the ARCHIVE rather than guessing from
+   what happens to be downloaded. */
+function archiveFooter(){
+  const rest = archiveTotal - archiveOffset;
+  if (!LIVE || (rest <= 0 && !archiveBusy)) return '';
+  const n = Math.max(0, Math.min(rest, ARCHIVE_PAGE));
+  return `<div class="loadolder">
+    <button class="btn" id="loadOlder" ${archiveBusy ? 'disabled' : ''}
+      title="The open queue above is always complete. Only the closed archive is paged, oldest last.">
+      ${archiveBusy ? 'Loading…' : `Load ${n} older archived item${n === 1 ? '' : 's'}`}</button>
+    ${archiveTotal ? `<span class="hint">${archiveOffset} of ${archiveTotal} archived items loaded · ${rest} older not shown</span>` : ''}
+  </div>`;
+}
+
 function renderRows(){
   const list = visibleItems();
+  const foot = archiveFooter();
   if (!list.length) {
     // An empty list after a FAILED load is not an empty queue — say which it is
     // rather than letting a network error read as "nothing to do" (issue 4's
-    // lesson, on the webapp side).
-    $('rows').innerHTML = loadError
+    // lesson, on the webapp side). And an empty list with archive left to page
+    // is neither: it is a filter whose matches are all older than the window.
+    $('rows').innerHTML = (loadError
       ? `<div class="empty">Could not read the queue: ${esc(loadError)}<br>
            <span style="font-size:12.5px">This is the API talking, not your queue — the page retries on the next engine event.</span></div>`
-      : `<div class="empty">No work items match this filter.</div>`;
+      : foot
+        ? `<div class="empty">Nothing loaded matches this filter — the archive is paged, and older entries may still match.</div>`
+        : `<div class="empty">No work items match this filter.</div>`) + foot;
     return;
   }
   $('rows').innerHTML = list.map(item => {
@@ -1523,20 +1747,38 @@ function renderRows(){
           <span class="fullid">ID: ${esc(item.workid)}</span></div>
         ${parkedBlock(item)}
         ${questionBlocks(item)}
-        <div class="dlabel">Prework</div><div>${pillRow(item.prework,false,'prework')}</div>
-        <div class="dlabel">Request</div><div class="textblock">${esc(item.mainwork)||'<i>—</i>'}</div>
-        <div class="dlabel">Postwork</div><div>${pillRow(item.postwork,false,'postwork')}</div>
-        <div class="dlabel">Output</div><div class="textblock mono">${esc(item.output)||'<i>no output yet</i>'}</div>
+        ${bodyBlocks(item)}
         <div class="dlabel">Details</div>
         <div class="detailbtns">
           <button class="btn" data-lb="tests" data-id="${item.workid}">View Test Details</button>
           <button class="btn" data-lb="times" data-id="${item.workid}">View Time Records</button>
-          <button class="btn" data-lb="context" data-id="${item.workid}">View Context and Prompts</button>
+          <button class="btn" data-lb="context" data-id="${item.workid}"${bodyReady(item) ? '' : ' disabled'}>View Context and Prompts</button>
           <button class="btn" data-lb="logs" data-id="${item.workid}">View Logs</button>
         </div>
       </div></div></div>
     </div>`;
-  }).join('');
+  }).join('') + foot;
+}
+
+/* Has this row's text arrived? Offline the mock items are whole from the start,
+   so the demo never waits and never fetches. */
+function bodyReady(item){ return !LIVE || bodyLoaded.has(item.workid); }
+
+/* Everything the summary left out. Until GET /api/workitems/<id> answers, the
+   panel says it is loading rather than painting "Request: —" beside a running
+   agent's row, which would read as an item dispatched with no instructions. */
+function bodyBlocks(item){
+  if (!bodyReady(item)) {
+    const err = bodyError.get(item.workid);
+    return `<div class="dlabel">Request</div>
+      <div class="textblock" style="color:var(--text-dim)">${err
+        ? `Could not load this item's text: ${esc(err)} — close the row and open it again to retry.`
+        : 'Loading this item’s request and output…'}</div>`;
+  }
+  return `<div class="dlabel">Prework</div><div>${pillRow(item.prework,false,'prework')}</div>
+    <div class="dlabel">Request</div><div class="textblock">${esc(item.mainwork || '')||'<i>—</i>'}</div>
+    <div class="dlabel">Postwork</div><div>${pillRow(item.postwork,false,'postwork')}</div>
+    <div class="dlabel">Output</div><div class="textblock mono">${esc(item.output || '')||'<i>no output yet</i>'}</div>`;
 }
 
 /* Why a guard or the dispatch validator parked this item — the one thing its
@@ -1561,7 +1803,15 @@ function parkedBlock(item){
 const ANSWERABLE = ['question', 'todo', 'paused'];
 
 function questionBlocks(item){
-  if (!item.question) return '';
+  if (!hasQuestion(item)) return '';
+  /* The question and the answer are body fields: the summary says only THAT
+     there is one. Until the fetch lands there is a question but not yet its
+     words — and an empty answer box here would invite someone to answer a
+     question they cannot read, then autosave that over the real answer. */
+  if (!bodyReady(item)) {
+    return `<div class="dlabel">Question</div>
+      <div class="textblock question" style="color:var(--text-dim)">Loading the question…</div>`;
+  }
   const stamp = (label, ts, extra) => ts
     ? `<span style="color:var(--text-dim);font-weight:500;font-size:11.5px"> — ${label} ${esc(fmtTs(ts))}${extra||''}</span>`
     : '';
@@ -1633,7 +1883,8 @@ async function flushAnswer(id){
   setAnswerState(id, 'saving');
   try {
     if (LIVE) await api(`/api/workitems/${id}`, { method:'PATCH', body: JSON.stringify({ answer: text }) });
-    item.answer = text;                 // keep the local copy in step with disk
+    item.answer = text;                 // keep the local copy in step with the row on disk
+    item.has_answer = !!text;           // …and the summary's boolean with the text, so the chip agrees
     setAnswerState(id, 'saved');
   } catch (e) {
     setAnswerState(id, 'not saved: ' + e.message);
@@ -1760,7 +2011,7 @@ function actionButtons(item){
   if (s === 'todo' || s === 'paused') b.push(['queue','Queue']);
   // An item that already carries a question can be parked back into the
   // Question bucket (e.g. after editing the question text).
-  if (item.question && (s === 'todo' || s === 'paused')) b.push(['question','Move to Question']);
+  if (hasQuestion(item) && (s === 'todo' || s === 'paused')) b.push(['question','Move to Question']);
   if ((s === 'todo' || s === 'paused') && item.sched && item.sched.kind) b.push(['schedule','Resume Schedule']);
   if (s === 'failed') b.push(['queue','Requeue (Retry)']);
   // paused/queued/failed can always go back to the ToDo review bucket — the
@@ -1782,6 +2033,11 @@ function actionButtons(item){
    half-typed answer cannot survive being retyped. */
 let renderHeld = false;
 function render(){
+  // Ahead of the focus check on purpose: a delta can invalidate the body of a
+  // row that is open somewhere else on the page while an answer is being typed,
+  // and that refetch should start now rather than wait on a blur. The fetch's
+  // own render() is held in turn, and the blur replays it.
+  syncBodies();
   if (document.querySelector('.answerbox:focus')) { renderHeld = true; return; }
   renderHeld = false;
   if (firstLoad) { renderSkeleton(); return; }
@@ -1901,7 +2157,7 @@ function lbContext(item){
         ...item.prework.map((p,i)=>[`${i+1}`, prepostNames().includes(p)?`prework:${p}`:'prework:inline', prepostNames().includes(p)?`.iter/prepostwork/${p}.${prepostExec(p)==='shell'?'sh':'md'}`:'inline literal from work item']),
         [`${item.prework.length+1}`, 'mainwork (+ spin-up on first turn)',
           'work item request + agent definition + source instructions + context list'
-          + (item.question && item.answer ? ' — prefaced by the answered question (asked → answer), engine-composed, not stored in the request' : '')],
+          + (hasQuestion(item) && hasAnswer(item) ? ' — prefaced by the answered question (asked → answer), engine-composed, not stored in the request' : '')],
         ...item.postwork.map((p,i)=>[`${item.prework.length+2+i}`, `postwork:${p}`, `.iter/prepostwork/${p}.${prepostExec(p)==='shell'?'sh':'md'}`]),
         [`${item.prework.length+item.postwork.length+2}`, 'selfcheck', 'engine-composed: re-read agent definition, confirm completion'],
       ].map(([n,t2,s]) => `<tr><td class="mono">${n}</td><td><b>${esc(t2)}</b></td><td style="color:var(--text-dim)">${esc(s)}</td></tr>`).join('')}
@@ -1959,6 +2215,17 @@ function automationInheritLabel(src){
 }
 
 function openForm(mode, source, priorState){
+  /* Edit, clone and follow-up all copy an existing item's TEXT into the form,
+     and the form's save writes every one of those fields back. Opened on a
+     summary — no mainwork, no context, no question — Save would quietly replace
+     the real request with an empty one. Every caller fetches the body first;
+     this is the backstop that makes a race a toast instead of data loss.
+     (`create` from a Projects node passes a synthesized item, not a queue row.) */
+  if (source && LIVE && mode !== 'create' && isSummary(source)) {
+    ensureBody(source.workid);
+    toast('Still loading this item’s request — try again in a moment');
+    return;
+  }
   // create with a source = prefilled create (e.g. Create WorkItem from a Projects node)
   const d = source ? JSON.parse(JSON.stringify(source)) : mk({});
   if (mode === 'create' && !source) d.context = literalContextLines();
@@ -2314,7 +2581,7 @@ function confirmDelete(item, onConfirm){
     closed
       ? `<p style="margin-top:0">This removes ${who} from the <b>closed archive</b> — the permanent
            record of the work this project has finished.</p>
-         <p>The entry is rewritten out of <span class="mono">workitems_closed.jsonl</span> and is gone for
+         <p>The row is deleted from the queue database and is gone for
            good: its output, its timings and its <b>${esc(item.state)}</b> result stop counting in the header
            counts and in the dashboard history. <b>Nothing keeps a copy and there is no undo.</b></p>
          <p style="color:var(--text-dim);font-size:12.5px">Worth doing for junk — an item that failed on a
@@ -2446,8 +2713,12 @@ function doAction(act, id){
   if (LIVE) {
     // Clone and follow-up stay client-side (they open the prefilled form; the POST
     // happens on save). Everything else is a server action.
-    if (act === 'clone') { openForm('clone', item); return; }
-    if (act === 'followup') { openForm('followup', item); return; }
+    // Both prefill a form from this item's text, which a summary does not
+    // carry — free when the row is already open, one small GET otherwise.
+    if (act === 'clone' || act === 'followup') {
+      ensureBody(id).then(() => openForm(act, items.find(i => i.workid === id) || item));
+      return;
+    }
     if (act === 'stopitem') {
       confirmStop(item, () => {
         postAction(id, 'stop')
@@ -2475,6 +2746,9 @@ function doAction(act, id){
       const prior = item.state;
       postAction(id, 'pause')
         .then(() => loadAll())
+        // loadAll left a SUMMARY in the array and the form edits text — without
+        // this the PATCH would post an empty mainwork over the real request.
+        .then(() => ensureBody(id))
         .then(() => {
           const fresh = items.find(i => i.workid === id);
           if (fresh) openForm('edit', fresh, prior);
@@ -2610,6 +2884,7 @@ document.addEventListener('click', (e) => {
   }
   if (t.hasAttribute('data-lbclose') || t.id === 'lbClose') { draft = null; closeLb(); return; }
   if (t.id === 'collapseAll') { openIds.clear(); render(); return; }
+  if (t.id === 'loadOlder') { loadArchivePage(); return; }
   if (t.id === 'newItem') { openForm('create', null); return; }
   if (t.id === 'engineChip' || t.closest('#engineChip')) {
     if (LIVE) {
@@ -2629,7 +2904,12 @@ document.addEventListener('click', (e) => {
 
   const rowId = t.dataset.rowclick;
   if (rowId && !e.target.closest('.actwrap')) {
-    openIds.has(rowId) ? openIds.delete(rowId) : openIds.add(rowId);
+    // Opening is also the retry: a body fetch that failed is not attempted again
+    // on every repaint (that would hammer a down API), so closing and re-opening
+    // the row is the gesture that asks once more. render() → syncBodies() does
+    // the fetch; nothing here needs to know whether one is needed.
+    if (openIds.has(rowId)) openIds.delete(rowId);
+    else { bodyError.delete(rowId); openIds.add(rowId); }
     render(); return;
   }
 });

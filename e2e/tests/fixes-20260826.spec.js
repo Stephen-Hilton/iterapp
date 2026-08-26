@@ -105,8 +105,10 @@ test.describe('issues 3a + 8 — closed items offer Clone and Delete, never a re
 
     await expect(page.locator('.item', { hasText: 'E2E closed failed' })).toHaveCount(0);
     // And it is gone from the server, not just the DOM.
+    // The archive is its own paginated endpoint since storage moved to SQLite —
+    // the list ships open items only.
     const stillThere = await page.evaluate(async () => {
-      const r = await fetch('/api/workitems').then((x) => x.json());
+      const r = await fetch('/api/workitems?archived=1&offset=0&limit=200').then((x) => x.json());
       return r.closed.some((i) => i.workid === 'e2e-closed-failed');
     });
     expect(stillThere).toBe(false);
@@ -157,5 +159,68 @@ test.describe('issue 13 — engine events patch the row in place', () => {
       .poll(async () => row(page, 'E2E approval gate').textContent(), { timeout: 8000 })
       .toContain('Paused');
     expect(await page.evaluate(() => window.__listFetches)).toBe(0);
+  });
+});
+
+test.describe('issue 11 — the list ships summaries, bodies load on demand', () => {
+  test('the queue payload carries no prose, and counts come from SQL', async ({ page }) => {
+    await page.goto('/#/workitems');
+    await page.waitForTimeout(1200);
+
+    const list = await page.evaluate(() =>
+      fetch('/api/workitems').then((r) => r.json())
+    );
+    expect(Array.isArray(list.open)).toBe(true);
+    expect(list.open.length).toBeGreaterThan(0);
+    // The whole point: the row payload stops carrying the big text fields, which
+    // is what made this endpoint grow without bound.
+    for (const row of list.open) {
+      expect(row.summary).toBe(true);
+      expect(row.mainwork).toBeUndefined();
+      expect(row.output).toBeUndefined();
+      expect(typeof row.has_question).toBe('boolean');
+    }
+    // Counts are a SQL rollup, not a tally of the shipped window.
+    expect(typeof list.counts.total).toBe('number');
+    expect(list.counts.total).toBeGreaterThanOrEqual(list.open.length);
+  });
+
+  test('expanding a row fetches its body exactly once, then reuses it', async ({ page }) => {
+    await page.goto('/#/workitems');
+    await page.waitForTimeout(1200);
+    await page.evaluate(() => {
+      window.__bodyGets = [];
+      const real = window.fetch;
+      window.fetch = (u, o) => {
+        const s = String(u);
+        if (/\/api\/workitems\/[^/?]+$/.test(s)) window.__bodyGets.push(s);
+        return real(u, o);
+      };
+    });
+    expect(await page.evaluate(() => window.__bodyGets.length)).toBe(0);
+
+    const target = row(page, 'E2E approval gate');
+    await target.locator('[data-rowclick]').click();
+    await page.waitForTimeout(900);
+    expect(await page.evaluate(() => window.__bodyGets.length)).toBe(1);
+
+    // Collapse and re-open: the cached body means no second round trip.
+    await target.locator('[data-rowclick]').click();
+    await page.waitForTimeout(200);
+    await target.locator('[data-rowclick]').click();
+    await page.waitForTimeout(600);
+    expect(await page.evaluate(() => window.__bodyGets.length)).toBe(1);
+  });
+
+  test('the archive is a separate paginated endpoint', async ({ page }) => {
+    await page.goto('/#/workitems');
+    await page.waitForTimeout(1200);
+    const archive = await page.evaluate(() =>
+      fetch('/api/workitems?archived=1&offset=0&limit=2').then((r) => r.json())
+    );
+    expect(Array.isArray(archive.closed)).toBe(true);
+    expect(archive.closed.length).toBeLessThanOrEqual(2);
+    expect(typeof archive.total).toBe('number');
+    expect(archive.limit).toBe(2);
   });
 });

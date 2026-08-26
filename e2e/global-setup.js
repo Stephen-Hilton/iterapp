@@ -9,6 +9,17 @@ const prepare = async () => {
   const dst = path.join(__dirname, '.fixture');
   fs.rmSync(dst, { recursive: true, force: true });
   fs.cpSync(src, dst, { recursive: true });
+  // Storage is SQLite now, and the engine imports the jsonl seed only when the
+  // database is EMPTY. A database copied in from sampleV1 (left by any earlier
+  // run) would make the seeded rows below invisible, so the fixture always
+  // starts without one — the jsonl files are this fixture's source of truth.
+  for (const f of ['iter.db', 'iter.db-wal', 'iter.db-shm', 'queue.meta.json']) {
+    fs.rmSync(path.join(dst, '.iter', '.engine', f), { force: true });
+  }
+  for (const f of ['workitems.jsonl', 'workitems_closed.jsonl']) {
+    const imported = path.join(dst, '.iter', '.engine', f + '.imported');
+    if (fs.existsSync(imported)) fs.renameSync(imported, path.join(dst, '.iter', '.engine', f));
+  }
   // Keep the queue deterministic: pre-flag the Orphanage-review schedule.
   fs.writeFileSync(path.join(dst, '.iter', '.engine', 'orphan_schedule_seeded'), 'e2e');
   fs.writeFileSync(path.join(dst, '.iter', '.engine', 'tempsweep_schedule_seeded'), 'e2e');
