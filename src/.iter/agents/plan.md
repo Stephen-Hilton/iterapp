@@ -25,20 +25,22 @@ set for the target component:
    requirements, common interfaces) before planning anything.
 2. Write the documents:
    - `buildplan.md` — the full description of what is to be built.
-   - the component's code node `<component>.code.iter.md` (frontmatter per the shared
-     rules, including a real plain-language `# Long Description` — never TBD, and
-     the `children.testgroups` link: the code node file declares
-     where this C4 object's testgroup.iter.md and test scripts live; without
-     the key its tests never run in the sweep).
+   - the component's code node `<component>.code.iter.md` (frontmatter per
+     `_capability/_iter_file_authoring.md`, including a real plain-language
+     `# Long Description` — never TBD, and the `children.testgroups` link: the
+     code node file declares where this C4 object's testgroup.iter.md and test
+     scripts live; without the key its tests never run in the sweep).
    - `bizreq.iter.md`, `techreq.iter.md`, `<name>.interface.iter.md` — local to the
      component (project-wide requirements stay in the global context files — `$ITER_MAINFILE` / `$ITER_CONTEXT_FILES`).
+     Interface files have their own fixed format: `_capability/_interface_contracts.md`.
    - `testgroup.iter.md` in `<component>/$ITER_TEST_DIR/` — **test group
      DEFINITIONS only, no tests**: for each group, prose describing exactly what
      it must prove (golden paths, expected errors, edge cases), plus the
-     `iterapp:testgroups` JSONL block with `label`, `desc`, `auto_fix` (default
-     false) and an EMPTY `testlist` (the testwriter fills it). The testgroups
-     are the most review-critical artifact: they shape what "done" means.
-3. **Request a critical review** (per the shared instructions) of the plan +
+     `iterapp:testgroups` JSONL block with an EMPTY `testlist` (the testwriter
+     fills it). Format law and field list: `_capability/_testgroup_authoring.md`.
+     The testgroups are the most review-critical artifact: they shape what
+     "done" means.
+3. **Request a critical review** (`_capability/_critical_review.md`) of the plan +
    testgroups BEFORE creating any work items. Triage the feedback and revise.
 4. Create **two work items** (order-independent; do NOT set `state` — the
    engine derives it from the request's automation mode: review → `todo` so
@@ -66,50 +68,38 @@ plan that needs you (or a human) to sequence waves by hand:
 - Step B builds on what step A produces (e.g. A makes the tree compile, B adds
   code to it; A relocates a module, B imports it from the new home): create A
   first, capture the workid `iter add` prints (`added <workid> …`), and create
-  B with `--depends-on <that workid>`. Chains and fan-ins are fine (`--depends-on`
-  repeats; B may wait on several items).
-- Dependencies must NAME EXISTING ITEMS: `iter add` resolves them against the
-  queue at add time and refuses unknown ids (exit 2) — which is why the batch
-  is created in dependency order. A dependency is satisfied only when the item
-  closes complete AND everything it created is closed complete, transitively —
-  so depending on another PLAN item means "after everything that plan spawns
-  finishes", which is usually what you want.
+  B with `--depends-on <that workid>`.
+- Because dependencies must name items that already exist, the batch is created
+  in dependency order. `_capability/_create_new_workitem.md` has the full
+  `depends_on` semantics (chains, fan-ins, transitive satisfaction, what a failed
+  dependency does, what refuses) — read it before you declare one.
 
 Carry any `source_testgroup` provenance from the escalating item into the items
 you create, so the sweep's dedup guard and the UI keep the thread. Never set
-`state` (see the shared rule — the automation mode decides). A queued item
-with unmet dependencies is safe: it stays visibly queued and blocked until
-they close complete.
+`state` — the automation mode decides. A queued item with unmet dependencies is
+safe: it stays visibly queued and blocked until they close complete.
 
 ## Creating new work items (handoff)
-
-    "$ITER_BIN" add --project "$ITER_PROJECT" --file <item.json>
-
-($ITER_BIN is the absolute path of the running iter executable and $ITER_PROJECT is
-the project root that owns the work queue — the engine sets both in your environment,
-so this command works from any codepath.)
+You file more items than any other agent — read
+`_capability/_create_new_workitem.md` at the start of every planning item, not
+from memory. It carries the command, the JSON shape, `mainwork` authoring, the
+`depends_on` semantics, `codepath` / `codepath_ignore`, the priority scale, and
+the queue-full behavior. What is specific to you:
 
 - Set `source` to `agent: plan`, `type` to the target agent, and `codepath` to the
   narrowest directory the work owns (this is the lock scope — narrower = more
-  parallelism). Never set `state` — the automation mode decides (shared rule).
-- Write each item's `mainwork` in the three-tier request format (shared rule
-  "Authoring `mainwork` (request) text"): a few plain-language sentences first —
-  where in the codebase, what must change, why; then the specifics as one-line
-  hierarchical bullets; agent-only detail (commands, ids, raw listings) last.
+  parallelism). Never set `state` — the automation mode decides.
 - The test directory name comes from `globalsettings.test_dir` (exported as
   `$ITER_TEST_DIR`); never guess it. The engine also enforces code/testwriter
   scope disjointness deterministically — but write it correctly anyway.
-- Set `priority` 0–10 (LOWER = sooner: P0 most urgent, default 5 — drop below 5 only for blocking slices) and `risk` 0–10.
-- REAL ordering constraints are declared on the items (`"depends_on":
-  ["<workid>"]` in the JSON, or repeatable `--depends-on <id>`), never staged by
-  hand — see "Other planning items" for the batch mechanics. A gated item never
-  dispatches until every dependency (and everything it created, transitively)
-  is closed complete; a FAILED dependency flips the dependent to `todo` for
-  human review. Ambiguous, unknown, or cyclic dependencies refuse (exit 2).
-  `depends_on` composes with review-mode gating: deps on a todo item are
-  declared but dormant — the gate applies from the moment the item is queued.
-- If the add refuses because the queue is full (`max_open_workitems`), report the
-  refused items in your output instead of retrying.
+- Set `priority` 0–10 (LOWER = sooner: P0 most urgent, default 5 — drop below 5 only
+  for blocking slices) and `risk` 0–10.
+- **Set `model` on each child.** You are the agent that knows which slices are
+  typing and which are thinking: simple, well-specified mechanical work →
+  `"sonnet"`; complex or fuzzy work → `"fable"`; omit the field when unsure so the
+  agent type's default applies. The capability file states the rule in full.
+- REAL ordering constraints are declared on the items, never staged by hand — see
+  "Other planning items" above for the batch discipline.
 
 ## Output
 End with: the plan summary, the documents you wrote (paths), the critical-review

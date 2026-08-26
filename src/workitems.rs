@@ -31,6 +31,21 @@ pub const EXEC_SHELL: &str = "shell";
 pub const AUTOMATION_REVIEW: &str = "review";
 pub const AUTOMATION_AUTO: &str = "auto";
 
+/// Why an item is parked in `todo` (issue 7b). Unset is the ordinary review
+/// gate — a click, not a judgment. These two are not.
+/// A guard tripped: `iter reject`, the non-convergence guard, a failed
+/// dependency, a user stop. Needs a person's judgment before it runs again.
+pub const TODO_REASON_GUARD: &str = "guard";
+/// Dispatch validation refused the item (a missing codepath &c). Nothing about
+/// it will change on retry — a human fixes the configuration.
+pub const TODO_REASON_CONFIG: &str = "config";
+
+/// The models an item may name in `model`. Small and closed on purpose: a
+/// typo'd model is only discovered when the session fails at dispatch, hours
+/// after the item was filed, so `iter add` refuses one at the moment it is
+/// written.
+pub const KNOWN_MODELS: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
+
 /// When a `scheduled` template fires (itersched.rs): the schedule spec.
 /// Minute granularity by design — the check cadence is 59s.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -147,6 +162,12 @@ pub struct WorkItem {
     /// deps) still outrank it.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub automation: String,
+    /// Per-item model override, honored at dispatch; empty = the agent type's
+    /// default (features item 12). e.g. "sonnet", "fable", "opus". A plan agent
+    /// sets it per child so the expensive models are spent where judgment
+    /// lives and mechanical work runs cheap.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
     /// Engine-recorded at each run start: HEAD of the item's codepath repo the
     /// moment work began (empty if the codepath is not in a git repo). The
     /// undo point offered when a run is stopped mid-stream —
@@ -171,6 +192,14 @@ pub struct WorkItem {
     pub answer: String,
     pub attempts: u32,
     pub lasterror: String,
+    /// Which of the three kinds of `todo` this is, so the UI can tell an
+    /// approval gate from a tripped guard from a broken configuration — they
+    /// look identical in the list otherwise, and only two of them need a
+    /// person's judgment. `lasterror` carries free prose and is NOT this:
+    /// TODO_REASON_* is the small closed vocabulary the UI switches on.
+    /// `question` has its own state and needs no reason.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub todo_reason: String,
     pub times: Times,
 }
 
@@ -196,6 +225,7 @@ impl Default for WorkItem {
             depends_on_shallow: false,
             created_by: String::new(),
             automation: String::new(),
+            model: String::new(),
             git_start_commit: String::new(),
             context: Vec::new(),
             testfiles: Vec::new(),
@@ -207,6 +237,7 @@ impl Default for WorkItem {
             answer: String::new(),
             attempts: 0,
             lasterror: String::new(),
+            todo_reason: String::new(),
             times: Times::default(),
         }
     }
@@ -440,6 +471,25 @@ fn find_cycle(item: &WorkItem, open: &[WorkItem]) -> Option<Vec<String>> {
     walk(item.workid.as_str(), &edges, &mut Vec::new())
 }
 
+/// Freshness stamp for `workitems.jsonl`, written beside it on every locked
+/// write (issue 5). Anyone reading the queue as a FILE — an agent grepping it,
+/// a human tailing it — otherwise cannot tell a current snapshot from an
+/// hours-old one: on pdy-dev four items read `todo` that the engine had closed
+/// `complete` seven hours earlier. A header line inside the jsonl would have
+/// been cheaper still and would have broken every parser of it, `Queue::load`
+/// included, so the stamp lives in its own file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct QueueMeta {
+    /// When the queue file was last written (ISO-8601 UTC).
+    pub written: String,
+    /// How many open items that write left in the file.
+    pub open: usize,
+    /// The process that wrote it — the engine while it runs, otherwise
+    /// whichever CLI or server process took the lock.
+    pub pid: u32,
+}
+
 /// The work-item queue: `.iter/.engine/workitems.jsonl` plus the append-only
 /// `workitems_closed.jsonl`. All writes go through the record-lock protocol; within
 /// this process an additional mutex (held by the caller, see scheduler) serializes use.
@@ -510,7 +560,32 @@ impl Queue {
         let tmp = self.open_path.with_extension("jsonl.tmp");
         std::fs::write(&tmp, &text)?;
         std::fs::rename(&tmp, &self.open_path)?;
+        // Still under the lock, so the stamp can never describe a write that
+        // another process has already replaced. Best-effort: a queue write must
+        // not fail because its sidecar could not be written.
+        let _ = self.write_meta(items.len());
         Ok(result)
+    }
+
+    /// The freshness sidecar's path — beside the queue, in `.iter/.engine/`.
+    pub fn meta_path(&self) -> PathBuf {
+        self.open_path.with_file_name("queue.meta.json")
+    }
+
+    fn write_meta(&self, open: usize) -> std::io::Result<()> {
+        let meta = QueueMeta { written: now_iso(), open, pid: std::process::id() };
+        let text = serde_json::to_string(&meta).expect("queue meta serializes");
+        // Same tmp+rename as the queue itself: a reader polling this file must
+        // never catch it half-written.
+        let tmp = self.meta_path().with_extension("json.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, self.meta_path())
+    }
+
+    /// How fresh the on-disk queue is, or None before the first locked write.
+    pub fn read_meta(&self) -> Option<QueueMeta> {
+        let text = std::fs::read_to_string(self.meta_path()).ok()?;
+        serde_json::from_str(&text).ok()
     }
 
     #[allow(dead_code)]
@@ -525,7 +600,17 @@ impl Queue {
         self.with_lock(move |items| items.push(item))
     }
 
+    /// Archive one item. Takes the record lock on the CLOSED file (a different
+    /// lock from the open queue's, so a worker archiving and another mutating
+    /// the queue never wait on each other). The lock matters because deleting a
+    /// closed item rewrites this whole file: an unlocked append landing mid-
+    /// rewrite would be dropped when the rewritten copy was renamed into place.
     pub fn append_closed(&self, item: &WorkItem) -> std::io::Result<()> {
+        let _guard = locks::acquire_file_lock(
+            &self.closed_path,
+            self.cfg.engine.queue_lock_retry_ms,
+            self.cfg.engine.queue_lock_break_sec,
+        )?;
         let mut line = serde_json::to_string(item).expect("workitem serializes");
         line.push('\n');
         append_to(&self.closed_path, &line)
@@ -656,6 +741,60 @@ mod tests {
         assert_eq!(queue.load().len(), 1);
         let closed = std::fs::read_to_string(&queue.closed_path).unwrap();
         assert!(closed.contains("\"w1\""));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two new fields are read by the scheduler, the API's editable list,
+    /// and the webapp — so they must survive a round trip AND stay off the
+    /// wire when unset (the queue file is read by humans; empty keys are noise
+    /// on every one of ~500 rows).
+    #[test]
+    fn model_and_todo_reason_roundtrip_and_stay_absent_when_unset() {
+        let plain = serde_json::to_string(&WorkItem::default()).unwrap();
+        assert!(!plain.contains("\"model\""), "{}", plain);
+        assert!(!plain.contains("\"todo_reason\""), "{}", plain);
+
+        let item = WorkItem {
+            model: "sonnet".into(),
+            todo_reason: TODO_REASON_CONFIG.into(),
+            ..Default::default()
+        };
+        let back: WorkItem = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert_eq!(back.model, "sonnet");
+        assert_eq!(back.todo_reason, "config");
+        // A queue row written before these fields existed still loads.
+        let old: WorkItem = serde_json::from_str(r#"{"workid":"w","state":"todo"}"#).unwrap();
+        assert!(old.model.is_empty() && old.todo_reason.is_empty());
+    }
+
+    /// Issue 5: every locked write leaves a stamp so a file reader can see how
+    /// old its snapshot is.
+    #[test]
+    fn locked_writes_stamp_the_freshness_sidecar() {
+        let root = tmpdir("queuemeta");
+        let cfg = Config::default();
+        let queue = Queue::new(&root, &cfg);
+        assert!(queue.read_meta().is_none(), "no stamp before the first write");
+
+        queue.append(&WorkItem { workid: "w1".into(), ..Default::default() }).unwrap();
+        queue.append(&WorkItem { workid: "w2".into(), ..Default::default() }).unwrap();
+        let meta = queue.read_meta().expect("a stamp after writing");
+        assert_eq!(meta.open, 2);
+        assert_eq!(meta.pid, std::process::id());
+        assert!(parse_iso(&meta.written).is_some(), "written is ISO-8601: {}", meta.written);
+
+        // Closing an item is a locked write too, so the count follows it down.
+        let mut done = queue.load()[0].clone();
+        done.state = STATE_COMPLETE.into();
+        queue.close(&done).unwrap();
+        assert_eq!(queue.read_meta().unwrap().open, 1);
+
+        // The stamp is its own file — the jsonl stays parseable line-for-line.
+        assert!(queue.meta_path().ends_with("queue.meta.json"));
+        let raw = std::fs::read_to_string(&queue.open_path).unwrap();
+        for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+            serde_json::from_str::<WorkItem>(line).expect("every line is still a work item");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

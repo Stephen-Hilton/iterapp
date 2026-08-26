@@ -36,50 +36,23 @@ iterapp-ready.
    — keeping requirement IDs stable across runs
 
 ## Node frontmatter (REQUIRED — structureV2: unlinked files land in the Orphanage)
+Writing iter files IS your job, so read the two authoring capabilities before you
+write the first one on any item:
+- `_capability/_iter_file_authoring.md` — code node and requirement-file
+  frontmatter, the required `# Long Description`, quoting, the orphan check
+  (`"$ITER_BIN" orphans --project "$ITER_PROJECT"` — run it after writing nodes and
+  link anything stranded).
+- `_capability/_interface_contracts.md` — the fixed format for each
+  `*.interface.iter.md`, which declares ONE logical data contract.
+
 Every `*.iter.md` you write MUST follow the dot rule (`<prefix>.<nodetype>.iter.md`)
 and begin with a `---`-fenced frontmatter block carrying `name`, `description`,
 and a `children:` mapping — nodes join the DAG ONLY through explicit children
-links (paths or globs); directory nesting alone links nothing.
-- **One code node per component directory** (usually alongside that component's
-  requirement files — a `<component>.code.iter.md` works well); start from
-  `"$ITER_BIN" validate --file <path> --template`:
+links (paths or globs); directory nesting alone links nothing. **One code node per
+component directory**, usually alongside that component's requirement files (a
+`<component>.code.iter.md` works well). Start every file from
+`"$ITER_BIN" validate --file <path> --template`, never from memory.
 
-      ---
-      name: "Human-Readable Component Name"
-      level: component        # context | container | component
-      description: "one line on what this component is"
-      owner: bespoke
-      teststate: inherit
-      children:
-        codedirs:   ["{thisfiledir}/"]
-        codenodes:  []          # link child code nodes here — the ONLY joining mechanism
-        inputs:     []          # interface FILES consumed
-        outputs:    []          # interface FILES produced
-        bizreqs:    ["{thisfiledir}/*.bizreq.iter.md"]
-        techreqs:   ["{thisfiledir}/*.techreq.iter.md"]
-        testgroups: ["{thisfiledir}/test/*.testgroup.iter.md"]
-      ---
-      (context body other agents read)
-
-  `context`-level nodes attach to the project head (main.iter.md) automatically;
-  every container/component must be listed in some parent's `codenodes` or it
-  orphans. After writing nodes, check `"$ITER_BIN" orphans --project
-  "$ITER_PROJECT"` and link anything stranded.
-- **Each `*.interface.iter.md`** declares ONE logical data contract in the
-  FIXED FORMAT — start from `"$ITER_BIN" validate --file <path> --template`,
-  never from memory. `kind:` is the interaction shape (request-reply | event |
-  stream | dataset), never a transport or a syntax; the body is the kind's H2
-  sections plus `## Worked examples` and `## Invariants`, message shapes in
-  pseudo-JSON (JSON is the notation, not a wire format). Transport-neutral:
-  routes/ports/topics/flags/exit codes are binding facts that live on the
-  serving object's code node file, never here. NEVER who provides/consumes it —
-  code nodes' inputs/outputs links carry that. Test: a stranger could implement
-  either side from this file alone, and nothing changes if a component is
-  rebuilt or redeployed differently. Model:
-  sampleV1/interfaces/ledger-command/ledger-command.interface.iter.md.
-
-- `*.bizreq.iter.md` / `*.techreq.iter.md` carry the same frontmatter law
-  (name, description, `children.reqpaths: []` when the body holds the reqs).
 3. **Project migration** (bringing an existing repo onto iterapp): survey the entire project,
    then create the work items needed to integrate it — typically multiple `code` items
    (one per component needing integration or missing files) and `testwriter` items (one
@@ -88,21 +61,12 @@ links (paths or globs); directory nesting alone links nothing.
 4. Do not modify project source code yourself; delegate through work items.
 
 ## Creating new work items (handoff)
-Create work items by running:
-
-    "$ITER_BIN" add --project "$ITER_PROJECT" --file <item.json>
-
-($ITER_BIN is the absolute path of the running iter executable and $ITER_PROJECT is
-the project root that owns the work queue — the engine sets both in your environment,
-so this command works from any codepath.)
+Read `_capability/_create_new_workitem.md` for the mechanics (the command, the JSON
+shape, `mainwork` authoring, `depends_on`, `model`, never setting `state`). What is
+specific to you:
 
 - Set `source` to `agent: ingest`, and attach the normalized requirement files you wrote
   to each new item's `context` so downstream agents inherit them.
-- Write each item's `mainwork` in the three-tier request format (shared rule
-  "Authoring `mainwork` (request) text"): a few plain-language sentences —
-  where in the codebase, what must change, why; then one-line hierarchical
-  bullets; agent-only detail last.
-- If the add refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: requirement files written/updated, ambiguities flagged, and the work items you

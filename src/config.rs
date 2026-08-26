@@ -71,6 +71,20 @@ pub struct GlobalSettings {
     /// and code items list `<test_dir>/` in codepath_ignore so the two can run
     /// in parallel. Exported to agents as ITER_TEST_DIR.
     pub test_dir: String,
+    /// Automation mode new work items get when nothing else decides
+    /// (features/workitem_automation.md). "auto" — a user-filed item's children
+    /// are born `queued`; "review" — they are born `todo` behind a human gate.
+    /// Agent-created items still INHERIT their creating parent's mode first;
+    /// this only fills the blank at the top of a lineage, which used to be
+    /// hard-coded to "review" and stalled automated queues at every stage.
+    pub default_automation: String,
+    /// Where agents put scratch files, exported to them as $ITER_TEMP.
+    /// Placeholder-expanded; see `temp_dir()` for the one binding that differs
+    /// from the global placeholder table.
+    pub temp_dir: String,
+    /// Temp files are auto-removed after this many days (`iter tempsweep`,
+    /// run daily by a seeded schedule). 0 = never sweep.
+    pub temp_file_ttl_days: u64,
     pub log_default_path: String,
     pub log_level: String,
     pub log_max_size_mb: u64,
@@ -85,6 +99,9 @@ impl Default for GlobalSettings {
             testwriter_max_tests_per_group: 100,
             critreview_max_rounds: 3,
             test_dir: "test".into(),
+            default_automation: "auto".into(),
+            temp_dir: "{dotiter}/temp/".into(),
+            temp_file_ttl_days: 14,
             log_default_path: "./logs/{YYYYMMDD-hh}.log".into(),
             log_level: "info".into(),
             log_max_size_mb: 10,
@@ -163,6 +180,30 @@ pub fn interface_dir(project_root: &Path, _cfg: &Config) -> std::path::PathBuf {
     crate::project::Project::load(project_root).interfacedir
 }
 
+/// Absolute temp directory for this project — the one place agents write
+/// scratch files, handed to them as `$ITER_TEMP`. Defaults to `{dotiter}/temp/`:
+/// scratch is PER-PROJECT, so it belongs in this project's engine home. Note it
+/// is `{dotiter}`, not `{iterdir}` — a deployed binary is routinely shared by
+/// several projects, so a temp directory next to the executable would pile
+/// every project's scratch into one place, which is the wrong-directory problem
+/// this setting exists to end.
+///
+/// A relative setting resolves against the project root. The directory is NOT
+/// created here; callers that hand the path to an agent create it.
+pub fn temp_dir(project_root: &Path, cfg: &Config) -> std::path::PathBuf {
+    let raw = cfg.globalsettings.temp_dir.trim();
+    let raw = if raw.is_empty() { "{dotiter}/temp/" } else { raw };
+    let project = crate::project::Project::load(project_root);
+    let expanded = project.vars().expand(raw).pop().unwrap_or_default();
+    let expanded = expanded.trim_end_matches('/');
+    let path = std::path::PathBuf::from(expanded);
+    if path.is_absolute() {
+        path
+    } else {
+        project.root.join(path)
+    }
+}
+
 /// Every file pinned into ALL new agent context: main.iter.md first, then the
 /// resolved `globalcontextfiles` globs (which absorbed the old global
 /// bizreq/techreq settings).
@@ -202,6 +243,40 @@ mod tests {
         let cfg = load(Path::new("/nonexistent/nowhere"));
         assert_eq!(cfg.engine.tick_interval_sec, 5);
         assert_eq!(cfg.engine.max_attempts, 3);
+    }
+
+    /// The two settings other parts of the system now read by name; a typo in
+    /// either default is a silent behavior change, so they are pinned here.
+    #[test]
+    fn automation_and_temp_defaults() {
+        let g = GlobalSettings::default();
+        assert_eq!(g.default_automation, "auto", "user-filed lineages automate unless told otherwise");
+        assert_eq!(g.temp_dir, "{dotiter}/temp/");
+        assert_eq!(g.temp_file_ttl_days, 14);
+    }
+
+    #[test]
+    fn temp_dir_defaults_under_the_project_engine_home() {
+        let dir = std::env::temp_dir().join(format!("iter-cfg-temp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".iter")).unwrap();
+        let root = dir.canonicalize().unwrap();
+
+        let cfg = Config::default();
+        assert_eq!(temp_dir(&dir, &cfg), root.join(".iter/temp"));
+
+        // An absolute setting is taken as written; a relative one hangs off the
+        // project root, never the caller's cwd (issue 9's stray `.iter/temp/`).
+        let mut cfg = Config::default();
+        cfg.globalsettings.temp_dir = "/var/scratch/iter/".into();
+        assert_eq!(temp_dir(&dir, &cfg), std::path::PathBuf::from("/var/scratch/iter"));
+        cfg.globalsettings.temp_dir = "scratch/".into();
+        assert_eq!(temp_dir(&dir, &cfg), root.join("scratch"));
+        // Blank falls back to the default rather than resolving to the root.
+        cfg.globalsettings.temp_dir = "  ".into();
+        assert_eq!(temp_dir(&dir, &cfg), root.join(".iter/temp"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -13,6 +13,20 @@ pub const TEMPLATE: &[(&str, &str)] = &[
     (".iter/agents/refactor.md", include_str!(".iter/agents/refactor.md")),
     (".iter/agents/testwriter.md", include_str!(".iter/agents/testwriter.md")),
     (".iter/agents/usecase.md", include_str!(".iter/agents/usecase.md")),
+    // Capability files (features item 12): mechanics an agent needs only
+    // occasionally, indexed from _shared.md and read on demand. They must ship
+    // with the template — an index line pointing at a file `iter init` never
+    // created is a capability the agent cannot use.
+    (".iter/agents/_capability/_create_new_workitem.md", include_str!(".iter/agents/_capability/_create_new_workitem.md")),
+    (".iter/agents/_capability/_ask_the_human.md", include_str!(".iter/agents/_capability/_ask_the_human.md")),
+    (".iter/agents/_capability/_critical_review.md", include_str!(".iter/agents/_capability/_critical_review.md")),
+    (".iter/agents/_capability/_reject_invalid_work.md", include_str!(".iter/agents/_capability/_reject_invalid_work.md")),
+    (".iter/agents/_capability/_runtests.md", include_str!(".iter/agents/_capability/_runtests.md")),
+    (".iter/agents/_capability/_testgroup_authoring.md", include_str!(".iter/agents/_capability/_testgroup_authoring.md")),
+    (".iter/agents/_capability/_iter_file_authoring.md", include_str!(".iter/agents/_capability/_iter_file_authoring.md")),
+    (".iter/agents/_capability/_interface_contracts.md", include_str!(".iter/agents/_capability/_interface_contracts.md")),
+    (".iter/agents/_capability/_teststate.md", include_str!(".iter/agents/_capability/_teststate.md")),
+    (".iter/agents/_capability/_usecase_links.md", include_str!(".iter/agents/_capability/_usecase_links.md")),
     (".iter/prepostwork/deploy.md", include_str!(".iter/prepostwork/deploy.md")),
     (".iter/prepostwork/git-commit.md", include_str!(".iter/prepostwork/git-commit.md")),
     (".iter/prepostwork/git-pr.md", include_str!(".iter/prepostwork/git-pr.md")),
@@ -75,6 +89,52 @@ mod tests {
         // Second pass adds nothing.
         assert_eq!(ensure_project(&root).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// features item 12: `_shared.md` carries an INDEX of capability files that
+    /// agents read on demand. An index line naming a file the template never
+    /// ships is a capability the agent cannot reach — it reads as deleted. Both
+    /// directions are checked, so neither a renamed file nor an orphaned one
+    /// can pass unnoticed.
+    #[test]
+    fn every_indexed_capability_ships_and_every_shipped_one_is_indexed() {
+        let shared = TEMPLATE
+            .iter()
+            .find(|(rel, _)| *rel == ".iter/agents/_shared.md")
+            .map(|(_, body)| *body)
+            .expect("_shared.md is in the template");
+        let shipped: Vec<&str> = TEMPLATE
+            .iter()
+            .filter_map(|(rel, _)| rel.strip_prefix(".iter/agents/_capability/"))
+            .collect();
+        assert!(!shipped.is_empty(), "the capability split shipped no files");
+
+        for name in &shipped {
+            assert!(
+                shared.contains(name),
+                "{} ships but nothing in _shared.md's index points at it — no agent will ever read it",
+                name
+            );
+        }
+        // And the reverse: every *.md the index names must be a shipped file.
+        for line in shared.lines() {
+            for token in line.split('`') {
+                // `<file>` and the like are prose placeholders, not references.
+                let token = token.trim_start_matches("_capability/");
+                if token.starts_with('_')
+                    && token.ends_with(".md")
+                    && token != "_shared.md"
+                    && !token.contains('<')
+                {
+                    assert!(
+                        shipped.contains(&token),
+                        "_shared.md indexes {} but the template does not ship it — `iter init` \
+                         would scaffold a project whose index points at a missing file",
+                        token
+                    );
+                }
+            }
+        }
     }
 
     #[test]

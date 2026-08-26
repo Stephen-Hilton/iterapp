@@ -1,9 +1,63 @@
 # Shared instructions (all agents)
 
 This file is appended to EVERY agent's context on every run — the store-once place
-for rules that apply to all agents. Keep entries short and universal; agent-specific
-guidance belongs in that agent's own file. (Files here starting with `_` are helpers,
-never agent types.)
+for rules that apply to all agents, every turn. Keep entries short and universal;
+agent-specific guidance belongs in that agent's own file, and mechanics an agent
+needs only occasionally belong in a capability file (see the index below). Files
+here starting with `_` are helpers, never agent types.
+
+## Capabilities — an index; READ the file when you need the capability
+
+Mechanics used occasionally live in their own files instead of this one, so agents
+that never use them never carry them. Each line below names a capability, says when
+you need it, and gives the file to read. Use your Read tool (or `cat`) to read that
+file AT THE MOMENT you need the capability, and follow what it says — never work
+from memory of what it probably contains. The directory is
+`$ITER_PROJECT/.iter/agents/_capability/` (`$ITER_PROJECT` is an absolute path the
+engine exports into your environment). Anywhere a file names a capability as
+`_capability/<file>.md` or just `<file>.md`, that is the file to read — expand it to
+`$ITER_PROJECT/.iter/agents/_capability/<file>.md`.
+
+- **`_create_new_workitem.md`** — creating a work item with `iter add`: the JSON
+  shape, every option, how to write the item's `mainwork`, `depends_on` ordering,
+  automation inheritance, `codepath` / `codepath_ignore`, and which `model` to put
+  on the item. Read it before every add. Two rules bind you even before you read
+  it: **never set `state`** (the engine derives it from the automation mode), and
+  write `mainwork` in the same three-tier shape as your own output.
+- **`_ask_the_human.md`** — `iter ask`: stopping to put a decision to a human when
+  it is not yours to make (what the product should do, which trade-off the project
+  lives with), plus the four-part format every question must take. Read it the
+  moment you are tempted to guess a product decision.
+- **`_critical_review.md`** — `iter critreview`: the synchronous critique
+  subprocess. Read it whenever your mainwork asks for a critical review or a
+  critique. The review is part of the work, and a nonzero exit means your item has
+  already been flagged to fail — stop there. The cap is a live setting (Settings →
+  `critreview_max_rounds`), currently
+  at most {critreview_max_rounds} review round(s) per work item.
+- **`_reject_invalid_work.md`** — `iter reject`: what to do when the problem is the
+  WORK ITEM itself (out of scope, goal unclear, premise no longer true, conflicts
+  with a `*bizreq.iter.md` invariant) rather than your ability to do it. Rejecting
+  is not failing. Read it before you fail — or quietly complete — a bad item.
+- **`_runtests.md`** — `iter runtests`: the deterministic runner and its three
+  modes — neutral runs, `--broken` (claims the defect is still present) and
+  `--fixed` (claims it is resolved). A false claim flags your item as failed. Read
+  it before any run that carries a claim, and before filing a defect-shaped item.
+- **`_testgroup_authoring.md`** — the format law for `*.testgroup.iter.md` files
+  and the shell scripts they register: the `iterapp:testgroups` JSONL block, the
+  `testlist` entry shape, the exit-code / `ITER_RESULT` script contract, the three
+  test flavors, and the registration chain that makes the sweep see a test at all.
+- **`_iter_file_authoring.md`** — creating or restructuring a code node or
+  requirement `*.iter.md` file: the frontmatter blocks, the required
+  `# Long Description`, the quoting rule, and the orphan check.
+- **`_interface_contracts.md`** — writing an `*.interface.iter.md`: the fixed
+  section format each `kind:` demands, transport neutrality, WHAT-never-WHO-or-HOW,
+  and reuse before creating a new id.
+- **`_teststate.md`** — `iter teststate`: the Test Loop gate
+  (`inherit` | `omit` | `include` | `block`), the nearest-flag-wins rule, and why a
+  `block` refusal must never be forced or worked around.
+- **`_usecase_links.md`** — `iter usecase`: editing a use-case file's
+  `children.codenodes` link list from any agent, and the rule that links reflect
+  what was BUILT, not what was proposed.
 
 ## Communicate clearly — a human must get it FAST
 
@@ -25,7 +79,7 @@ item outputs, observations, reports) as exactly three tiers, in this order:
    two tiers above.
 
 Style rules for all tiers (and everything else you write — commit messages,
-docs):
+docs, the `mainwork` of items you create):
 
 - **Use specific, common words.** No jargon, no invented terms, no implied
   meanings. Call files and things by their exact names (`testgroup.iter.md`,
@@ -37,62 +91,15 @@ docs):
 - **Avoid large blocks of dense text** — they slow human readers down. Break
   them up or cut them.
 
-## Authoring `mainwork` (request) text on items you create
+## Scratch files go in `$ITER_TEMP`
 
-Any agent may create work items, and each item's `mainwork` is read twice:
-by a human deciding whether the item should run, and by the agent that runs
-it. Author it in the same three-tier shape as your outputs:
-
-1. Open with a few plain-language sentences: where in the codebase the item
-   operates, what must change, and why — which requirement or test of the
-   current mainwork it serves.
-2. Then the specifics as hierarchical bullets — acceptance criteria, files,
-   constraints — one line each, two max.
-3. Put agent-only detail (exact commands, ids, raw listings the human should
-   not wade through) at the bottom, clearly last.
-
-## Requesting a critical review
-
-When your mainwork asks for a critical review (or "critique"), get one
-synchronously — no work items involved — BEFORE acting on the reviewed result
-(e.g. a plan agent reviews its plan before creating the follow-on items):
-
-1. Write the material to review (the plan text, a change summary plus file list,
-   etc.) to a temp file, e.g. `.iter/temp/critique-<workid>.md`.
-2. Run — and set the Bash tool call's timeout high (up to 1800000 ms); the review
-   takes minutes:
-
-       "$ITER_BIN" critreview --project "$ITER_PROJECT" --file <material.md> --context <requirements.md> ...
-
-3. The critic's verdict and numbered feedback arrive on stdout. Triage it
-   yourself: decide which items are valid given the requirements, do a
-   cost/benefit pass on the valid ones, implement what is worth doing, and record
-   each item's disposition in your output.
-4. After major revisions, request another review of the revised material. Cap:
-   at most {critreview_max_rounds} review round(s) per work item (Settings →
-   `critreview_max_rounds`); stop earlier the moment a review comes back with
-   no material findings — rounds are a budget, not a target.
-
-Exit codes: **0** — feedback on stdout, triage it. **Any nonzero exit** — the
-review could not be delivered and your work item has already been flagged to
-fail (the engine enforces this at the next turn boundary regardless of what you
-do). STOP immediately: do not create work items, do not proceed without the
-review, end your session stating the critreview failure. A requested review is
-part of the work — work without it is not done.
-
-## Work items you create: never set `state`
-
-Do not set `state` on work items you create (`iter add`). The engine derives it
-from YOUR work item's automation mode, inherited down the whole chain from the
-original request: `automation: review` → your items are born `todo` (a human
-reviews each stage before it runs); `automation: auto` → born `queued` (fully
-automated build). Any `todo`/`queued` you write is overridden — the mode, not
-the prompt, decides. Design every handoff to work in BOTH modes: the documents
-and mainwork must stand alone whether a human reads them first or an agent
-picks them up seconds later. (Guards outrank automation: `iter reject`, the
-non-convergence guard, and failed dependencies land items in `todo` in any
-mode, and `--question` lands an item in `question` in any mode — see "Asking
-the human a question" below.)
+Anything you write for your own use within one work item's lifetime — a work item
+draft you feed to `iter add --file`, a question file, review material, a one-off
+helper script — goes in `$ITER_TEMP/`, the absolute scratch directory the engine
+exports into your environment. **Never write a relative `.iter/temp/...` path**: it
+resolves against your working directory and mints a stray temp tree wherever you
+happen to be running. Files there are swept after `temp_file_ttl_days` (Settings),
+so nothing that someone will want later belongs there.
 
 ## Lock scope and codepath_ignore
 
@@ -102,89 +109,7 @@ relative to the codepath), those subtrees are **carved out of your scope — do 
 create, edit, or delete anything under them.** Another work item may own them and
 be running there right now; the engine's lock lets you both through on exactly
 that promise. Reading is fine anywhere. When you create work items, use the same
-mechanism to parallelize: e.g. a code item on `<component>` with
-`"codepath_ignore": ["$ITER_TEST_DIR/"]` alongside a testwriter item whose
-codepath IS `<component>/$ITER_TEST_DIR` (the project's test directory name —
-`globalsettings.test_dir`, exported as `$ITER_TEST_DIR`).
-
-## Defect items carry their failing testgroup (red before fix)
-
-A work item you create may sit queued for hours and then run against a tree that
-has moved on. In the TDD flow that risk is handled by tests, not prose: a
-defect-shaped item must carry the testgroup that proves the defect
-(`source_testgroup` on sweep-born items; name the group in `mainwork` on items
-you author). The receiving agent reproduces BEFORE fixing:
-
-    "$ITER_BIN" runtests --project "$ITER_PROJECT" --group "<label>" --broken
-
-`--broken` claims "the defect is still present". If the group is actually green
-the claim is false: the engine flags the item (it fails at the turn boundary no
-matter what you do next) — the item is STALE; touch no code and stop. When your
-fix is done, gate completion with `--fixed` (claims "resolved"; any red or
-script error flags the item). Plain `runtests` invocations are neutral — run
-them freely while iterating; they never flag anything.
-
-A defect claim that could have a test gets the test written first, then the fix
-item. Only for genuinely untestable claims (external infra state, credentials)
-may an item fall back to prose: state the claim, the check command, and
-"if this no longer holds, report stale and stop" in `mainwork`.
-
-## Rejecting invalid work (any agent)
-
-Failing an item means "I couldn't do the work" — the engine retries it. When the
-problem is the WORK ITSELF (out of scope for the project, goal unclear, premise
-no longer true, conflicts with a `*bizreq.iter.md` invariant), do not fail and
-do not quietly complete. Reject it:
-
-    "$ITER_BIN" reject --project "$ITER_PROJECT" --reason "<why, and what would make it acceptable>"
-
-The engine moves the item to `todo` at the turn boundary — the human-review
-bucket, where the user edits and requeues (or deletes) it. No retries are
-burned; nothing gets buried in the completed archive. Your reason and your
-output are what the re-evaluating human sees: name the blocking fact and the
-smallest change that would make the item valid, then end your work.
-
-## Asking the human a question (any agent)
-
-Some decisions are not yours to make: what the product should do, which
-trade-off the project wants to live with, which of two defensible designs to
-carry for years. Guessing one of those and building on it is worse than
-stopping. Ask:
-
-    "$ITER_BIN" ask --project "$ITER_PROJECT" --question "<the question>"
-    "$ITER_BIN" ask --project "$ITER_PROJECT" --file .iter/temp/q-<workid>.md
-
-Your work item moves to the `question` state at the turn boundary — parked,
-no retries burned, your turns so far kept as the research behind the ask. When
-a human answers it in the webapp, the item queues again and the agent that
-picks it up gets the question and the answer at the top of its request.
-Summarize the question in your output and end your turn; do no further work on
-that item.
-
-If the decision does NOT block you, raise it as its own item instead and keep
-going: `"$ITER_BIN" add --type <agent> --title "<the decision, as a question>"
---question "<the question>" --mainwork "<what to do once it is answered>"`.
-
-**Research before you ask.** A question the repository already answers wastes
-the one resource an agent cannot make more of. Read the relevant
-`*.code.iter.md` node files, the `*.bizreq.iter.md` / `*.techreq.iter.md` under
-them, the global context files, the interface contracts and use-cases, and the
-actual code. Ask only what none of them decide.
-
-**Write the question in four parts**, in this order:
-
-1. **Context** — where in the codebase this sits and why the decision is needed
-   now. Plain sentences; assume the reader has not seen this work item.
-2. **The question** — the one decision, stated as a question. One decision per
-   work item; two questions are two items.
-3. **Two to four options** — concrete, each with what it buys and what it costs
-   (effort, risk, what it forecloses later). Name the requirement, file, or
-   constraint each option honors or breaks.
-4. **Your recommendation** — which one you would take and why, so the human can
-   answer in one word.
-
-Never ask a question whose options you have not researched, and never ask one
-you could answer by reading. An unhelpful question is a rejected question.
+mechanism to parallelize them — `_create_new_workitem.md` has the pattern.
 
 ## iter files — the FILENAME declares the nodetype (structureV2)
 
@@ -225,123 +150,20 @@ engine, never guess: `"$ITER_BIN" resolve --project "$ITER_PROJECT"
 authoritative template for the nodetype named by the filename (the file need
 not exist yet; an existing interface file's `kind:` steers which skeleton you
 get). Fetch it when you create or restructure a file — the template is the
-single deterministic source, so format changes reach every agent at once.
+single deterministic source, so format changes reach every agent at once. The
+authoring rules for each nodetype are in `_iter_file_authoring.md` and
+`_interface_contracts.md`.
 
 EVERY node file must begin with `---`-fenced frontmatter carrying `name:`,
 `description:`, and a `children:` mapping with at least one sub-key (write the
 defaults out explicitly; body-only bizreq/techreq may use `reqpaths: []`).
 
-- Code node (`*.code.iter.md`):
-
-      ---
-      name: "Human-Readable Name"
-      level: component        # context | container | component
-      description: "one line on what this code node is"
-      owner: bespoke          # bespoke | oss | 3rdparty
-      teststate: inherit      # omit | include | block | inherit
-      children:
-        codedirs:   ["{thisfiledir}/"]          # the actual source code
-        codenodes:  []                          # child *.code.iter.md files (paths/globs)
-        inputs:     []                          # interface FILES consumed
-        outputs:    []                          # interface FILES produced
-        bizreqs:    ["{thisfiledir}/*.bizreq.iter.md"]
-        techreqs:   ["{thisfiledir}/*.techreq.iter.md"]
-        testgroups: ["{thisfiledir}/test/*.testgroup.iter.md"]
-      ---
-
-  **The code node file defines the C4 object — every file belonging to it is
-  linked here, never inferred from directory positions.** `context`-level nodes
-  attach to the project head automatically; containers/components attach where
-  a parent's `codenodes` lists them (unlinked ones orphan). A testgroups link
-  matching nothing = this node is deliberately untested; if tests should
-  exist, create them where the link will find them.
-
-- Interface node (`*.interface.iter.md`) — the LOGICAL data contract between
-  code nodes; a GLOBAL object living under `{interfaces}`. FIXED FORMAT —
-  these sections and ONLY these, enforced by `iter validate` (get the current
-  skeleton with `"$ITER_BIN" validate --file <path> --template`; never write
-  one from memory):
-
-  - frontmatter: `name:` (the id); `kind:` — the interaction shape,
-    `request-reply | event | stream | dataset`, never a transport or a syntax;
-    `description:` (quoted prose); `children:` with the per-node defaults
-    (`{thisfiledir}/{thisfilestem}/*.bizreq|techreq|testgroup.iter.md`)
-  - one `# <id> — contract` H1, then a named summary under 300 characters
-  - the kind's H2 sections: request-reply → `## Request`, `## Reply, success
-    shape`, `## Reply, failure shape`; event → `## Event`; stream →
-    `## Stream item`, `## Stream end`; dataset → `## Record`
-  - closing every file, in order: `## Worked examples` (normative pairs in one
-    strict-JSON fence) and `## Invariants` (few bullets — only what examples
-    cannot show)
-  - optionally, and ONLY as the final section after `## Invariants`:
-    `## Exceptions` — a declared deviation from the internal transport law that
-    service-to-service calls ride the mesh with mutual TLS and speak gRPC. State
-    what deviates (e.g. a component that must speak an infrastructure wire
-    protocol such as Redis's or Kafka's), why gRPC is impractical there, and
-    what still holds (mesh transit, mTLS). Most contracts have no such section,
-    and that is the normal case: no section, no exception
-
-  Message shapes are pseudo-JSON with constraints as inline comments. JSON is
-  the NOTATION, not a wire format — conventions for what JSON cannot say:
-  binary as hex/base64 strings, 64-bit ints and money as strings or integer
-  cents, timestamps as ISO-8601 strings, enums as closed vocabularies named in
-  comments. A function call is logically request → reply, so a library surface
-  is written as kwargs-object → return-object messages. Tag a fence (```json)
-  only when the block strictly parses; pseudo-examples stay untagged. Models:
-  `sampleV1/interfaces/ledger-command/` (request-reply) and
-  `sampleV1/interfaces/entry-recorded/` (event — note the different fixed
-  sections `kind:` demands; `iter validate --file <f> --template` prints the
-  right skeleton for the kind).
-
-  **The two-clause test — the file is right when:** (1) a stranger could
-  implement EITHER side from this file alone, and (2) nothing in it would
-  change if a component were rebuilt in another language or deployed
-  differently. An interface is TRANSPORT-NEUTRAL: the same messages may ride
-  an HTTP body, a gRPC message, a queue record, argv/stdout, or an in-process
-  struct, chained in any order, without renaming a field or changing a rule.
-  Carrier bindings — routes, ports, topics, flags, exit codes, build and
-  deploy facts — fail clause 2: record them on the code node file of the object
-  that serves that binding, never here.
-
-  **WHAT, never WHO or HOW.** An interface is used by many code nodes; the file
-  must not name providers, consumers, or callers, nor describe how or where
-  anyone uses it — the structure graph already carries that through the code
-  nodes' `children.inputs`/`children.outputs` links. Sentences like "consumed
-  by X" go stale the moment a second consumer appears, and `iter validate`
-  flags them.
-
-  **Interfaces are shared contracts — reuse before creating.** Before adding a
-  new interface, check the existing ids (every `*.interface.iter.md` in the tree
-  — the scan aggregates them globally) for a contract that already fits;
-  extend or reference it instead of creating a near-duplicate. Create a new id
-  only when no existing contract covers the need. NEW interface files are named
-  `<id>.interface.iter.md` and land in `$ITER_INTERFACE_DIR` (the
-  `globalinterfacedir` / `{interfaces}` setting, default `{topdir}/interfaces/`)
-  — the scanner finds them anywhere, but new ones belong there.
-
-  **Copy the quotes** on the prose fields (`name`, `description`, `endpoint`). Prose
-  routinely contains a colon-plus-space, and while the engine parses that fine
-  unquoted, strict-YAML tools reading the same file refuse the whole block. Bare
-  single-token values (`level:`, `kind:`, `owner:`, `teststate:`) stay unquoted.
-
-  Every code node's BODY must contain a `# Long Description` section: a
-  plain-language description of the object for a non-technical reader — describe,
-  don't state; no jargon; define every acronym on first use ("three letter
-  acronym (TLA)"); link related project parts by their node file path. Write it
-  for real when you create or substantially change a node — never leave `TBD`.
-
-- Use-case nodes (`*.usecase.iter.md`) are GLOBAL objects under `{usecases}`.
-  Their `children.codenodes` is the REQUIRED link list (the *.code.iter.md
-  files the journey needs — an empty list is valid and marks work to come);
-  edit it with the engine-owned path: `"$ITER_BIN" usecase --project
-  "$ITER_PROJECT" --file <f> --add <code file> [--remove <entry>] [--list]`.
-
-- **Project-WIDE context** is `$ITER_MAINFILE` (the main.iter.md project head —
-  the first file in every agent context) plus every `globalcontextfiles`
-  match, colon-joined in `$ITER_CONTEXT_FILES`. The engine lists exactly those
-  in your spin-up context automatically. Component-local requirement files
-  stay linked beside their component (`children.bizreqs`/`techreqs`); a
-  requirement that spans components belongs in the global context files.
+**Project-WIDE context** is `$ITER_MAINFILE` (the main.iter.md project head — the
+first file in every agent context) plus every `globalcontextfiles` match,
+colon-joined in `$ITER_CONTEXT_FILES`. The engine lists exactly those in your
+spin-up context automatically. Component-local requirement files stay linked beside
+their component (`children.bizreqs` / `techreqs`); a requirement that spans
+components belongs in the global context files.
 
 If you encounter a node file with missing or malformed frontmatter anywhere in the
 files you read for your work, correct it as part of your change and note the fix in

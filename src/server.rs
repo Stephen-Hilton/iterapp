@@ -1,6 +1,6 @@
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -104,8 +104,16 @@ pub fn slug(project_root: &Path) -> String {
 /// paths — what the Settings page renders and PUTs back.
 pub fn project_settings(project_root: &Path) -> Value {
     let p = crate::project::Project::load(project_root);
+    let cfg = config::load(project_root);
     json!({
         "server": p.server,
+        // The engine-side globals (.iter/.engine/config.json) ride along so the
+        // Settings page renders them beside the head-file settings from one
+        // fetch — default_automation, temp_dir and temp_file_ttl_days are in
+        // here. They are written back through PUT /api/config or the
+        // `globalsettings` half of PUT /api/projectsettings; both land in the
+        // same file, merged by key.
+        "globalsettings": serde_json::to_value(&cfg.globalsettings).unwrap_or(Value::Null),
         "project": {
             "projectname": p.config.projectname,
             "projectdescription": p.config.projectdescription,
@@ -120,6 +128,10 @@ pub fn project_settings(project_root: &Path) -> Value {
             "interfacedir": p.interfacedir.to_string_lossy(),
             "usecasedir": p.usecasedir.to_string_lossy(),
             "scandirs": p.scandirs.iter().map(|d| d.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            // Where `temp_dir`'s placeholders actually land — the same absolute
+            // path the engine exports to agents as $ITER_TEMP, so the Settings
+            // page shows the directory the sweeper will be walking.
+            "tempdir": config::temp_dir(project_root, &cfg).to_string_lossy(),
         },
         // Legacy aliases a few readers still use.
         "project_name": p.projectname(),
@@ -261,6 +273,7 @@ fn route(req: &Req, engine: &Engine, port: u16) -> Resp {
         ("GET", ["api", "workitems", id]) => api_get(project, id),
         ("PATCH", ["api", "workitems", id]) => api_patch(req, project, id),
         ("POST", ["api", "workitems", id, "action"]) => api_action(req, project, id),
+        ("GET", ["api", "workitems", id, "gated"]) => api_gated(project, id),
         ("GET", ["api", "workitems", id, "logs"]) => api_logs(project, id),
         ("GET", ["api", "workitems", id, "tests"]) => api_tests(project, id),
         ("GET", ["api", "history"]) => api_history(req, project),
@@ -297,11 +310,34 @@ fn queue_for(project: &Path) -> Queue {
     Queue::new(project, &cfg)
 }
 
+/// The header's numbers, in one place because two producers must agree:
+/// /api/state answers a poll, the SSE delta ships them alongside the changed
+/// rows, and a client that mixed two different tallies would flicker between
+/// them. Every state the list can show gets a key — `failed` spans both files
+/// (a failed item is open while it still has retries left and archived once
+/// they run out), `complete` and the archive's share of `failed` come from the
+/// closed file alone.
+fn queue_counts(open: &[WorkItem], closed: &[WorkItem]) -> Value {
+    let count = |s: &str| open.iter().filter(|i| i.state == s).count();
+    json!({
+        "queued": count(workitems::STATE_QUEUED),
+        "in-progress": count(workitems::STATE_IN_PROGRESS),
+        "todo": count(workitems::STATE_TODO),
+        "question": count(workitems::STATE_QUESTION),
+        "paused": count(workitems::STATE_PAUSED),
+        "scheduled": count(workitems::STATE_SCHEDULED),
+        "failed": count(workitems::STATE_FAILED)
+            + closed.iter().filter(|i| i.state == workitems::STATE_FAILED).count(),
+        "complete": closed.iter().filter(|i| i.state == workitems::STATE_COMPLETE).count(),
+        "open": open.len(),
+        "total": open.len() + closed.len(),
+    })
+}
+
 fn api_state(project: &Path, engine: &Engine, port: u16) -> Resp {
     let queue = queue_for(project);
     let open = queue.load();
     let closed = queue.load_closed();
-    let count = |s: &str| open.iter().filter(|i| i.state == s).count();
     let cfg = config::load(project);
     json_resp(
         200,
@@ -321,18 +357,7 @@ fn api_state(project: &Path, engine: &Engine, port: u16) -> Resp {
                     "age_sec": u.age_sec(now),
                 })
             }).unwrap_or(Value::Null),
-            "counts": {
-                "queued": count(workitems::STATE_QUEUED),
-                "in-progress": count(workitems::STATE_IN_PROGRESS),
-                "todo": count(workitems::STATE_TODO),
-                "question": count(workitems::STATE_QUESTION),
-                "paused": count(workitems::STATE_PAUSED),
-                "failed": count(workitems::STATE_FAILED)
-                    + closed.iter().filter(|i| i.state == workitems::STATE_FAILED).count(),
-                "complete": closed.iter().filter(|i| i.state == workitems::STATE_COMPLETE).count(),
-                "open": open.len(),
-                "total": open.len() + closed.len(),
-            }
+            "counts": queue_counts(&open, &closed),
         }),
     )
 }
@@ -414,26 +439,30 @@ fn api_meta(project: &Path) -> Resp {
     )
 }
 
-fn api_list(project: &Path) -> Resp {
-    let queue = queue_for(project);
-    let open = queue.load();
-    let closed = queue.load_closed();
-    // Dependency-gated items get their gate's live status injected (computed
-    // against the FULL closed archive, before truncation), so the webapp header
-    // can show the blocked-by chain without re-deriving engine semantics.
-    // The picker's own skip reasons (written each tick). A dependency gate has
-    // always had a chip; a LOCK gate had nothing, so a queue full of runnable
-    // work with one agent on it looked like the engine ignoring it.
-    let blocked = crate::scheduler::read_blocked(project);
-    let open_vals: Vec<Value> = open
-        .iter()
+/// Serialize the open queue the way the webapp expects to receive it. Both
+/// producers of open rows go through here — the full list and the SSE delta —
+/// so a row that arrives as a delta is byte-identical to the same row arriving
+/// from a refetch, and the client never has to reconcile two shapes.
+///
+/// Dependency-gated items get their gate's live status injected (computed
+/// against the FULL closed archive, before any truncation), so the webapp can
+/// show the blocked-by chain without re-deriving engine semantics. `blocked`
+/// carries the picker's own skip reasons (written each tick): a dependency gate
+/// has always had a chip; a LOCK gate had nothing, so a queue full of runnable
+/// work with one agent on it looked like the engine ignoring it.
+fn open_item_values(
+    open: &[WorkItem],
+    closed: &[WorkItem],
+    blocked: &HashMap<String, crate::scheduler::Blocked>,
+) -> Vec<Value> {
+    open.iter()
         .map(|i| {
             let mut v = serde_json::to_value(i).expect("workitem serializes");
             if let Some(b) = blocked.get(&i.workid) {
                 v["lock_status"] = serde_json::to_value(b).unwrap_or(Value::Null);
             }
             if !i.depends_on.is_empty() {
-                let (state, by) = match workitems::dep_status(i, &open, &closed) {
+                let (state, by) = match workitems::dep_status(i, open, closed) {
                     workitems::DepStatus::Satisfied => ("ok", Value::Null),
                     workitems::DepStatus::Blocked(id) => ("blocked", json!(id)),
                     workitems::DepStatus::Failed(why) => ("failed", json!(why)),
@@ -442,7 +471,15 @@ fn api_list(project: &Path) -> Resp {
             }
             v
         })
-        .collect();
+        .collect()
+}
+
+fn api_list(project: &Path) -> Resp {
+    let queue = queue_for(project);
+    let open = queue.load();
+    let closed = queue.load_closed();
+    let blocked = crate::scheduler::read_blocked(project);
+    let open_vals = open_item_values(&open, &closed, &blocked);
     let mut closed = closed;
     if closed.len() > 500 {
         closed = closed.split_off(closed.len() - 500);
@@ -541,10 +578,15 @@ fn api_get(project: &Path, id: &str) -> Resp {
     }
 }
 
+/// `model` is the per-item override (features item 12): empty means the agent
+/// type's default, so clearing it here is how a user hands the item back to the
+/// agent's own model. `todo_reason` is editable for the same reason the state
+/// is — a human who has fixed the broken configuration behind a `"config"` park
+/// clears the reason along with the `todo`, and nothing else can clear it.
 const EDITABLE: &[&str] = &[
     "title", "type", "priority", "risk", "source", "codepath", "codepaths", "codepath_ignore", "context", "testfiles",
     "prework", "postwork", "mainwork", "exec", "sched", "depends_on", "depends_on_shallow", "automation", "question",
-    "answer",
+    "answer", "model", "todo_reason",
 ];
 
 /// States whose items a PATCH may rewrite. `queued` is included: an item that
@@ -641,13 +683,34 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
     let action = body.get("action").and_then(|a| a.as_str()).unwrap_or("");
     let queue = queue_for(project);
 
+    // release_gated acts on this item's DESCENDANTS, never on the item itself,
+    // so it reads the same whether the parent is still open or closed months
+    // ago — the usual case is exactly that, a finished plan item whose children
+    // were all born `todo` under review mode (issue 7c).
+    if action == "release_gated" {
+        return api_release_gated(project, id);
+    }
+
+    let open_now = queue.load();
+
+    // An id the open queue does not hold may still be in the archive. Until
+    // issues 3+8 that was one flat "no such open work item" for every verb, so
+    // a Retry click on a closed item read like a transient glitch and a Delete
+    // click promised something no route implemented.
+    if !open_now.iter().any(|i| i.workid == id) {
+        if let Some(archived) = queue.load_closed().into_iter().rev().find(|i| i.workid == id) {
+            return closed_item_action(project, &queue, &archived, action);
+        }
+        return err_resp(404, "no such open work item");
+    }
+
     // Stop an IN-PROGRESS ("errantly started") item: the engine owns it, so
     // the stop is delivered as a file flag — the runner polls it mid-turn and
     // kills the session; the worker moves the item to `todo` with partial
     // output kept. The webapp confirms with the user before calling this
     // (mid-stream stop, partially completed work, git undo hint).
     if action == "stop" {
-        let Some(item) = queue.load().into_iter().find(|i| i.workid == id) else {
+        let Some(item) = open_now.iter().find(|i| i.workid == id) else {
             return err_resp(404, "no such open work item");
         };
         if item.state != workitems::STATE_IN_PROGRESS {
@@ -665,7 +728,7 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
     // itersched::fire dedups under the record lock, so this happens before (not
     // inside) the with_lock below.
     if matches!(action, "queue" | "requeue")
-        && queue.load().iter().any(|i| i.workid == id && i.state == workitems::STATE_SCHEDULED)
+        && open_now.iter().any(|i| i.workid == id && i.state == workitems::STATE_SCHEDULED)
     {
         let cfg = config::load(project);
         return match crate::itersched::fire(project, &cfg, id, "manual queue") {
@@ -748,20 +811,15 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
                 Ok(json!({ "state": "deleted" }))
             }
             "clone" => {
-                let mut copy = items[pos].clone();
-                copy.workid = uuid::Uuid::new_v4().to_string();
-                copy.state = workitems::STATE_TODO.into();
-                copy.attempts = 0;
-                copy.output.clear();
-                copy.lasterror.clear();
-                copy.times = workitems::Times { added: workitems::now_iso(), ..Default::default() };
+                let copy = fresh_clone(&items[pos]);
                 let workid = copy.workid.clone();
                 items.push(copy);
                 Ok(json!({ "state": "todo", "workid": workid }))
             }
             _ => Err((
                 400,
-                "action must be queue|todo|pause|schedule|answer|question|complete|delete|clone|stop".to_string(),
+                "action must be queue|todo|pause|schedule|answer|question|complete|delete|clone|stop|release_gated"
+                    .to_string(),
             )),
         }
     });
@@ -777,6 +835,183 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
             json_resp(200, v)
         }
         Ok(Err((code, msg))) => err_resp(code, &msg),
+        Err(e) => err_resp(500, &e.to_string()),
+    }
+}
+
+/// A clone is a NEW item that starts where the original STARTED, not where it
+/// ended: fresh workid, no attempts, no output, no error, no park reason, and
+/// `todo` so a human confirms before it runs. The reset has to be complete
+/// because this is the recovery path out of a closed item — a clone that
+/// inherited a burned attempt count would be terminal on its first pick.
+fn fresh_clone(item: &WorkItem) -> WorkItem {
+    let mut copy = item.clone();
+    copy.workid = uuid::Uuid::new_v4().to_string();
+    copy.state = workitems::STATE_TODO.into();
+    copy.attempts = 0;
+    copy.output.clear();
+    copy.lasterror.clear();
+    copy.todo_reason.clear();
+    copy.times = workitems::Times { added: workitems::now_iso(), ..Default::default() };
+    copy
+}
+
+/// Why a closed item refused a verb, in the two facts that decide what the user
+/// does next: what it closed AS, and how many attempts are behind that. Issue 3
+/// — the old answer was a flat "no such open work item", which reads like a
+/// transient glitch, so the user clicked Retry several more times.
+fn closed_item_message(item: &WorkItem) -> String {
+    let state = if item.state.is_empty() { "archived" } else { item.state.as_str() };
+    format!(
+        "this item is closed ({} after {} attempt{}); clone it to run again",
+        state,
+        item.attempts,
+        if item.attempts == 1 { "" } else { "s" }
+    )
+}
+
+/// The verbs an ARCHIVED item still answers. `delete` and `clone` are the only
+/// two that mean anything on history — one drops the row, the other starts a
+/// fresh item from it — and every other verb is asking finished work to run
+/// again, which it cannot do.
+fn closed_item_action(project: &Path, queue: &Queue, item: &WorkItem, action: &str) -> Resp {
+    match action {
+        "delete" => match remove_closed(project, queue, &item.workid) {
+            Ok(true) => json_resp(200, json!({ "state": "deleted", "archived": true })),
+            Ok(false) => err_resp(404, "no such work item"),
+            Err(e) => err_resp(500, &format!("cannot rewrite the closed archive: {}", e)),
+        },
+        "clone" => {
+            let copy = fresh_clone(item);
+            let workid = copy.workid.clone();
+            match queue.append(&copy) {
+                Ok(()) => json_resp(200, json!({ "state": "todo", "workid": workid, "archived": true })),
+                Err(e) => err_resp(500, &format!("cannot append: {}", e)),
+            }
+        }
+        _ => err_resp(409, &closed_item_message(item)),
+    }
+}
+
+/// Drop one row from `workitems_closed.jsonl` — whole-file rewrite under the
+/// same record lock `Queue::with_lock` takes on the open queue. Answers whether
+/// the id was there to remove. Issue 8: before this the archive was append-only
+/// forever, so a junk item sat in the `failed` count permanently and the only
+/// removal was hand-editing the file while hoping the engine stayed quiet.
+///
+/// `Queue::append_closed` archives WITHOUT taking this lock, so the lock alone
+/// cannot stop an engine appending in the millisecond between our read and our
+/// rename. The length re-check catches exactly that: a file that grew under us
+/// means an append landed, and we redo the rewrite rather than swallow it.
+fn remove_closed(project: &Path, queue: &Queue, workid: &str) -> std::io::Result<bool> {
+    let cfg = config::load(project);
+    let path = &queue.closed_path;
+    let len_of = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    for _ in 0..4 {
+        let _guard =
+            locks::acquire_file_lock(path, cfg.engine.queue_lock_retry_ms, cfg.engine.queue_lock_break_sec)?;
+        let before = len_of(path);
+        let items = queue.load_closed();
+        let kept: Vec<&WorkItem> = items.iter().filter(|i| i.workid != workid).collect();
+        if kept.len() == items.len() {
+            return Ok(false);
+        }
+        let mut text = String::new();
+        for item in kept {
+            text.push_str(&serde_json::to_string(item).expect("workitem serializes"));
+            text.push('\n');
+        }
+        if len_of(path) != before {
+            continue; // an append landed mid-rewrite — start over so it survives
+        }
+        let tmp = path.with_extension("jsonl.tmp");
+        std::fs::write(&tmp, &text)?;
+        std::fs::rename(&tmp, path)?;
+        return Ok(true);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "the closed archive kept changing under the rewrite",
+    ))
+}
+
+/// Everything transitively created by `id` — the same `created_by` walk the
+/// dependency gate uses, which is why a CLOSED ancestor still yields open
+/// children: an item that spawns work "completes" the moment it files it, and
+/// that finished plan item is the usual thing a user is looking at when they
+/// ask what is still gated.
+///
+/// Returns (releasable, guarded). A `todo` child whose `todo_reason` is empty
+/// was merely BORN under review mode — one click from running, and the thing
+/// issue 7c asks to bulk-release. A child carrying a reason was parked by a
+/// guard (iter reject, failed dependency, broken configuration): that is
+/// somebody's judgment, never a bulk release. `question` items sit in their own
+/// state and appear in neither list.
+fn gated_descendants(id: &str, open: &[WorkItem], closed: &[WorkItem]) -> (Vec<String>, Vec<String>) {
+    let (mut releasable, mut guarded) = (Vec::new(), Vec::new());
+    let mut stack = vec![id.to_string()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(parent) = stack.pop() {
+        if !seen.insert(parent.clone()) {
+            continue;
+        }
+        for child in open.iter().filter(|i| i.created_by == parent) {
+            if child.state == workitems::STATE_TODO {
+                if child.todo_reason.trim().is_empty() {
+                    releasable.push(child.workid.clone());
+                } else {
+                    guarded.push(child.workid.clone());
+                }
+            }
+            stack.push(child.workid.clone());
+        }
+        for child in closed.iter().filter(|i| i.created_by == parent) {
+            stack.push(child.workid.clone());
+        }
+    }
+    (releasable, guarded)
+}
+
+/// GET /api/workitems/<id>/gated → how many descendants are sitting in `todo`
+/// only because they were born under review mode. Flipping an item's automation
+/// to `auto` does NOT retroactively queue children already born `todo`
+/// (correct — but nothing said so), and this is the count that says it.
+fn api_gated(project: &Path, id: &str) -> Resp {
+    let queue = queue_for(project);
+    let open = queue.load();
+    let closed = queue.load_closed();
+    if !open.iter().any(|i| i.workid == id) && !closed.iter().any(|i| i.workid == id) {
+        return err_resp(404, "no such work item");
+    }
+    let (ids, guarded) = gated_descendants(id, &open, &closed);
+    json_resp(200, json!({ "count": ids.len(), "ids": ids, "guarded": guarded.len() }))
+}
+
+/// POST /api/workitems/<id>/action {"action":"release_gated"} — the one-time
+/// release. Items whose dependencies are unsatisfied still move to `queued`:
+/// the dependency gate is evaluated at dispatch and holds them there visibly,
+/// which is the honest place for that wait. Guard-parked descendants are
+/// counted as `skipped` and left alone.
+fn api_release_gated(project: &Path, id: &str) -> Resp {
+    let queue = queue_for(project);
+    let closed = queue.load_closed();
+    if !queue.load().iter().any(|i| i.workid == id) && !closed.iter().any(|i| i.workid == id) {
+        return err_resp(404, "no such work item");
+    }
+    // The walk runs INSIDE the lock, against the live open list: an item the
+    // engine picked up (or a guard parked) between the UI's count and the
+    // user's click is judged as it stands now, not as the page last saw it.
+    let result = queue.with_lock(|items| {
+        let (releasable, guarded) = gated_descendants(id, items, &closed);
+        let releasable: HashSet<String> = releasable.into_iter().collect();
+        for item in items.iter_mut().filter(|i| releasable.contains(&i.workid)) {
+            item.state = workitems::STATE_QUEUED.into();
+            item.lasterror.clear();
+        }
+        (releasable.len(), guarded.len())
+    });
+    match result {
+        Ok((released, skipped)) => json_resp(200, json!({ "released": released, "skipped": skipped })),
         Err(e) => err_resp(500, &e.to_string()),
     }
 }
@@ -913,12 +1148,35 @@ fn api_history(req: &Req, project: &Path) -> Resp {
     )
 }
 
+/// Overlay `patch` onto `base` key by key, recursing into nested objects: keys
+/// in `patch` win, keys only in `base` survive. Every settings write here edits
+/// BY KEY rather than replacing the document, because a caller that sends three
+/// settings must not silently drop the twenty it did not mention.
+fn merge_json(base: &mut Value, patch: &Value) {
+    match (base, patch) {
+        (Value::Object(b), Value::Object(p)) => {
+            for (k, v) in p {
+                merge_json(b.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+        (b, p) => *b = p.clone(),
+    }
+}
+
+/// GET /api/config — the canonical defaults with the file's own keys laid over
+/// the top. A settings page can only edit a key it can see, and a config.json
+/// written before a setting existed (`default_automation`, `temp_dir`,
+/// `temp_file_ttl_days`) has no line for it; serving the raw file meant those
+/// settings were invisible and therefore uneditable. The overlay direction also
+/// preserves keys the struct does not know — hand-added notes, or settings a
+/// newer binary wrote — instead of pruning them on the caller's next PUT.
 fn api_config_get(project: &Path) -> Resp {
     let path = config::engine_dir(project).join("config.json");
-    match std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
-        Some(v) => json_resp(200, v),
-        None => json_resp(200, serde_json::to_value(config::Config::default()).unwrap_or(Value::Null)),
+    let mut v = serde_json::to_value(config::load(project)).unwrap_or(Value::Null);
+    if let Some(raw) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+        merge_json(&mut v, &raw);
     }
+    json_resp(200, v)
 }
 
 fn api_config_put(req: &Req, project: &Path) -> Resp {
@@ -1032,14 +1290,36 @@ fn api_agent_put(req: &Req, project: &Path, name: &str) -> Resp {
     json_resp(200, agent_json(project, &crate::agents::parse(name, &rewritten)))
 }
 
-/// PUT /api/projectsettings {server?: {...}, project?: {...}} — the server
+/// PUT /api/projectsettings {server?, project?, globalsettings?} — the server
 /// half lands in `.iter/config.iter.json`; the project half is a record-level
-/// frontmatter edit of main.iter.md (the body is never touched here). List
-/// values are written in the inline `key: ["a", "b"]` form the parser reads.
+/// frontmatter edit of main.iter.md (the body is never touched here); the
+/// globalsettings half is merged into `.iter/.engine/config.json`, which is the
+/// same file PUT /api/config writes. List values are written in the inline
+/// `key: ["a", "b"]` form the parser reads.
 fn api_projectsettings_put(req: &Req, project: &Path) -> Resp {
     let Ok(v @ Value::Object(_)) = serde_json::from_slice::<Value>(&req.body) else {
         return err_resp(400, "body must be a JSON object");
     };
+    // The engine-side globals live in neither head file, so this half is a
+    // key-merge into the engine config rather than a document replace — a
+    // Settings page sending only default_automation/temp_dir/temp_file_ttl_days
+    // must leave the engine and limits blocks exactly as they were.
+    if let Some(globals @ Value::Object(_)) = v.get("globalsettings") {
+        let path = config::engine_dir(project).join("config.json");
+        let mut cfg_json = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .unwrap_or_else(|| json!({}));
+        merge_json(&mut cfg_json, &json!({ "globalsettings": globals }));
+        if serde_json::from_value::<config::Config>(cfg_json.clone()).is_err() {
+            return err_resp(400, "globalsettings do not match config.json's shape");
+        }
+        let tmp = path.with_extension("json.tmp");
+        let text = serde_json::to_string_pretty(&cfg_json).unwrap_or_default();
+        if std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+            return err_resp(500, "cannot write config.json");
+        }
+    }
     if let Some(server) = v.get("server") {
         let Ok(sc) = serde_json::from_value::<crate::project::ServerConfig>(server.clone()) else {
             return err_resp(400, "server settings do not match config.iter.json's shape");
@@ -1728,8 +2008,93 @@ fn api_validate(req: &Req, project: &Path) -> Resp {
 
 /* ------------------------------------------------------------ SSE */
 
-/// Change feed: watch the queue + closed-file fingerprints, emit an event on change.
-/// The page re-fetches on each event — dumb, robust, and plenty for loopback.
+/// What one connection last told its client about the queue: the hash of each
+/// open row AS SENT, and the ids in the archive. Diffing this against a fresh
+/// load is what turns "a file changed" into a delta the client can apply to the
+/// rows it already holds.
+struct QueueSnapshot {
+    open: HashMap<String, u64>,
+    closed: HashSet<String>,
+}
+
+/// "Is this the same row I already sent?" — hashed over the compact
+/// serialization, so two runs that produce equal JSON produce equal hashes and
+/// an unchanged row is never re-shipped. Per-connection and in-process, so the
+/// hasher's lack of cross-run stability costs nothing.
+fn value_hash(v: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    v.to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Diff the queue against what this connection last sent and shape the payload.
+/// The delta is the whole point: the client used to refetch the ENTIRE queue —
+/// open plus archive, full mainwork and output text — on every engine event, so
+/// with several agents running the UI spent its life re-downloading megabytes
+/// to reflect a one-field change.
+///
+/// A diff bigger than 50 rows falls back to `{"type":"change"}`: past that the
+/// delta costs more than the refetch it replaces, and the client has always
+/// known how to reload.
+fn queue_delta(project: &Path, prev: &mut QueueSnapshot) -> Value {
+    let queue = queue_for(project);
+    let open = queue.load();
+    let closed = queue.load_closed();
+    let blocked = crate::scheduler::read_blocked(project);
+    let values = open_item_values(&open, &closed, &blocked);
+
+    let mut next_open: HashMap<String, u64> = HashMap::with_capacity(open.len());
+    let mut changed: Vec<Value> = Vec::new();
+    for (item, value) in open.iter().zip(values) {
+        let hash = value_hash(&value);
+        if prev.open.get(&item.workid) != Some(&hash) {
+            changed.push(value);
+        }
+        next_open.insert(item.workid.clone(), hash);
+    }
+    let next_closed: HashSet<String> = closed.iter().map(|i| i.workid.clone()).collect();
+
+    // An id that left the open queue either got ARCHIVED or got DELETED, and
+    // the client does entirely different things with the two — one moves to the
+    // closed list, the other stops existing.
+    let (mut archived, mut removed): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for id in prev.open.keys() {
+        if next_open.contains_key(id) {
+            continue;
+        }
+        if next_closed.contains(id) {
+            archived.push(id.clone());
+        } else {
+            removed.push(id.clone());
+        }
+    }
+    // Issue 8 made the archive mutable: a closed row the user deleted is in
+    // neither file afterwards, and has to leave the client's list too.
+    for id in &prev.closed {
+        if !next_closed.contains(id) && !next_open.contains_key(id) {
+            removed.push(id.clone());
+        }
+    }
+
+    let counts = queue_counts(&open, &closed);
+    prev.open = next_open;
+    prev.closed = next_closed;
+    if changed.len() + archived.len() + removed.len() > 50 {
+        return json!({ "type": "change" });
+    }
+    json!({
+        "type": "delta",
+        "changed": changed,
+        "removed": removed,
+        "closed": archived,
+        "counts": counts,
+    })
+}
+
+/// Change feed: watch the two queue files plus the engine's stop signal, and on
+/// every change ship what actually changed. The keepalive stays a bare comment
+/// line — an EventSource with nothing to say still has to say it.
 fn sse_events(mut stream: TcpStream, project: &Path) {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() {
@@ -1742,14 +2107,27 @@ fn sse_events(mut stream: TcpStream, project: &Path) {
         std::fs::metadata(p).map(|m| (m.len(), m.modified().ok())).unwrap_or((0, None))
     };
     let mut last = (fingerprint(&open), fingerprint(&closed), signal.exists());
+    // Seeded from the queue as it stands at connect time — the client has just
+    // fetched the same thing, so the first event carries what changed SINCE
+    // then rather than the whole queue over again.
+    let mut snapshot = QueueSnapshot { open: HashMap::new(), closed: HashSet::new() };
+    let _ = queue_delta(project, &mut snapshot);
     let mut beats: u32 = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(700));
         let now = (fingerprint(&open), fingerprint(&closed), signal.exists());
         let payload = if now != last {
+            let engine_toggled = now.2 != last.2;
             last = now;
             beats = 0;
-            "data: {\"type\":\"change\"}\n\n".to_string()
+            // Always diff, even when we are about to send `change`: the
+            // snapshot has to keep up with the files either way, or the next
+            // real delta reports rows that moved two events ago.
+            let delta = queue_delta(project, &mut snapshot);
+            // The engine's own running/stopped state is not a queue row, so no
+            // row-level delta expresses it — the client reloads, as before.
+            let value = if engine_toggled { json!({ "type": "change" }) } else { delta };
+            format!("data: {}\n\n", value)
         } else {
             beats += 1;
             if beats % 20 != 0 {
@@ -1792,6 +2170,253 @@ pub fn active_locks(project: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp_project(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("iter-srv-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".iter/.engine")).unwrap();
+        dir
+    }
+
+    fn item(id: &str, state: &str) -> WorkItem {
+        WorkItem { workid: id.into(), state: state.into(), ..Default::default() }
+    }
+
+    fn post_action(project: &Path, id: &str, verb: &str) -> Resp {
+        let req = Req {
+            method: "POST".into(),
+            path: String::new(),
+            query: HashMap::new(),
+            body: format!(r#"{{"action":"{}"}}"#, verb).into_bytes(),
+        };
+        api_action(&req, project, id)
+    }
+
+    fn body_of(resp: &Resp) -> Value {
+        serde_json::from_slice(&resp.body).expect("handlers answer JSON")
+    }
+
+    /// Issue 8: the archive was append-only, so a junk item sat in the `failed`
+    /// count forever. Dropping one row must leave every neighbour intact.
+    #[test]
+    fn closed_rows_can_be_removed_and_neighbours_survive() {
+        let root = tmp_project("closed-del");
+        let queue = Queue::new(&root, &config::Config::default());
+        for id in ["a", "b", "c"] {
+            queue.append_closed(&item(id, workitems::STATE_COMPLETE)).unwrap();
+        }
+        assert!(remove_closed(&root, &queue, "b").unwrap());
+        let left: Vec<String> = queue.load_closed().into_iter().map(|i| i.workid).collect();
+        assert_eq!(left, vec!["a".to_string(), "c".to_string()]);
+        assert!(!remove_closed(&root, &queue, "b").unwrap(), "a second delete has nothing to do");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue 3: "no such open work item" reads like a transient glitch, so the
+    /// user kept clicking Retry. The refusal must name what the item is.
+    #[test]
+    fn closed_item_refusal_names_the_state_and_the_budget() {
+        let mut burned = item("x", workitems::STATE_FAILED);
+        burned.attempts = 50;
+        let msg = closed_item_message(&burned);
+        assert!(msg.contains("failed") && msg.contains("50 attempts") && msg.contains("clone"), "{}", msg);
+        let mut once = item("y", workitems::STATE_COMPLETE);
+        once.attempts = 1;
+        assert!(closed_item_message(&once).contains("1 attempt)"), "the singular reads right too");
+    }
+
+    /// Issues 3+8 through the real route: a closed item takes clone and delete,
+    /// and refuses every run-again verb with the state, not a 404.
+    #[test]
+    fn closed_item_actions_through_the_action_route() {
+        let root = tmp_project("closed-actions");
+        let queue = Queue::new(&root, &config::Config::default());
+        let mut dead = item("dead", workitems::STATE_FAILED);
+        dead.attempts = 50;
+        dead.mainwork = "CREATE USECASE: New User Signup".into();
+        queue.append_closed(&dead).unwrap();
+
+        for verb in ["queue", "requeue", "todo", "pause", "complete", "stop", "answer"] {
+            let resp = post_action(&root, "dead", verb);
+            assert_eq!(resp.status, 409, "{} must not answer 404", verb);
+            let msg = body_of(&resp)["error"].as_str().unwrap_or_default().to_string();
+            assert!(msg.contains("closed (failed after 50 attempts)") && msg.contains("clone"), "{}: {}", verb, msg);
+        }
+
+        let cloned = post_action(&root, "dead", "clone");
+        assert_eq!(cloned.status, 200);
+        let open = queue.load();
+        assert_eq!(open.len(), 1, "the clone is a NEW open item");
+        assert_eq!(open[0].mainwork, "CREATE USECASE: New User Signup", "the work is the point of cloning");
+        assert_eq!(open[0].state, workitems::STATE_TODO);
+        assert_eq!(open[0].attempts, 0);
+        assert_eq!(queue.load_closed().len(), 1, "cloning leaves history alone");
+
+        let deleted = post_action(&root, "dead", "delete");
+        assert_eq!(deleted.status, 200);
+        assert_eq!(body_of(&deleted)["archived"], true);
+        assert!(queue.load_closed().is_empty());
+        assert_eq!(post_action(&root, "dead", "delete").status, 404, "with the row gone the id is unknown again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_clone_starts_where_the_original_started() {
+        let mut burned = item("orig", workitems::STATE_FAILED);
+        burned.attempts = 50;
+        burned.output = "half a run".into();
+        burned.lasterror = "codepath does not exist".into();
+        burned.todo_reason = "config".into();
+        let copy = fresh_clone(&burned);
+        assert_ne!(copy.workid, burned.workid);
+        assert_eq!(copy.state, workitems::STATE_TODO);
+        assert_eq!(copy.attempts, 0, "a clone inheriting the burned budget would die on its first pick");
+        assert!(copy.output.is_empty() && copy.lasterror.is_empty());
+        assert!(copy.todo_reason.is_empty(), "the clone's todo is an ordinary gate, not the original's park");
+    }
+
+    /// Issue 7c: the item a user is looking at is usually the FINISHED plan
+    /// item, so the walk has to cross closed ancestors to reach its open
+    /// children — and it must leave guard-parked ones alone.
+    #[test]
+    fn gated_walk_crosses_closed_ancestors_and_spares_guards() {
+        let plan = item("plan", workitems::STATE_COMPLETE);
+        let mut stage = item("stage", workitems::STATE_COMPLETE);
+        stage.created_by = "plan".into();
+        let mut gate = item("gate", workitems::STATE_TODO);
+        gate.created_by = "stage".into();
+        let mut guarded = item("guarded", workitems::STATE_TODO);
+        guarded.created_by = "stage".into();
+        guarded.todo_reason = "guard".into();
+        let mut asked = item("asked", workitems::STATE_QUESTION);
+        asked.created_by = "stage".into();
+        let mut running = item("running", workitems::STATE_IN_PROGRESS);
+        running.created_by = "plan".into();
+
+        let (releasable, parked) =
+            gated_descendants("plan", &[gate, guarded, asked, running], &[plan, stage]);
+        assert_eq!(releasable, vec!["gate".to_string()], "only the review-gate todo releases");
+        assert_eq!(parked, vec!["guarded".to_string()], "a tripped guard is a judgment call, not a click");
+    }
+
+    #[test]
+    fn release_gated_queues_only_the_review_gated() {
+        let root = tmp_project("release");
+        let queue = Queue::new(&root, &config::Config::default());
+        queue.append(&item("p", workitems::STATE_TODO)).unwrap();
+        let mut child = item("c", workitems::STATE_TODO);
+        child.created_by = "p".into();
+        queue.append(&child).unwrap();
+        let mut broken = item("g", workitems::STATE_TODO);
+        broken.created_by = "p".into();
+        broken.todo_reason = "config".into();
+        queue.append(&broken).unwrap();
+
+        let counted = body_of(&api_gated(&root, "p"));
+        assert_eq!(counted["count"], 1);
+        assert_eq!(counted["ids"], json!(["c"]));
+        assert_eq!(counted["guarded"], 1);
+
+        let released = api_release_gated(&root, "p");
+        assert_eq!(released.status, 200);
+        let body = body_of(&released);
+        assert_eq!(body["released"], 1);
+        assert_eq!(body["skipped"], 1);
+        let states: HashMap<String, String> =
+            queue.load().into_iter().map(|i| (i.workid, i.state)).collect();
+        assert_eq!(states["c"], workitems::STATE_QUEUED);
+        assert_eq!(states["g"], workitems::STATE_TODO, "the broken-configuration park stays parked");
+        assert_eq!(states["p"], workitems::STATE_TODO, "the item itself is not its own descendant");
+        assert_eq!(api_release_gated(&root, "nope").status, 404);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue 13: an engine event must carry what changed. Archived and deleted
+    /// arrive as different signals because the client does different things
+    /// with them — one row moves to the closed list, the other stops existing.
+    #[test]
+    fn sse_delta_reports_changed_archived_and_removed() {
+        let root = tmp_project("delta");
+        let queue = Queue::new(&root, &config::Config::default());
+        queue.append(&item("a", workitems::STATE_TODO)).unwrap();
+        queue.append(&item("b", workitems::STATE_QUEUED)).unwrap();
+
+        let mut snap = QueueSnapshot { open: HashMap::new(), closed: HashSet::new() };
+        let seed = queue_delta(&root, &mut snap);
+        assert_eq!(seed["changed"].as_array().unwrap().len(), 2, "the seeding pass sees everything as new");
+
+        let quiet = queue_delta(&root, &mut snap);
+        assert!(quiet["changed"].as_array().unwrap().is_empty(), "a re-read with no writes says nothing");
+        assert_eq!(quiet["counts"]["open"], 2);
+
+        queue.mutate("a", |i| i.state = workitems::STATE_QUEUED.into()).unwrap();
+        let flipped = queue_delta(&root, &mut snap);
+        let changed = flipped["changed"].as_array().unwrap();
+        assert_eq!(changed.len(), 1, "one field moved, one row ships");
+        assert_eq!(changed[0]["workid"], "a");
+        assert_eq!(changed[0]["state"], workitems::STATE_QUEUED);
+        assert_eq!(flipped["counts"]["queued"], 2);
+
+        let mut done = item("b", workitems::STATE_COMPLETE);
+        done.times.closed = workitems::now_iso();
+        queue.close(&done).unwrap();
+        let archived = queue_delta(&root, &mut snap);
+        assert_eq!(archived["closed"], json!(["b"]));
+        assert!(archived["removed"].as_array().unwrap().is_empty());
+        assert_eq!(archived["counts"]["complete"], 1);
+
+        remove_closed(&root, &queue, "b").unwrap();
+        let gone = queue_delta(&root, &mut snap);
+        assert_eq!(gone["removed"], json!(["b"]), "deleting an archived row reaches the client");
+        assert_eq!(gone["counts"]["total"], 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_big_diff_falls_back_to_a_reload() {
+        let root = tmp_project("bigdelta");
+        let queue = Queue::new(&root, &config::Config::default());
+        queue
+            .with_lock(|items| {
+                for n in 0..51 {
+                    items.push(item(&format!("w{}", n), workitems::STATE_TODO));
+                }
+            })
+            .unwrap();
+        let mut snap = QueueSnapshot { open: HashMap::new(), closed: HashSet::new() };
+        assert_eq!(queue_delta(&root, &mut snap)["type"], "change", "51 rows is cheaper to refetch than to ship");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `failed` spans both files — open while retries remain, archived once the
+    /// budget is gone — and the header shows the two as one number.
+    #[test]
+    fn counts_span_the_open_queue_and_the_archive() {
+        let open = vec![
+            item("a", workitems::STATE_QUEUED),
+            item("b", workitems::STATE_FAILED),
+            item("s", workitems::STATE_SCHEDULED),
+        ];
+        let closed = vec![item("c", workitems::STATE_COMPLETE), item("d", workitems::STATE_FAILED)];
+        let counts = queue_counts(&open, &closed);
+        assert_eq!(counts["failed"], 2);
+        assert_eq!(counts["complete"], 1);
+        assert_eq!(counts["scheduled"], 1, "the list shows schedules, so the header counts them");
+        assert_eq!(counts["open"], 3);
+        assert_eq!(counts["total"], 5);
+    }
+
+    #[test]
+    fn settings_merge_keeps_what_the_caller_did_not_mention() {
+        let mut base = json!({
+            "engine": {"max_attempts": 3, "tick_interval_sec": 5},
+            "globalsettings": {"test_dir": "test"},
+        });
+        merge_json(&mut base, &json!({"globalsettings": {"temp_file_ttl_days": 30}}));
+        assert_eq!(base["globalsettings"]["temp_file_ttl_days"], 30);
+        assert_eq!(base["globalsettings"]["test_dir"], "test", "an unmentioned sibling survives");
+        assert_eq!(base["engine"]["max_attempts"], 3, "an unmentioned block survives whole");
+    }
 
     #[test]
     fn auto_port_is_deterministic_and_in_range() {

@@ -40,6 +40,7 @@ then summarize the rejection in your output and stop working. The engine moves
 this item to `todo` for the user to re-evaluate — your reason and output are
 what they'll see, so make both specific. Do NOT mark rejected work complete and
 do NOT grind out a use-case you believe is invalid.
+(`_capability/_reject_invalid_work.md` has the full rule.)
 
 ## Behavior (valid use-cases)
 
@@ -64,8 +65,9 @@ do NOT grind out a use-case you believe is invalid.
    create that testgroup file with the GROUPS defined (labels + descriptions
    of the end-to-end journey tests this use-case needs) but empty testlists —
    the sweep turns empty testlists into testwriter authoring items, so E2E
-   coverage follows automatically. Only a use-case that genuinely should not
-   be tested declares `testgroups: []` (say why in your output).
+   coverage follows automatically. The file's format is in
+   `_capability/_testgroup_authoring.md`. Only a use-case that genuinely should
+   not be tested declares `testgroups: []` (say why in your output).
 3. **Map the DAG.** Get the authoritative scan (never glob it yourself):
 
        "$ITER_BIN" markers --project "$ITER_PROJECT"
@@ -77,8 +79,8 @@ do NOT grind out a use-case you believe is invalid.
    in the reqs docs).
 4. **PRESENT nodes**: link them now as `children.codenodes` entries — the
    node FILE paths (e.g. `{topdir}/core/intake/intake.code.iter.md`). You own
-   the use-case file, so edit it directly; other agents use
-   `"$ITER_BIN" usecase --file <path> --add "<code file path>"` instead.
+   the use-case file, so edit it directly; other agents use the engine-owned
+   `iter usecase` path instead (`_capability/_usecase_links.md`).
 5. **MISSING objects**: open **ONE plan work item covering ALL the gaps** (a
    single plan keeps shared interfaces coherent; the plan agent decomposes into
    parallel code/testwriter items itself — whether those are gated for human
@@ -89,10 +91,9 @@ do NOT grind out a use-case you believe is invalid.
          --title "plan: build out C4 objects for usecase <name>" \
          --mainwork "<the use-case, the full list of missing objects, and the reqs constraints that shaped it>"
 
-   Set `source` to `agent: usecase` when using `--file`. Write the plan item's
-   mainwork in the three-tier request format (shared rule "Authoring `mainwork`
-   (request) text"): plain-language sentences first — where, what, why; then
-   one-line hierarchical bullets; agent-only detail last. In the plan mainwork,
+   Set `source` to `agent: usecase` when using `--file`. The item's mechanics
+   and `mainwork` authoring are in `_capability/_create_new_workitem.md`. In the
+   plan mainwork,
    instruct that each built node gets linked back into the use-case file via
    `"$ITER_BIN" usecase --file <usecase file> --add "<code file path>"` AND
    re-entered into the Test Loop via `"$ITER_BIN" teststate --include "<ref>"`
@@ -106,12 +107,11 @@ do NOT grind out a use-case you believe is invalid.
 
        "$ITER_BIN" teststate --project "$ITER_PROJECT" --include "<node key>"
 
-   The nearest flag wins, so including a component works even under an omitted
-   container. If the command REFUSES because a node is `teststate: block`
-   (outside/vendor setup missing), do NOT try to force or work around it — the
-   refusal is the design. Report the blocked object in your output so the user
-   decides. Never `--omit`/`--block`/`--clear` anything: your job is only to
-   include this use-case's dependencies.
+   If the command REFUSES because a node is `teststate: block` (outside/vendor
+   setup missing), do NOT try to force or work around it — the refusal is the
+   design. Report the blocked object in your output so the user decides. Never
+   `--omit`/`--block`/`--clear` anything: your job is only to include this
+   use-case's dependencies. Full gate semantics: `_capability/_teststate.md`.
 7. Priorities are lower-is-sooner (P0 most urgent, default 5); the plan item at
    P3 runs ahead of default work without preempting urgent fixes.
 

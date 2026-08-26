@@ -633,6 +633,17 @@ const prepostNames = () => PREPOST.map(p => p.name);
 const prepostExec = n => (PREPOST.find(p => p.name === n) || {}).exec || 'agent';
 const AGENTS = ['plan','code','testwriter','usecase','refactor','ingest'];
 
+/* Models a work item may name (features item 12c). Empty means "whatever the
+   agent type's own definition says" — the normal case; an override is for work
+   whose shape is known, e.g. a mechanical sweep that does not need opus. The
+   engine refuses anything outside this set. */
+const MODELS = ['opus','sonnet','haiku','fable'];
+
+/* globalsettings.default_automation — what a user-filed item's automation means
+   when the form leaves it unset. Read from /api/config at load; "auto" is the
+   engine's own default. */
+let DEFAULT_AUTOMATION = 'auto';
+
 /* Live agent definitions (fetched at startup when LIVE, mock otherwise). The
    New WorkItem form reads default_codepath_resolved / default_codepath_ignore
    from here to pre-fill fields when an agent type is picked. */
@@ -813,14 +824,18 @@ function mk(over) {
   return Object.assign({
     workid: uuid(), title:'', type:'code', state:'todo', source:'user',
     priority:5, risk:0, codepath:'./src', codepath_ignore:[], depends_on:[], automation:'',
-    context:[], testfiles:[],
+    context:[], testfiles:[], model:'', todo_reason:'',
     prework:[], mainwork:'', postwork:[], output:'', question:'', answer:'', attempts:0, lasterror:'',
     tests:null,
     times:{ added:nowIso(), start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'', asked:'', answered:'' },
   }, over);
 }
 
-let items = [
+/* The offline demo's project — the "greet" sample. It is the ENTIRE dataset when
+   the file is opened over file://, and it is never shown in LIVE mode: a status
+   page that paints another project's numbers for a beat, however short, is
+   telling its user something false about their own queue (issue 10). */
+const MOCK_ITEMS = [
   mk({ title:'Add --shout flag to greet: uppercase the entire greeting line per BR-4',
     type:'code', state:'complete', source:'user', priority:4, risk:2, codepath:'./src',
     prework:['git-pull'], postwork:['git-commit'],
@@ -881,6 +896,7 @@ let items = [
     times:{ added:'2026-08-11T16:15:00Z' } }),
   mk({ title:'Add farewell subcommand: greet.sh bye [name] mirrors greeting contract',
     type:'code', state:'todo', source:'user', priority:5, risk:2, codepath:'./src',
+    model:'sonnet',
     prework:['git-pull'], postwork:['git-commit','git-pr'],
     mainwork:'Draft: add a "bye" subcommand mirroring the greeting contract (BR-2 analogue: default "Goodbye, World!"). Composes with --shout and --lang. Held in todo until bizreq BR-7 is approved.',
     times:{ added:'2026-08-11T16:20:30Z' } }),
@@ -889,6 +905,22 @@ let items = [
     context:['./bizreq.md','~/dev/global/rules/*req*.md'],
     mainwork:'Survey ~/dev/paydaay-notify, init .iter from the template, and create code + testwriter items per component (sender, scheduler, templates) so each can run in parallel. Held until repo access is confirmed.',
     times:{ added:'2026-08-11T16:22:00Z' } }),
+  /* the two todo parks that are NOT a click: a tripped guard and a broken
+     configuration (issue 7b) — the demo carries one of each so the three chips
+     can be compared side by side */
+  mk({ title:'Wire greet.sh into the release script (returned by the non-convergence guard)',
+    type:'code', state:'todo', source:'agent: plan', priority:4, risk:3, codepath:'./src',
+    todo_reason:'guard', attempts:3,
+    lasterror:'non-convergence guard: three attempts produced no change to the codepath — a human decides whether the request is achievable as written',
+    mainwork:'Add a release-script hook that calls greet.sh --version during packaging so the packaged version string is checked at build time.',
+    output:'[mainwork] Attempt 3 ended with no files changed; the release script location named in the request does not exist in this repo.',
+    times:{ added:'2026-08-11T18:02:00Z', start:'2026-08-11T19:40:00Z' } }),
+  mk({ title:'CREATE USECASE: New User Signup',
+    type:'usecase', state:'todo', source:'user', priority:3, risk:2, codepath:'./usecases',
+    todo_reason:'config', attempts:0,
+    lasterror:'codepath does not exist: /Users/stephen.hilton/dev/iterapp/sample/usecases — configuration error, create the directory (or fix the codepath) and queue this item again',
+    mainwork:'Write the New User Signup use case into the global usecase directory, linking the interfaces it exercises.',
+    times:{ added:'2026-08-11T18:20:00Z' } }),
   mk({ title:'Fix: contract group flaky on machines where sh is dash (printf %s escaping)',
     type:'code', state:'failed', source:'error', priority:3, risk:3, codepath:'./test',
     prework:['git-pull'], postwork:['git-commit'],
@@ -941,7 +973,7 @@ us the first time a locale needs more than one string.`,
 ];
 
 /* one terminally-failed closed item to exercise the Failed count from the archive */
-items.push(mk({ title:'Spike: rewrite greet in awk for speed (abandoned after 3 attempts)',
+MOCK_ITEMS.push(mk({ title:'Spike: rewrite greet in awk for speed (abandoned after 3 attempts)',
   type:'refactor', state:'failed', source:'user', priority:9, risk:8, codepath:'./src',
   mainwork:'Explore whether an awk implementation is meaningfully faster than sh for greet. Keep behavior identical.',
   output:'[mainwork] awk variant passes greetings but breaks TR-2 (adds a gawk dependency on two target platforms). No portable win found.',
@@ -950,8 +982,16 @@ items.push(mk({ title:'Spike: rewrite greet in awk for speed (abandoned after 3 
 
 /* ------------------------------------------------------------------ state */
 
+/* LIVE starts with NOTHING (issue 10). Every count, row, and chip on this page
+   is derived from `items`, so an empty array is the only honest state until
+   /api/workitems has answered — and `firstLoad` holds the first paint on a
+   skeleton so the beat before that answer shows blanks, not the demo's 17. */
+let items = LIVE ? [] : MOCK_ITEMS;
+let firstLoad = LIVE;
+let loadError = '';
+
 let activeFilters = new Set();          // empty = all
-let openIds = new Set(LIVE ? [] : [items[1].workid]);
+let openIds = new Set(LIVE ? [] : [MOCK_ITEMS[1].workid]);
 let engineRunning = true;
 let sortBy = 'state';
 
@@ -1068,6 +1108,9 @@ async function loadAll(){
     if (cfg && cfg.globalsettings && cfg.globalsettings.user_timezone) {
       USER_TZ = cfg.globalsettings.user_timezone;
     }
+    if (cfg && cfg.globalsettings && cfg.globalsettings.default_automation) {
+      DEFAULT_AUTOMATION = cfg.globalsettings.default_automation;
+    }
     AGENTS.length = 0;
     meta.agents.forEach(a => AGENTS.push(a.type));
     PREPOST.length = 0;
@@ -1080,6 +1123,7 @@ async function loadAll(){
       DEFAULT_CONTEXT = meta.default_context;
     }
     items = [...list.open, ...list.closed.slice().reverse()];
+    firstLoad = false; loadError = '';
     const brand = document.querySelector('.projbrand');
     brand.querySelector('b').textContent = meta.project_name;
     brand.querySelector('span').textContent = `${meta.url_slug}.localhost:${location.port || 80}`;
@@ -1087,8 +1131,68 @@ async function loadAll(){
     setFavicon(meta.url_slug || 'iter');
     render();
   } catch (e) {
+    // A failed first load still releases the skeleton — held forever it reads
+    // as a hung page, and the row area says what actually went wrong.
+    firstLoad = false;
+    loadError = e.message;
+    render();
     toast('API error: ' + e.message);
   }
+}
+
+/* issue 13b — apply a change feed event in place.
+   `/api/events` used to say only "something changed", and the handler answered
+   by refetching the entire queue — every item, open and archived, with all its
+   mainwork and output text (~2MB on pdy-dev) — for what is usually one field on
+   one row. Several agents running means events arrive continuously, so the UI
+   spent its life re-downloading its own screen. The event now carries the
+   changed items themselves and this patches them into `items`, with no fetch of
+   any kind. render() is the same call it always was, so the rule that a focused
+   answer box holds the rebuild holds for deltas too.
+   The event's `counts` block is deliberately NOT used for the summary bar: it
+   is computed over the FULL closed archive while /api/workitems ships only the
+   last 500 archived items, so a header fed from it would disagree with the list
+   underneath it (click Complete, see 500 of 3000 rows). Every count here is
+   derived from `items`, the same array the rows come from, so the bar and the
+   list always tell the same story.
+   Resolves false when the delta cannot be completed and the caller must fall
+   back to the full load. */
+const DELTA_MAX_FETCHES = 10;
+
+async function applyDelta(msg){
+  const put = (fresh) => {
+    if (!fresh || !fresh.workid) return;
+    const at = items.findIndex(i => i.workid === fresh.workid);
+    if (at >= 0) items[at] = fresh; else items.unshift(fresh);
+  };
+
+  (msg.changed || []).forEach(put);
+  for (const id of (msg.removed || [])) {
+    items = items.filter(i => i.workid !== id);
+    openIds.delete(id);
+    gatedCounts.delete(id);
+  }
+  /* `changed` carries OPEN rows only, so an item that just moved to the archive
+     arrives as a bare id: we know it closed but not with what state, output, or
+     close stamp, and guessing any of those would put a fiction on screen.
+     Fetching that ONE item is a few hundred bytes — reloading the whole queue to
+     learn one row's ending is the megabyte this mechanism exists to avoid. Past
+     a handful of them the full load is the cheaper answer again. */
+  const needBody = (msg.closed || []).filter(id => {
+    const have = items.find(i => i.workid === id);
+    return !have || !have.times || !have.times.closed;
+  });
+  if (needBody.length > DELTA_MAX_FETCHES) return false;
+  if (needBody.length) {
+    try {
+      const got = await Promise.all(needBody.map(id => api(`/api/workitems/${id}`)));
+      got.forEach(r => put(r && r.item));
+    } catch (e) {
+      return false;                       // the item is gone or the API is down: reload and see
+    }
+  }
+  render();
+  return true;
 }
 
 async function refreshEngine(){
@@ -1197,6 +1301,55 @@ function blocksChip(item){
   return n ? `<span class="chip kv mono" title="Open work items gated on this one finishing">blocks: ${n}</span>` : '';
 }
 
+/* An item in the ARCHIVE (workitems_closed.jsonl). times.closed is the queue's
+   own marker for it — the engine stamps it when it moves the record out of the
+   open file, and /api/workitems returns the two lists concatenated. */
+function isClosed(item){ return !!(item.times && item.times.closed); }
+
+/* issue 7b — `todo` conflates three different situations, and they need three
+   different things from the reader:
+     unset   a review gate. Nothing is wrong; it wants a click.
+     guard   iter reject, non-convergence, a failed dependency, a user stop.
+             Something went sideways and a person has to judge it — so it wears
+             the same orange the lock/paused warnings wear.
+     config  dispatch validation refused it (a missing codepath &c). Retrying
+             cannot fix it; the configuration has to change. Red, like a failure,
+             because that is what it is — just caught before the retry budget died.
+   lasterror carries the specifics, so it rides in the hover text. */
+function todoReasonChip(item){
+  if (item.state !== 'todo') return '';
+  const why = item.lasterror ? '\n\n' + item.lasterror : '';
+  if (item.todo_reason === 'guard')
+    return `<span class="chip" style="background:var(--s-paused-bg);color:#fff"
+      title="A guard parked this item — iter reject, the non-convergence guard, a failed dependency, or a stop you asked for. It needs your judgment, not just your click: read the output, then queue, edit, or complete it.${esc(why)}">⚠ guard parked this</span>`;
+  if (item.todo_reason === 'config')
+    return `<span class="chip" style="background:var(--s-failed-bg);color:#fff"
+      title="Dispatch validation refused this item before any agent ran — a codepath that does not exist, or a file where a directory belongs. No attempt was burned and none will help: fix the configuration named below, then queue it.${esc(why)}">⚙ broken configuration</span>`;
+  return `<span class="chip neutral"
+    title="Waiting for your approval to run — this item was born under review-mode automation and nothing is wrong with it. Queue it when you want it to go.">☐ awaiting your approval</span>`;
+}
+
+/* issue 12c — a per-item model override is invisible everywhere else (it only
+   shows up in what the run costs), so it says so on the row. */
+function modelChip(item){
+  if (!item.model) return '';
+  return `<span class="chip kv mono"
+    title="Per-item model override: this run uses ${esc(item.model)} instead of the ${esc(item.type)} agent's default model.">model: ${esc(item.model)}</span>`;
+}
+
+/* issue 7c — descendants of this item that were born ToDo under review-mode
+   automation and are still sitting there. The count is only known once
+   something has asked /api/workitems/<id>/gated (the Actions menu, or a save
+   that flipped automation to auto), so the chip appears when the answer is in
+   hand and never costs a fetch of its own. */
+const gatedCounts = new Map();   // workid -> gated descendant count, as last measured
+function gatedChip(item){
+  const n = gatedCounts.get(item.workid);
+  if (!n) return '';
+  return `<span class="chip" style="background:var(--s-todo-bg);color:#fff"
+    title="${n} work item${n===1?'':'s'} descended from this one ${n===1?'is':'are'} parked in ToDo purely by the review gate. Actions → Release gated items queues them all.">☐ ${n} gated</span>`;
+}
+
 function sourceLabel(src){
   if (src === 'user') return 'User';
   if (src === 'error') return 'Error';
@@ -1210,24 +1363,49 @@ function summaryCounts(){
   return c;
 }
 
+/* The nine chips of the summary bar, in display order. One list, so the live
+   bar and the loading skeleton always have the same shape and the same column
+   math — the bar must not reflow when the first response lands. */
+const SUMMARY_DEFS = [
+  ['total','Total','var(--s-total-bg)','var(--s-total-fg)'],
+  ['complete','✓ Complete','var(--s-complete-bg)','var(--s-complete-fg)'],
+  ['in-progress','⟳ In-Progress','var(--s-progress-bg)','var(--s-progress-fg)'],
+  ['queued','◷ Queued','var(--s-queued-bg)','var(--s-queued-fg)'],
+  ['question','? Question','var(--s-question-bg)','var(--s-question-fg)'],
+  ['todo','☐ ToDo','var(--s-todo-bg)','var(--s-todo-fg)'],
+  ['failed','✕ Failed','var(--s-failed-bg)','var(--s-failed-fg)'],
+  ['paused','❙❙ Paused','var(--s-paused-bg)','var(--s-paused-fg)'],
+  ['scheduled','⏱ Scheduled','var(--s-scheduled-bg)','var(--s-scheduled-fg)'],
+];
+
+// Keep the bar one row wide as states are added: the count drives the grid,
+// and half of it (rounded up) is the two-row fallback on narrow windows.
+function sizeSummaryGrid(){
+  $('summary').style.setProperty('--sumcols', SUMMARY_DEFS.length);
+  $('summary').style.setProperty('--sumcols-half', Math.ceil(SUMMARY_DEFS.length / 2));
+}
+
+/* The beat before the first /api/workitems answer: the real bar, dimmed, with
+   no numbers in it. Anything else on screen here would be the demo dataset. */
+function renderSkeleton(){
+  sizeSummaryGrid();
+  $('summary').className = 'summary';
+  // Same classes as the real bar, not just the same shape: anything keying off
+  // `.sumbtn.total` (styling, tests) must see the skeleton as the same element
+  // in a loading state rather than as a different widget.
+  $('summary').innerHTML = SUMMARY_DEFS.map(([key,label,bg,fg]) =>
+    `<button class="sumbtn ${key==='total'?'total':''}" disabled style="background:${bg};color:${fg};opacity:.45"
+      title="Loading this project's queue…">
+      <span class="n">·</span><span class="t">${label}</span></button>`).join('');
+  $('filterHint').textContent = 'Loading work items…';
+  $('rows').innerHTML = `<div class="empty">Loading this project's queue…</div>`;
+}
+
 function renderSummary(){
   const c = summaryCounts();
-  const defs = [
-    ['total','Total','var(--s-total-bg)','var(--s-total-fg)'],
-    ['complete','✓ Complete','var(--s-complete-bg)','var(--s-complete-fg)'],
-    ['in-progress','⟳ In-Progress','var(--s-progress-bg)','var(--s-progress-fg)'],
-    ['queued','◷ Queued','var(--s-queued-bg)','var(--s-queued-fg)'],
-    ['question','? Question','var(--s-question-bg)','var(--s-question-fg)'],
-    ['todo','☐ ToDo','var(--s-todo-bg)','var(--s-todo-fg)'],
-    ['failed','✕ Failed','var(--s-failed-bg)','var(--s-failed-fg)'],
-    ['paused','❙❙ Paused','var(--s-paused-bg)','var(--s-paused-fg)'],
-    ['scheduled','⏱ Scheduled','var(--s-scheduled-bg)','var(--s-scheduled-fg)'],
-  ];
+  const defs = SUMMARY_DEFS;
   $('summary').className = 'summary' + (activeFilters.size ? ' filtered' : '');
-  // Keep the bar one row wide as states are added: the count drives the grid,
-  // and half of it (rounded up) is the two-row fallback on narrow windows.
-  $('summary').style.setProperty('--sumcols', defs.length);
-  $('summary').style.setProperty('--sumcols-half', Math.ceil(defs.length / 2));
+  sizeSummaryGrid();
   $('summary').innerHTML = defs.map(([key,label,bg,fg]) => {
     const on = key !== 'total' && activeFilters.has(key);
     const n = key === 'total' ? c.total : c[key];
@@ -1295,7 +1473,13 @@ function pillRow(assigned, editable, phase){
 function renderRows(){
   const list = visibleItems();
   if (!list.length) {
-    $('rows').innerHTML = `<div class="empty">No work items match this filter.</div>`;
+    // An empty list after a FAILED load is not an empty queue — say which it is
+    // rather than letting a network error read as "nothing to do" (issue 4's
+    // lesson, on the webapp side).
+    $('rows').innerHTML = loadError
+      ? `<div class="empty">Could not read the queue: ${esc(loadError)}<br>
+           <span style="font-size:12.5px">This is the API talking, not your queue — the page retries on the next engine event.</span></div>`
+      : `<div class="empty">No work items match this filter.</div>`;
     return;
   }
   $('rows').innerHTML = list.map(item => {
@@ -1317,7 +1501,7 @@ function renderRows(){
             <span class="chip" style="background:var(--s-queued-bg);color:#fff" title="Requested by">${esc(sourceLabel(item.source))}</span>
             ${testChip(item)}
             ${item.source_testgroup ? `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="Born from this testgroup (sweep provenance)${(item.source_tests||[]).length ? ' — red at birth: ' + esc(item.source_tests.join(', ')) : ''}">TG: ${esc(item.source_testgroup)}</span>` : ''}
-            ${questionChip(item)}${depChip(item)}${lockChip(item)}${wholeTreeChip(item)}${blocksChip(item)}
+            ${todoReasonChip(item)}${questionChip(item)}${depChip(item)}${lockChip(item)}${wholeTreeChip(item)}${blocksChip(item)}${gatedChip(item)}${modelChip(item)}
             ${item.sched && item.sched.kind ? `<span class="chip mono" style="background:var(--s-scheduled-bg);color:#fff" title="Schedule — last fired: ${esc(item.sched.last_fired || 'never')}">⏱ ${esc(schedDesc(item.sched))}</span>` : ''}
             ${item.source_schedule ? `<span class="chip" style="background:var(--s-scheduled-bg);color:#fff" title="Born from schedule ${esc(item.source_schedule)}">SCHED RUN</span>` : ''}
             ${item.exec === 'shell' ? `<span class="chip mono" style="background:var(--s-paused-bg);color:#fff" title="exec: shell — the engine runs the steps as shell commands; no LLM">⚙ shell</span>` : ''}
@@ -1337,6 +1521,7 @@ function renderRows(){
         <div class="dvalrow"><span class="codepath" title="Lock scope and agent working directory">${esc(absCodepath(item.codepath))}</span>${
           (item.codepath_ignore||[]).length ? `<span class="codepath" title="Subtrees carved out of the lock scope — parallel items may own them" style="opacity:.75">ignoring: ${esc(item.codepath_ignore.join(', '))}</span>` : ''}
           <span class="fullid">ID: ${esc(item.workid)}</span></div>
+        ${parkedBlock(item)}
         ${questionBlocks(item)}
         <div class="dlabel">Prework</div><div>${pillRow(item.prework,false,'prework')}</div>
         <div class="dlabel">Request</div><div class="textblock">${esc(item.mainwork)||'<i>—</i>'}</div>
@@ -1352,6 +1537,17 @@ function renderRows(){
       </div></div></div>
     </div>`;
   }).join('');
+}
+
+/* Why a guard or the dispatch validator parked this item — the one thing its
+   reader has to act on, and it is written in lasterror. It gets a block of its
+   own beside the request rather than living only in the hover text and the Time
+   Records lightbox, because "codepath does not exist: <path>" is the fix. */
+function parkedBlock(item){
+  if (item.state !== 'todo' || !item.todo_reason || !item.lasterror) return '';
+  const cfg = item.todo_reason === 'config';
+  return `<div class="dlabel">${cfg ? 'Configuration' : 'Guard'}</div>
+    <div class="textblock" style="border-left:4px solid ${cfg ? 'var(--s-failed-bg)' : 'var(--s-paused-bg)'}">${esc(item.lasterror)}</div>`;
 }
 
 /* features/Question_state.md — the Question and the Answer are two separate
@@ -1476,23 +1672,59 @@ async function answerAndQueue(id){
     render(); toast(`Answered — ${shortId(item)} queued`);
     return;
   }
+  // Optimistic (issue 13b): the answer and the queue land on screen at once —
+  // the round trip only confirms them, and a refusal puts the item back where
+  // it was with the typed text intact so nothing has to be retyped.
+  const before = { state: item.state, answer: item.answer, answered: item.times.answered, lasterror: item.lasterror };
+  item.answer = text; item.times.answered = nowIso();
+  item.state = 'queued'; item.lasterror = '';
+  render();
   try {
-    await api(`/api/workitems/${id}/action`,
+    const r = await api(`/api/workitems/${id}/action`,
       { method:'POST', body: JSON.stringify({ action:'answer', answer: text, queue: true }) });
+    if (r.state && r.state !== item.state) { item.state = r.state; render(); }
     toast(`Answered — ${shortId(item)} queued`);
-    await loadAll();
   } catch (e) {
+    item.state = before.state; item.answer = before.answer;
+    item.times.answered = before.answered; item.lasterror = before.lasterror;
+    answerDrafts.set(id, text);            // the typing is not lost because the server said no
+    render();
     toast('Answer failed: ' + e.message);
   }
 }
 
+/* issue 7c — the release acts on this item's DESCENDANTS, never on the item, so
+   it belongs in every menu including a closed one: the parent that filed a
+   review-gated programme is normally complete and archived by the time anyone
+   notices its children never queued. The count is only fetched on click. */
+function gatedMenuItem(item){
+  const n = gatedCounts.get(item.workid);
+  return `<button data-act="gated" data-id="${item.workid}" role="menuitem">Release${n ? ` ${n}` : ''} gated item${n === 1 ? '' : 's'}…</button>`;
+}
+
 function actionButtons(item){
   const s = item.state;
+  /* issues 3 + 8 — an archived item is not a work item any more, it is history.
+     Every state verb (queue, retry, todo, pause, complete) reaches into the OPEN
+     queue only and answers 409; offering those buttons is what made a user click
+     Retry five times on an item that could never run again. What IS possible:
+     clone it into a fresh item, start a follow-up from it (both build a NEW item
+     client-side and never touch this one), and delete the archive entry. */
+  if (isClosed(item)) {
+    const attempts = item.attempts ? ` after ${item.attempts} attempt${item.attempts===1?'':'s'}` : '';
+    return `<button data-act="clone" data-id="${item.workid}" role="menuitem">Clone (run it again)</button>
+      ${s === 'complete' ? `<button data-act="followup" data-id="${item.workid}" role="menuitem">Create Follow-up Request</button>` : ''}
+      ${gatedMenuItem(item)}
+      <div class="sep"></div>
+      <span class="note">Closed ${esc(s)}${esc(attempts)} — a closed item cannot be requeued, retried, or edited. Clone makes a fresh copy you can run.</span>
+      <button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete from archive…</button>`;
+  }
   if (s === 'in-progress') {
     // The engine is loosely coupled to the queue: while an agent is running this
     // item, queue-side state changes wouldn't alter engine behavior — so Clone,
     // and Stop (delivered to the engine as a file flag it polls mid-turn).
     return `<button data-act="clone" data-id="${item.workid}" role="menuitem">Clone</button>
+      ${gatedMenuItem(item)}
       <button class="danger" data-act="stopitem" data-id="${item.workid}" role="menuitem">Stop (halt mid-run)…</button>
       <div class="sep"></div>
       <span class="note">Agent is running — Stop kills its session and returns the item to ToDo.</span>`;
@@ -1505,6 +1737,7 @@ function actionButtons(item){
       <button data-act="pauseedit" data-id="${item.workid}" role="menuitem">Pause &amp; Edit</button>
       <button data-act="complete" data-id="${item.workid}" role="menuitem">Complete (retire schedule)</button>
       <button data-act="clone" data-id="${item.workid}" role="menuitem">Clone</button>
+      ${gatedMenuItem(item)}
       <div class="sep"></div>
       <span class="note">Run Now clones this schedule into a queued run (skipped if one is still open).</span>
       <button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete</button>`;
@@ -1518,6 +1751,7 @@ function actionButtons(item){
       <button data-act="pauseedit" data-id="${item.workid}" role="menuitem">Pause &amp; Edit</button>
       <button data-act="complete" data-id="${item.workid}" role="menuitem">Complete (no work needed)</button>
       <button data-act="clone" data-id="${item.workid}" role="menuitem">Clone</button>
+      ${gatedMenuItem(item)}
       <div class="sep"></div>
       <span class="note">An agent is waiting on this decision — open the row and type the answer there.</span>
       <button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete</button>`;
@@ -1536,6 +1770,7 @@ function actionButtons(item){
   if (s === 'complete') b.push(['followup','Create Follow-up Request']);
   b.push(['clone','Clone']);
   const rows = b.map(([a,l]) => `<button data-act="${a}" data-id="${item.workid}" role="menuitem">${l}</button>`);
+  rows.push(gatedMenuItem(item));
   rows.push('<div class="sep"></div>');
   rows.push(`<button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete</button>`);
   return rows.join('');
@@ -1549,6 +1784,7 @@ let renderHeld = false;
 function render(){
   if (document.querySelector('.answerbox:focus')) { renderHeld = true; return; }
   renderHeld = false;
+  if (firstLoad) { renderSkeleton(); return; }
   renderSummary(); renderRows();
 }
 
@@ -1713,6 +1949,15 @@ function codepathLines(){
   return $('f_codepath').value.split('\n').map(s => s.trim()).filter(Boolean);
 }
 
+/* What an UNSET automation mode actually resolves to, spelled out instead of
+   hidden behind the word "default": a user-filed item takes the project setting
+   (issue 7a), an agent-created one inherits the item that created it. */
+function automationInheritLabel(src){
+  return (!src || src === 'user' || src === 'error' || src === 'scheduler')
+    ? `project default — ${DEFAULT_AUTOMATION} (Settings → default_automation)`
+    : 'inherit from the item that created this one';
+}
+
 function openForm(mode, source, priorState){
   // create with a source = prefilled create (e.g. Create WorkItem from a Projects node)
   const d = source ? JSON.parse(JSON.stringify(source)) : mk({});
@@ -1732,6 +1977,9 @@ function openForm(mode, source, priorState){
   const agentOpts = AGENTS.map(a => `<option value="${a}" ${d.type===a?'selected':''}>${a}</option>`).join('');
   const srcOpts = ['user','error','scheduler',...AGENTS.map(a=>'agent: '+a)]
     .map(s => `<option value="${esc(s)}" ${d.source===s?'selected':''}>${esc(s)}</option>`).join('');
+  const modelOpts = `<option value="" ${d.model?'':'selected'}>model: agent default</option>` +
+    MODELS.map(m => `<option value="${m}" ${d.model===m?'selected':''}>model: ${m}</option>`).join('');
+  const inheritLabel = esc(automationInheritLabel(d.source));
 
   openLb(titleMap[mode], `
     <div class="form" id="editForm">
@@ -1744,6 +1992,7 @@ function openForm(mode, source, priorState){
           <option value="agent" ${(d.exec||'agent')!=='shell'?'selected':''}>exec: agent (LLM)</option>
           <option value="shell" ${d.exec==='shell'?'selected':''}>exec: shell (engine-run)</option>
         </select>
+        <select id="f_model" title="Which model runs this ONE item, overriding the agent type's default. Simple, well-specified mechanical work — comment sweeps, doc repointing, rename plumbing — runs fine on sonnet; complex or fuzzy work wants fable. Leave it on the agent default when unsure.">${modelOpts}</select>
         <label title="Lower runs sooner — P0 is most urgent, default 5">Priority <input type="range" id="f_priority" min="0" max="10" value="${d.priority}"
           oninput="document.getElementById('pv').textContent=this.value"><span class="rangeval" id="pv">${d.priority}</span></label>
         <label>Risk <input type="range" id="f_risk" min="0" max="10" value="${d.risk}"
@@ -1755,7 +2004,8 @@ function openForm(mode, source, priorState){
       <span class="flabel">Automation</span>
       <div class="inline">
         <select id="f_automation" title="How work items created BY this one are born — inherited down the whole chain of agent handoffs. Guards (reject, non-convergence, failed dependencies) still land items in ToDo regardless.">
-          <option value="" ${d.automation!=='auto'?'selected':''}>review each stage — created items born ToDo (default)</option>
+          <option value="" ${d.automation?'':'selected'}>${inheritLabel}</option>
+          <option value="review" ${d.automation==='review'?'selected':''}>review each stage — created items born ToDo</option>
           <option value="auto" ${d.automation==='auto'?'selected':''}>fully automated — created items born Queued</option>
         </select>
         <span style="color:var(--text-dim);font-size:12px">applies to items this one CREATES (plan → code/testwriter → …); the engine enforces it, agent prompts can't override</span>
@@ -1845,6 +2095,15 @@ function openForm(mode, source, priorState){
   $('f_codepath').addEventListener('input', () => {
     $('f_pathhint').innerHTML = codepathLines().map(p => '→ ' + esc(absCodepath(p))).join('<br>');
   });
+  // Name the model the picked agent actually runs, so the choice is between two
+  // named models rather than one named and one unknown.
+  const syncModelDefault = () => {
+    const a = AGENT_DEFS.find(x => x.type === $('f_type').value);
+    $('f_model').options[0].textContent =
+      a && a.model ? `model: agent default (${a.model})` : 'model: agent default';
+  };
+  $('f_type').addEventListener('change', syncModelDefault);
+  syncModelDefault();
   // Per-agent defaults (create mode only): picking an agent type pre-fills
   // codepath / codepath_ignore from the agent def's default_codepath(_ignore)
   // frontmatter, so conventions (usecase agent → usecases dir + test-dir carve)
@@ -1876,6 +2135,7 @@ function openForm(mode, source, priorState){
   // scheduled time" — lower = sooner). All reversible by switching Source back.
   const syncSched = () => {
     const isSched = $('f_source').value === 'scheduler';
+    $('f_automation').options[0].textContent = automationInheritLabel($('f_source').value);
     $('f_schedlabel').style.display = isSched ? '' : 'none';
     $('f_schedrow').style.display = isSched ? '' : 'none';
     const kind = $('f_sk').value;
@@ -1939,7 +2199,15 @@ function saveDraft(targetState){
   d.question = $('f_question').value.trim();
   d.answer = $('f_answer_form').value.trim();
   d.exec = $('f_exec').value;
+  d.model = $('f_model').value;
   d.automation = $('f_automation').value;
+  // A NEW user-filed item has no parent to inherit from, so "unset" here means
+  // the project default — resolved now, on the client, rather than left as an
+  // empty string the engine would have to read as "review" (issue 7a).
+  if (draft.mode !== 'edit' && !d.automation
+      && ['user','error','scheduler'].includes(d.source)) {
+    d.automation = DEFAULT_AUTOMATION;
+  }
   // The Question state exists to carry a question; an empty one parks the item
   // in a bucket that tells the next reader nothing.
   if (targetState === 'question' && !d.question) {
@@ -1965,13 +2233,21 @@ function saveDraft(targetState){
         depends_on: d.depends_on, context: d.context, testfiles: d.testfiles,
         prework: d.prework, postwork: d.postwork, mainwork: d.mainwork,
         question: d.question, answer: d.answer,
-        exec: d.exec, sched: d.sched, automation: d.automation };
+        exec: d.exec, sched: d.sched, automation: d.automation, model: d.model };
       const stateAction = targetState === 'queued' ? 'queue' : targetState === 'todo' ? 'todo'
         : targetState === 'scheduled' ? 'schedule' : targetState === 'question' ? 'question' : 'pause';
+      const base = draft.base;
+      // Flipping an item to `auto` does NOT retroactively queue the children it
+      // already created under review mode — correct, but silent, and a queue
+      // that stalls at every stage boundary overnight is what silence costs
+      // (issue 7c). So the save offers the one-time release straight away.
+      const flippedToAuto = d.automation === 'auto'
+        && (items.find(i => i.workid === base) || {}).automation !== 'auto';
       let warn = '';
-      api(`/api/workitems/${draft.base}`, { method: 'PATCH', body: JSON.stringify(fields) })
-        .then(r => { warn = r && r.warning ? r.warning : ''; return postAction(draft.base, stateAction); })
+      api(`/api/workitems/${base}`, { method: 'PATCH', body: JSON.stringify(fields) })
+        .then(r => { warn = r && r.warning ? r.warning : ''; return postAction(base, stateAction); })
         .then(() => { toast(warn ? `Saved as ${targetState} — ${warn}` : `Saved as ${targetState}`); return done(); })
+        .then(() => { if (flippedToAuto) return releaseGated(base, { quiet: true }); })
         .catch(e => toast('Save failed: ' + e.message));
     } else {
       d.state = targetState;
@@ -2027,13 +2303,149 @@ git reset --hard ${esc(item.git_start_commit)}</pre>`
   $('confirmStop').addEventListener('click', onConfirm);
 }
 
+/* Deleting an OPEN item drops one row off a queue; deleting a CLOSED one edits
+   history — the archive is where "what this project has done" is kept, and the
+   entry stops counting in the header and the dashboard the moment it goes
+   (issue 8). Same button, two very different sentences. */
+function confirmDelete(item, onConfirm){
+  const closed = isClosed(item);
+  const who = `<b>${esc(item.title)}</b> <span class="mono">(${shortId(item)})</span>`;
+  openLb(closed ? 'Delete this archive entry?' : 'Delete work item?',
+    closed
+      ? `<p style="margin-top:0">This removes ${who} from the <b>closed archive</b> — the permanent
+           record of the work this project has finished.</p>
+         <p>The entry is rewritten out of <span class="mono">workitems_closed.jsonl</span> and is gone for
+           good: its output, its timings and its <b>${esc(item.state)}</b> result stop counting in the header
+           counts and in the dashboard history. <b>Nothing keeps a copy and there is no undo.</b></p>
+         <p style="color:var(--text-dim);font-size:12.5px">Worth doing for junk — an item that failed on a
+           configuration error and produced nothing. Not worth doing for history you may want to read later.</p>`
+      : `<p style="margin-top:0">This permanently removes ${who} from the queue. The engine keeps no copy.</p>`,
+    `<button class="btn" data-lbclose>Cancel</button>
+     <button class="btn danger" id="confirmDelete">${closed ? 'Delete permanently' : 'Delete'}</button>`);
+  $('confirmDelete').addEventListener('click', onConfirm);
+}
+
+/* issue 13b — optimistic state changes. For queue/pause/todo/complete the
+   server's answer is a foregone conclusion in every case but a refusal, so the
+   row repaints before the POST leaves; a refusal (a 409 on a closed item, an
+   engine-owned in-progress item) puts the old state straight back, so the screen
+   never keeps a lie. The SSE delta that follows carries the authoritative
+   record, and nothing here refetches the queue. */
+const OPTIMISTIC_STATE = {
+  queue: 'queued', pause: 'paused', todo: 'todo',
+  complete: 'complete', question: 'question', schedule: 'scheduled',
+};
+
+async function serverAction(id, action){
+  const item = items.find(i => i.workid === id);
+  if (!item) return;
+  // A scheduled item's "Run Now" CLONES a run into the queue and leaves the
+  // template alone, and only the engine knows whether a run is already open —
+  // nothing to predict, so that one waits for the answer.
+  const next = item.state === 'scheduled' ? null : OPTIMISTIC_STATE[action];
+  const before = { state: item.state, closed: item.times.closed, lasterror: item.lasterror };
+  if (next) {
+    item.state = next;
+    if (action === 'queue') item.lasterror = '';
+    // complete archives the item, and it is times.closed that flips the row to
+    // the archived action menu — stamp it now, the delta overwrites it with the
+    // engine's own stamp a moment later.
+    if (next === 'complete' && !item.times.closed) item.times.closed = nowIso();
+    render();
+  }
+  try {
+    const r = await postAction(id, action);
+    if (r.fired) {           // schedule fired a run: a NEW item exists, which a delta can't invent
+      toast(`Run queued (${String(r.workid).slice(0,8)}) — schedule unchanged`);
+      return loadAll();
+    }
+    if (r.state && r.state !== item.state) { item.state = r.state; render(); }
+    toast(`${shortId(item)} → ${r.state || next || 'done'}`);
+  } catch (e) {
+    if (next) {
+      item.state = before.state;
+      item.lasterror = before.lasterror;
+      item.times.closed = before.closed;
+      render();
+    }
+    toast('Action failed: ' + e.message);
+  }
+}
+
+/* issue 7c — "N items were born under review mode and still need a one-time
+   release". The count comes from the server's own descendant walk (the same one
+   dep_status uses), so this asks rather than guessing, and it asks only when
+   someone clicks. Guard-parked and question items are never in the answer. */
+async function gatedCount(id){
+  if (!LIVE) {
+    // The demo has no created_by chain, so every OTHER item parked in todo for
+    // no stated reason stands in for the review-gated descendant set.
+    const gated = items.filter(i => i.state === 'todo' && !i.todo_reason && i.workid !== id);
+    return { count: gated.length, ids: gated.map(i => i.workid) };
+  }
+  return api(`/api/workitems/${id}/gated`);
+}
+
+/* `quiet` is the automatic offer made right after an automation change: it
+   should say nothing at all when there is nothing gated, because the user asked
+   for a save, not for this. A click on the menu item is the loud path. */
+async function releaseGated(id, opts = {}){
+  const item = items.find(i => i.workid === id);
+  if (!item) return;
+  let data;
+  try { data = await gatedCount(id); }
+  catch (e) { if (!opts.quiet) toast('Gated descendants: ' + e.message); return; }
+  const n = data.count || 0;
+  gatedCounts.set(id, n);
+  render();
+  if (!n) {
+    if (!opts.quiet) toast(`Nothing gated — no descendant of ${shortId(item)} is waiting on a review-gate release`);
+    return;
+  }
+  const ids = (data.ids || []).slice(0, 40).map(id12);
+  openLb(`Release ${n} gated item${n===1?'':'s'}?`, `
+    <p style="margin-top:0"><b>${n}</b> work item${n===1?'':'s'} descended from ${esc(item.title)}
+      ${n===1?'is':'are'} sitting in ToDo for one reason only: ${n===1?'it was':'they were'} born under
+      review-mode automation and never released. Releasing moves ${n===1?'it':'them'} to <b>Queued</b>.</p>
+    <p style="color:var(--text-dim);font-size:12.5px">${data.guarded
+        ? `${data.guarded} further descendant${data.guarded===1?' is':'s are'} parked by a guard and will be left alone — those`
+        : 'Items a guard parked and items waiting on a question are not touched — those'} want your judgment, not
+      a release. Dependencies still hold: a released item whose dependency has not closed waits at the dispatch
+      gate instead of running.</p>
+    <div class="textblock mono" style="max-height:22vh">${esc(ids.join('\n'))}${data.ids && data.ids.length > 40 ? `\n… and ${data.ids.length - 40} more` : ''}</div>`,
+    `<button class="btn" data-lbclose>Cancel</button>
+     <button class="btn primary" id="confirmGated">Release ${n} item${n===1?'':'s'}</button>`);
+  $('confirmGated').addEventListener('click', async () => {
+    closeLb();
+    if (!LIVE) {
+      (data.ids || []).forEach(gid => {
+        const g = items.find(i => i.workid === gid);
+        if (g) { g.state = 'queued'; g.lasterror = ''; }
+      });
+      gatedCounts.set(id, 0); render();
+      toast(`Released ${n} gated item${n===1?'':'s'}`);
+      return;
+    }
+    try {
+      const r = await api(`/api/workitems/${id}/action`,
+        { method:'POST', body: JSON.stringify({ action:'release_gated' }) });
+      gatedCounts.set(id, 0);
+      toast(`Released ${r.released}${r.skipped ? ` · skipped ${r.skipped}` : ''}`);
+      await loadAll();          // a bulk move across the queue: structural, not a delta
+    } catch (e) { toast('Release failed: ' + e.message); }
+  });
+}
+
 function doAction(act, id){
   const item = items.find(i => i.workid === id);
   if (!item) return;
   if (act === 'answerqueue') { answerAndQueue(id); return; }
+  // Acts on this item's descendants, not on the item — so it works the same
+  // whether the item is open or archived (issue 7c).
+  if (act === 'gated') { releaseGated(id); return; }
   if (LIVE) {
     // Clone and follow-up stay client-side (they open the prefilled form; the POST
-    // happens on save). Everything else is a server action + reload.
+    // happens on save). Everything else is a server action.
     if (act === 'clone') { openForm('clone', item); return; }
     if (act === 'followup') { openForm('followup', item); return; }
     if (act === 'stopitem') {
@@ -2045,18 +2457,21 @@ function doAction(act, id){
       return;
     }
     if (act === 'delete') {
-      openLb('Delete work item?', `
-        <p style="margin-top:0">This permanently removes <b>${esc(item.title)}</b>
-        <span class="mono">(${shortId(item)})</span> from the queue. The engine keeps no copy.</p>`,
-        `<button class="btn" data-lbclose>Cancel</button>
-         <button class="btn danger" id="confirmDelete">Delete</button>`);
-      $('confirmDelete').addEventListener('click', () => {
-        postAction(id, 'delete').then(() => { closeLb(); toast('Deleted'); return loadAll(); })
-          .catch(e => toast('Delete failed: ' + e.message));
+      confirmDelete(item, () => {
+        // Optimistic: the row goes now and comes back if the server refuses.
+        const at = items.indexOf(item);
+        items.splice(at, 1);
+        openIds.delete(id);
+        closeLb(); render();
+        postAction(id, 'delete')
+          .then(r => toast(r.archived ? 'Archive entry deleted' : 'Deleted'))
+          .catch(e => { items.splice(at, 0, item); render(); toast('Delete failed: ' + e.message); });
       });
       return;
     }
     if (act === 'pauseedit') {
+      // The form edits a server-shaped record, so this one still reloads: the
+      // PATCH that follows must start from what is actually on disk.
       const prior = item.state;
       postAction(id, 'pause')
         .then(() => loadAll())
@@ -2067,10 +2482,7 @@ function doAction(act, id){
         .catch(e => toast('Pause failed: ' + e.message));
       return;
     }
-    const serverAction = act === 'queue' ? 'queue' : act === 'complete' ? 'complete' : act;
-    postAction(id, serverAction)
-      .then(r => { toast(r.fired ? `Run queued (${String(r.workid).slice(0,8)}) — schedule unchanged` : `${shortId(item)} → ${r.state}`); return loadAll(); })
-      .catch(e => toast('Action failed: ' + e.message));
+    serverAction(id, act);
     return;
   }
   switch (act) {
@@ -2119,15 +2531,11 @@ function doAction(act, id){
     case 'followup':
       openForm('followup', item); return;
     case 'delete':
-      openLb('Delete work item?', `
-        <p style="margin-top:0">This permanently removes <b>${esc(item.title)}</b>
-        <span class="mono">(${shortId(item)})</span> from the queue. The engine keeps no copy.</p>`,
-        `<button class="btn" data-lbclose>Cancel</button>
-         <button class="btn danger" id="confirmDelete">Delete</button>`);
-      $('confirmDelete').addEventListener('click', () => {
+      confirmDelete(item, () => {
+        const archived = isClosed(item);
         items = items.filter(i => i.workid !== id);
         openIds.delete(id);
-        closeLb(); render(); toast('Deleted');
+        closeLb(); render(); toast(archived ? 'Archive entry deleted' : 'Deleted');
       });
       return;
   }
@@ -2413,6 +2821,9 @@ const CONFIG = {
   },
   globalsettings: {
     user_timezone: ['UTC', 'timezone for displaying timestamps — data stays UTC on disk; DST handled automatically'],
+    default_automation: ['auto', 'what a user-filed work item’s automation mode is when it doesn’t say — auto: the items it creates are born Queued (the whole chain runs); review: they are born ToDo and wait for a click at every stage. A per-item setting still overrides this.'],
+    temp_dir: ['{dotiter}/temp/', 'where agents put scratch files; exported to every agent session as $ITER_TEMP, absolute — a relative path in an agent prompt resolves against wherever that agent happens to be working and mints a stray temp tree there'],
+    temp_file_ttl_days: [14, 'temp files are auto-removed after this many days by the daily sweep; 0 = never sweep. Critique files (critique-*) are never swept — they are review history, not scratch.'],
     critreview_max_rounds: [3, 'max critical-review rounds an agent runs per work item — substituted into _shared.md as {critreview_max_rounds}; each round is a synchronous critic session (minutes + spend), and agents stop earlier when a review has no material findings'],
     testwriter_min_tests_per_group: [20, 'minimum tests a testwriter agent produces per testgroup (floor)'],
     testwriter_max_tests_per_group: [100, 'maximum tests a testwriter agent produces per testgroup'],
@@ -2505,6 +2916,8 @@ function settingsLayout(){
         Object.keys(CONFIG.engine).map(k => cfg('engine', k))],
       ['Test', 'Testwriter output bounds and the test-directory layout. The deterministic test loop itself runs as a "Test Loop" scheduled workitem whose command carries every knob as a visible flag — create it below, tune/pause it in WorkItems — see features/TDD.md',
         ['testwriter_min_tests_per_group','testwriter_max_tests_per_group','test_dir'].map(k => cfg('globalsettings', k))],
+      ['Automation & scratch', 'What new work items are automated by default, and where agents keep their scratch files (exported to them as $ITER_TEMP)',
+        ['default_automation','temp_dir','temp_file_ttl_days'].map(k => cfg('globalsettings', k))],
       ['Review', 'Critical-review budget: how many critic rounds an agent may run per work item (the cap _shared.md tells every agent; takes effect on the next agent spin-up, no restart needed)',
         [cfg('globalsettings','critreview_max_rounds')]],
       ['Usage limits', 'Account-usage throttle: tiered agent caps from Claude Code’s server-reported 5h/7d utilization, kept fresh by the probe session',
@@ -2551,6 +2964,10 @@ async function renderSettings(){
     const cur = String(cfgVal(section, key, v));
     let control;
     if (key === 'user_timezone') control = tzSelectHtml(`${section}.${key}`, cur);
+    // Two values, and a typo in a free-text box would mean "review" silently.
+    else if (key === 'default_automation') control = `<select data-cfg="${section}.${key}">
+      <option value="auto"${cur === 'auto' ? ' selected' : ''}>auto</option>
+      <option value="review"${cur === 'review' ? ' selected' : ''}>review</option></select>`;
     else if (typeof v === 'boolean') control = `<select data-cfg="${section}.${key}" data-bool="true">
       <option${cur === 'true' ? ' selected' : ''}>true</option><option${cur !== 'true' ? ' selected' : ''}>false</option></select>`;
     else control = `<input type="text" data-cfg="${section}.${key}" data-num="${typeof v === 'number'}" value="${esc(cur)}">`;
@@ -3716,7 +4133,9 @@ function setFavicon(slug){
   }
   faviconLink.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
 }
-setFavicon(SLUG);
+// SLUG is the demo project's, so LIVE gets a neutral dot until /api/meta says
+// whose queue this is (issue 10 — the identity flashes as loudly as the counts).
+setFavicon(LIVE ? 'iter' : SLUG);
 
 let servers = SERVERS;
 
@@ -3759,6 +4178,14 @@ $('serverSwitch').addEventListener('click', (e) => {
 // startup (a failure just means no pre-fill — the form still works).
 AGENT_DEFS = LIVE ? [] : MOCK_AGENT_DEFS;
 if (LIVE) api('/api/agents').then(d => { AGENT_DEFS = d.agents || []; }).catch(() => {});
+// The markup ships with the demo project's name and host in the sidebar; in LIVE
+// they are blanked until /api/meta names the project you are actually looking at.
+if (LIVE) {
+  const brand = document.querySelector('.projbrand');
+  brand.querySelector('b').textContent = '';
+  brand.querySelector('span').textContent = '';
+  document.title = 'IterLoop';
+}
 render();
 navTo(location.hash.replace(/^#\//,'') || 'workitems');
 renderServers();
@@ -3767,12 +4194,26 @@ if (LIVE) {
   setInterval(refreshEngine, 5000);
   const es = new EventSource('/api/events');
   let debounce;
-  es.onmessage = () => {
+  let dashDebounce;
+  // The dashboard reads /api/history, which is a full pass over the closed
+  // archive — worth doing when the numbers move, not worth doing per event.
+  const refreshDashboard = (delay) => {
+    if (!document.getElementById('view-dashboard').classList.contains('active')) return;
+    clearTimeout(dashDebounce);
+    dashDebounce = setTimeout(renderDashboard, delay);
+  };
+  const fullReload = () => {
     clearTimeout(debounce);
-    debounce = setTimeout(() => {
-      loadAll().then(refreshEngine);
-      if (document.getElementById('view-dashboard').classList.contains('active')) renderDashboard();
-    }, 250);
+    debounce = setTimeout(() => { loadAll().then(refreshEngine); refreshDashboard(0); }, 250);
+  };
+  es.onmessage = async (ev) => {
+    let msg = null;
+    try { msg = JSON.parse(ev.data || '{}'); } catch (e) { /* not JSON: treat as "something changed" */ }
+    // {"type":"delta"} patches rows in place; {"type":"change"} means the server
+    // decided the diff was too big or reached outside the two queue files, and
+    // the full load is the cheaper answer.
+    if (msg && msg.type === 'delta' && await applyDelta(msg)) { refreshDashboard(3000); return; }
+    fullReload();
   };
 }
 </script>

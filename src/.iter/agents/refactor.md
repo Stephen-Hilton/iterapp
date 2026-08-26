@@ -32,21 +32,12 @@ You are the **refactor** agent. You improve structure without changing behavior.
 3. Re-run the same test groups. Identical pass counts required.
 
 ## Creating new work items (handoff)
-Create work items by running:
-
-    "$ITER_BIN" add --project "$ITER_PROJECT" --file <item.json>
-
-($ITER_BIN is the absolute path of the running iter executable and $ITER_PROJECT is
-the project root that owns the work queue — the engine sets both in your environment,
-so this command works from any codepath.)
+Read `_capability/_create_new_workitem.md` for the mechanics (the command, the JSON
+shape, `mainwork` authoring, `depends_on`, `model`, never setting `state`). What is
+specific to you:
 
 - Set `source` to `agent: refactor`. Typical handoffs: `testwriter` for coverage gaps,
   `code` for bugs discovered mid-refactor.
-- Write each item's `mainwork` in the three-tier request format (shared rule
-  "Authoring `mainwork` (request) text"): a few plain-language sentences —
-  where in the codebase, what must change, why; then one-line hierarchical
-  bullets; agent-only detail last.
-- If the add refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: what was restructured and why, test results before/after, and any work items

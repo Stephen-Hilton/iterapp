@@ -66,10 +66,11 @@ struct Shared {
     /// overlap one, so an occupied lock scope never costs a pick; entries are
     /// removed when the worker thread finishes.
     running_paths: Mutex<HashMap<String, Vec<(PathBuf, Vec<String>)>>>,
-    /// Usage-limit hold: pick nothing until this instant (set by a worker that hit a
-    /// window limit; lifted early when a fresh snapshot shows utilization back
-    /// under 95%). Unlike the stop signal, the engine stays alive and auto-resumes.
-    limit_hold: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Usage-limit hold (limits::Hold): pick nothing until the window reopens.
+    /// Set by a worker whose turn came back 429; the engine stays alive and
+    /// auto-resumes at the reset the API named. Concurrent workers hitting the
+    /// same closed window fold into ONE hold — see `enter_limit_hold`.
+    limit_hold: Mutex<Option<limits::Hold>>,
 }
 
 /// RAII entry in Shared.running_paths: dropped (in the worker thread) when the run
@@ -110,6 +111,35 @@ impl Shared {
 
     fn queue(&self) -> Queue {
         Queue::new(&self.project_root, &self.cfg())
+    }
+
+    /// Close the picking window on a 429. Answers whether THIS caller is the one
+    /// that closed it, and when the window now reopens. Several agents are
+    /// normally in flight, so a window that shuts announces itself to every one
+    /// of them within a second or two; only the first gets to say so, which is
+    /// what turns hours of per-spawn log spam into one line. When a hold is
+    /// already standing the later reset wins — a second error naming a
+    /// further-out window extends the hold, never shortens it.
+    fn enter_limit_hold(
+        &self,
+        hold: limits::Hold,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (bool, chrono::DateTime<chrono::Utc>) {
+        let mut cur = self.limit_hold.lock().unwrap();
+        match cur.as_mut() {
+            Some(standing) if standing.until > now => {
+                if hold.until > standing.until {
+                    standing.until = hold.until;
+                    standing.authoritative = hold.authoritative;
+                }
+                (false, standing.until)
+            }
+            _ => {
+                let until = hold.until;
+                *cur = Some(hold);
+                (true, until)
+            }
+        }
     }
 }
 
@@ -381,18 +411,26 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
             last_tier_cap = Some(tier);
         }
 
-        // Usage-limit hold: set by a worker that hit a window limit. Lifted at the
-        // recorded reset time, or early when fresh data shows usage back under 95%.
+        // Usage-limit hold: set by a worker whose turn came back 429. It ends at
+        // the reset the API named — the statusline snapshot gets no vote there
+        // (limits::Hold documents why), and only a GUESSED hold can be cut short
+        // by data newer than the error itself. Both log lines a hold produces
+        // are one-per-hold: the close is announced by the worker that hit it,
+        // the reopen right here.
         let mut holding = false;
         {
             let mut hold = shared.limit_hold.lock().unwrap();
-            if let Some(until) = *hold {
-                let fresh_ok = usage.as_ref().is_some_and(|u| {
-                    u.age_sec(now_utc) < (cfg.limits.probe_interval_sec as i64 * 2)
-                        && u.effective_pct(now_utc) < 95.0
-                });
-                if now_utc >= until || fresh_ok {
-                    logging::info("engine", "usage-limit hold lifted; resuming picking");
+            if let Some(h) = hold.as_ref() {
+                let early = h.may_lift_early(usage.as_ref(), now_utc);
+                if now_utc >= h.until || early {
+                    logging::info(
+                        "engine",
+                        if early {
+                            "usage window reopened early (fresh snapshot, no stated reset); resuming picking"
+                        } else {
+                            "usage window reopened; resuming picking"
+                        },
+                    );
                     *hold = None;
                 } else {
                     holding = true;
@@ -656,6 +694,7 @@ fn flip_failed_dependents(queue: &Queue) -> Vec<(String, String)> {
             if let Some(it) = items.iter_mut().find(|i| i.workid == *workid) {
                 if it.state == workitems::STATE_QUEUED || it.state == workitems::STATE_FAILED {
                     it.state = workitems::STATE_TODO.into();
+                    it.todo_reason = workitems::TODO_REASON_GUARD.into();
                     it.lasterror = format!("DEPENDENCY FAILED: {}", why);
                     it.times.start = String::new();
                 }
@@ -825,6 +864,11 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
         // removal — so no fresh stop can ever be lost here.
         let _ = std::fs::remove_file(stopitem_path(&shared.project_root, &item.workid));
         item.state = workitems::STATE_IN_PROGRESS.into();
+        // Whatever parked this item in `todo` before (a guard, a broken
+        // codepath) has been dealt with by whoever queued it again — carrying
+        // the reason into the run would leave a stale "broken configuration"
+        // chip on an item that is visibly working.
+        item.todo_reason.clear();
         item.attempts += 1;
         item.times.start = workitems::now_iso();
         item.codepath_ignore.extend(best_repairs.iter().cloned());
@@ -1026,6 +1070,18 @@ fn disjointness_repairs(
     repairs
 }
 
+/// Which model this run uses: the item's own `model` when it names one, else the
+/// agent type's default (features item 12). The point of the override is that a
+/// plan can route its mechanical children — comment sweeps, doc repointing,
+/// rename plumbing — to a cheap model without minting a second agent type for
+/// them, so the expensive models are spent only where judgment lives.
+fn effective_model(agent: &AgentDef, item: &WorkItem) -> String {
+    match item.model.trim() {
+        "" => agent.model.clone(),
+        m => m.to_string(),
+    }
+}
+
 fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: String) {
     let cfg = shared.cfg();
     let code_root = config::code_root(&shared.project_root, &cfg);
@@ -1033,11 +1089,12 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
     let lock_timeout = cfg.engine.codepath_lock_timeout_sec.max(agent.max_work_timeout_sec);
 
     // A codepath that isn't a real directory is a broken work item, not a busy
-    // one: fail it (normal attempt/backoff rules apply) instead of requeueing
-    // forever. EVERY entry is checked, not just the primary.
+    // one — and not a failing one either: no retry can conjure the directory, so
+    // it parks for a human instead of grinding through the attempt budget
+    // (park_config_error). EVERY entry is checked, not just the primary.
     if let Err(msg) = validate_codepaths(&code_root, &item) {
         logging::error(&tag, &msg);
-        fail_item(&shared, &item, &msg, String::new(), &tag);
+        park_config_error(&shared, &item, &msg, &tag);
         return;
     }
 
@@ -1060,9 +1117,30 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
 
     let turns = build_turns(&shared, &agent, &item, &codepath, &tag);
     let mut session = Session::new(agent.clone(), codepath.clone(), shared.project_root.clone());
+    // Per-item model override (features item 12). Logged either way, because
+    // "which model ran this" is otherwise only recoverable by joining the spend
+    // ledger against the agent definition as it stood at the time.
+    session.agent.model = effective_model(&agent, &item);
+    if session.agent.model == agent.model {
+        logging::info(&tag, &format!("model {} ({} default)", agent.model, agent.type_name));
+    } else {
+        logging::info(
+            &tag,
+            &format!("model {} (per-item override of the {} default, {})", session.agent.model, agent.type_name, agent.model),
+        );
+    }
     // The workid lets an `iter critreview` subprocess flag THIS item as failed
     // deterministically (fail-flag file) instead of trusting the agent to stop.
     session.envs.push(("ITER_WORKID".to_string(), item.workid.clone()));
+    // $ITER_TEMP (issue 9): agents write scratch files here. Absolute and
+    // created up front — the agent instructions used to name a RELATIVE
+    // `.iter/temp/`, which resolves against whatever the agent's working
+    // directory happens to be and minted a second temp tree at the repo root.
+    let temp = config::temp_dir(&shared.project_root, &cfg);
+    if let Err(e) = std::fs::create_dir_all(&temp) {
+        logging::warn(&tag, &format!("cannot create the temp directory {}: {}", temp.display(), e));
+    }
+    session.envs.push(("ITER_TEMP".to_string(), temp.to_string_lossy().into_owned()));
     // Every locked codepath, colon-joined (first = the working directory).
     session.envs.push((
         "ITER_CODEPATHS".to_string(),
@@ -1214,16 +1292,25 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
                     } else {
                         let now = chrono::Utc::now();
                         let retry = cfg.limits.probe_interval_sec.max(60) as i64;
-                        let until = crate::limits::parse_reset_epoch(&e, now)
-                            .unwrap_or_else(|| now + chrono::Duration::seconds(retry));
-                        logging::error(&tag, &format!(
-                            "usage window limit hit ({}); holding new picks until {} and requeueing {}",
-                            e,
-                            until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            short(&item.workid)
-                        ));
-                        *shared.limit_hold.lock().unwrap() = Some(until);
-                        requeue_with_output(&shared, &item.workid, "usage limit reached; engine holding until reset", true, Some(outputs.join("\n")));
+                        let (announced, until) =
+                            shared.enter_limit_hold(limits::Hold::from_error(&e, now, retry), now);
+                        let resuming = limits::local_label(until, &cfg);
+                        // One line per closed window, not one per spawn: the
+                        // announcing worker carries the whole 429 payload (the
+                        // only place it is worth having), every later worker
+                        // under the same hold says one short sentence.
+                        if announced {
+                            logging::error(
+                                &tag,
+                                &format!("usage window closed, resuming {} — holding all picks until then. The API said: {}", resuming, e),
+                            );
+                        } else {
+                            logging::warn(
+                                &tag,
+                                &format!("usage window still closed (resuming {}); requeued {}", resuming, short(&item.workid)),
+                            );
+                        }
+                        requeue_with_output(&shared, &item.workid, &format!("usage limit reached; engine holding until {}", resuming), true, Some(outputs.join("\n")));
                     }
                     drop(lock);
                     return;
@@ -1277,7 +1364,7 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
     let codepath = resolve_codepath(&code_root, &item.codepath);
     if let Err(msg) = validate_codepaths(&code_root, &item) {
         logging::error(&tag, &msg);
-        fail_item(&shared, &item, &msg, String::new(), &tag);
+        park_config_error(&shared, &item, &msg, &tag);
         return;
     }
     let lock = match acquire_all_codepath_locks(&code_root, &item, "shell", cfg.engine.codepath_lock_timeout_sec) {
@@ -1295,8 +1382,13 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
     let iter_bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "iter".to_string());
+    let temp = config::temp_dir(&shared.project_root, &cfg);
+    if let Err(e) = std::fs::create_dir_all(&temp) {
+        logging::warn(&tag, &format!("cannot create the temp directory {}: {}", temp.display(), e));
+    }
     let envs: Vec<(String, String)> = vec![
         ("ITER_BIN".into(), iter_bin),
+        ("ITER_TEMP".into(), temp.to_string_lossy().into_owned()),
         ("ITER_PROJECT".into(), shared.project_root.to_string_lossy().into_owned()),
         (
             "ITER_MAINFILE".into(),
@@ -1516,6 +1608,7 @@ fn stop_item(shared: &Shared, workid: &str, partial_output: String) {
     let queue = shared.queue();
     let _ = queue.mutate(workid, |it| {
         it.state = workitems::STATE_TODO.into();
+        it.todo_reason = workitems::TODO_REASON_GUARD.into();
         it.lasterror = "STOPPED by user mid-run — work may be partially completed; \
                         git_start_commit is the undo point"
             .into();
@@ -1536,6 +1629,7 @@ fn reject_item(shared: &Shared, workid: &str, reason: &str, partial_output: Stri
     let queue = shared.queue();
     let _ = queue.mutate(workid, |it| {
         it.state = workitems::STATE_TODO.into();
+        it.todo_reason = workitems::TODO_REASON_GUARD.into();
         it.lasterror = format!("REJECTED by agent: {}", reason);
         if !partial_output.is_empty() {
             it.output = partial_output.clone();
@@ -1606,6 +1700,36 @@ fn requeue_with_output(shared: &Shared, workid: &str, reason: &str, refund_attem
         }
         it.times.start = String::new();
     });
+}
+
+/// A dispatch-validation failure — the item names a codepath that is not a
+/// directory the engine can lock — is a CONFIGURATION error, and retrying one is
+/// just waiting for a person to notice. Measured on pdy-dev (issue 1,
+/// 2026-08-25): one item burned all 50 attempts over five days against a
+/// directory that did not exist, milliseconds per attempt, never launching an
+/// agent, and the only signal a human got was the item finally closing `failed`
+/// with an empty output.
+///
+/// So this parks instead of failing: `todo` — the human-review bucket — with the
+/// attempt refunded (the run never started, so nothing was spent to burn one)
+/// and `todo_reason = "config"`, which is what lets the webapp show "broken
+/// configuration" rather than a generic approval gate. `fail_item` stays for
+/// genuine run failures, where the next attempt is a real chance.
+fn park_config_error(shared: &Shared, item: &WorkItem, error: &str, tag: &str) {
+    {
+        let _q = shared.queue_mutex.lock().unwrap();
+        let _ = shared.queue().mutate(&item.workid, |it| {
+            it.state = workitems::STATE_TODO.into();
+            it.todo_reason = workitems::TODO_REASON_CONFIG.into();
+            it.lasterror = format!("CONFIGURATION ERROR — retrying cannot fix this; a human must: {}", error);
+            it.attempts = it.attempts.saturating_sub(1);
+            it.times.start = String::new();
+        });
+    }
+    logging::warn(
+        tag,
+        &format!("{} → todo (configuration error, no attempt burned): {}", short(&item.workid), error),
+    );
 }
 
 fn fail_item(shared: &Shared, item: &WorkItem, error: &str, partial_output: String, tag: &str) {
@@ -1758,9 +1882,31 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
     for w in &warnings {
         logging::warn(tag, w);
     }
+    // Assembly order is load-bearing (features item 12): the prompt cache keys
+    // on the exact BYTE PREFIX and is shared across sessions, so N agents whose
+    // spin-ups begin identically cost one cache write and N-1 cheap reads. Part
+    // one below is byte-identical for every item an agent type runs; part two,
+    // from `# Source instructions` on, is where anything item-specific starts. A
+    // single workid or resolved path above the divider gives every session its
+    // own cache entry, which is what it used to do.
     let mut spinup = String::new();
     spinup.push_str(&agent.body);
     spinup.push_str(&shared_section);
+    // The project head is surfaced to EVERY work item (structureV2): the
+    // main.iter.md project definition first, then every globalcontextfiles
+    // match — ONE spot configures all always-loaded context. Listed in full:
+    // this list used to drop the entries an item also carried as its own
+    // context, which made it per-item for the sake of a repeated path or two.
+    let head_files = config::global_context_files(&shared.project_root);
+    if !head_files.is_empty() {
+        spinup.push_str(
+            "\n\n# Project context ($ITER_MAINFILE + globalcontextfiles)\nThe project definition and global requirements — read what applies before starting:\n",
+        );
+        for f in &head_files {
+            spinup.push_str(&format!("- {}\n", f.display()));
+        }
+    }
+    // ---- everything below here varies per work item ----
     if let Some(source_text) = source_instructions(&shared.project_root, &item.source) {
         spinup.push_str("\n\n# Source instructions\n");
         spinup.push_str(&source_text);
@@ -1772,25 +1918,10 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
         codepath.display()
     ));
     spinup.push_str(&previous_attempt_section(item));
-    // The project head is surfaced to EVERY work item (structureV2): the
-    // main.iter.md project definition first, then every globalcontextfiles
-    // match — ONE spot configures all always-loaded context. Files already
-    // attached as this item's context aren't repeated.
-    let head_files: Vec<_> = config::global_context_files(&shared.project_root)
-        .into_iter()
-        .filter(|f| !context_files.contains(f))
-        .collect();
-    if !head_files.is_empty() {
-        spinup.push_str(
-            "\n# Project context ($ITER_MAINFILE + globalcontextfiles)\nThe project definition and global requirements — read what applies before starting:\n",
-        );
-        for f in &head_files {
-            spinup.push_str(&format!("- {}\n", f.display()));
-        }
-    }
-    if !context_files.is_empty() {
+    let item_files: Vec<_> = context_files.iter().filter(|f| !head_files.contains(f)).collect();
+    if !item_files.is_empty() {
         spinup.push_str("\n# Context files\nRead each of these before starting:\n");
-        for f in &context_files {
+        for f in &item_files {
             spinup.push_str(&format!("- {}\n", f.display()));
         }
     }
@@ -2370,8 +2501,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Issue 1: a codepath that does not exist is a configuration error, and no
+    /// number of retries makes a directory appear. It parks for a human with the
+    /// attempt refunded — the pdy-dev item that burned 50 attempts over five
+    /// days on this exact message is the reason.
     #[test]
-    fn missing_codepath_fails_item_instead_of_requeueing() {
+    fn missing_codepath_parks_for_a_human_instead_of_burning_attempts() {
         let root = std::env::temp_dir().join(format!("iterloop-nodir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let shared = Arc::new(test_shared(&root));
@@ -2385,9 +2520,160 @@ mod tests {
         shared.queue().append(&item).unwrap();
         run_workitem(Arc::clone(&shared), AgentDef::default(), item, "test#1".into());
         let items = shared.queue().load();
-        assert_eq!(items[0].state, workitems::STATE_FAILED, "must fail, not requeue");
+        assert_eq!(items[0].state, workitems::STATE_TODO, "parked for review, not failed and retried");
+        assert_eq!(items[0].todo_reason, "config", "the UI must tell this apart from an approval gate");
+        assert_eq!(items[0].attempts, 0, "the run never started; the attempt is refunded");
         assert!(items[0].lasterror.contains("codepath does not exist"));
-        assert!(items[0].lasterror.contains("does/not/exist"));
+        assert!(items[0].lasterror.contains("does/not/exist"), "the message names the path to fix");
+        assert!(items[0].lasterror.contains("CONFIGURATION ERROR"), "and says a retry cannot help");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The file-as-codepath case is the same validation family and gets the same
+    /// treatment: a file can never hold the `.iter.lock` a codepath needs.
+    #[test]
+    fn a_file_codepath_parks_too() {
+        let root = std::env::temp_dir().join(format!("iterloop-filecp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = Arc::new(test_shared(&root));
+        std::fs::write(root.join("notadir.md"), "content").unwrap();
+        let item = WorkItem {
+            workid: "w-filecp".into(),
+            item_type: "code".into(),
+            codepath: "notadir.md".into(),
+            attempts: 3,
+            ..Default::default()
+        };
+        shared.queue().append(&item).unwrap();
+        run_workitem(Arc::clone(&shared), AgentDef::default(), item, "test#2".into());
+        let items = shared.queue().load();
+        assert_eq!(items[0].state, workitems::STATE_TODO);
+        assert_eq!(items[0].todo_reason, "config");
+        assert_eq!(items[0].attempts, 2);
+        assert!(items[0].lasterror.contains("is a file, not a directory"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Picking an item clears whatever parked it: a running item must not still
+    /// wear a "broken configuration" chip from the round before.
+    #[test]
+    fn claiming_an_item_clears_its_todo_reason() {
+        let root = std::env::temp_dir().join(format!("iterloop-clearreason-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let shared = test_shared(&root);
+        let item = WorkItem {
+            workid: "w-refixed".into(),
+            item_type: "code".into(),
+            state: workitems::STATE_QUEUED.into(),
+            todo_reason: "config".into(),
+            ..Default::default()
+        };
+        shared.queue().append(&item).unwrap();
+        let picked = pick_next(&shared, &["code"], false).expect("a re-queued item is pickable");
+        assert!(picked.todo_reason.is_empty());
+        assert!(shared.queue().load()[0].todo_reason.is_empty(), "and on disk, not just in the claim");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue 12c: the item decides the model when it says so, the agent type
+    /// decides otherwise. Whitespace is not an opinion.
+    #[test]
+    fn item_model_overrides_the_agent_default() {
+        let agent = AgentDef { type_name: "code".into(), model: "opus".into(), ..Default::default() };
+        assert_eq!(effective_model(&agent, &WorkItem::default()), "opus");
+        let cheap = WorkItem { model: "sonnet".into(), ..Default::default() };
+        assert_eq!(effective_model(&agent, &cheap), "sonnet");
+        let blank = WorkItem { model: "   ".into(), ..Default::default() };
+        assert_eq!(effective_model(&agent, &blank), "opus", "an empty override is no override");
+    }
+
+    /// Issue 12d: the prompt cache keys on the exact byte prefix and is shared
+    /// across sessions, so the spin-up two items of the same type get must be
+    /// byte-identical until the item-specific part starts. Interpolate a workid
+    /// or a resolved path above `# Work item` and this goes red.
+    #[test]
+    fn spinup_is_byte_identical_until_the_work_item_section() {
+        let root = std::env::temp_dir().join(format!("iterloop-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".iter/agents")).unwrap();
+        std::fs::write(root.join(".iter/agents/_shared.md"), "# Shared rules\nWrite tests first.").unwrap();
+        std::fs::write(root.join("main.iter.md"), "# The project").unwrap();
+        let shared = test_shared(&root);
+        let agent = AgentDef {
+            type_name: "code".into(),
+            body: "You are the code agent. Do the work.".into(),
+            ..Default::default()
+        };
+        let mk = |id: &str, title: &str| WorkItem {
+            workid: id.into(),
+            item_type: "code".into(),
+            title: title.into(),
+            mainwork: format!("do the {} thing", title),
+            lasterror: format!("{} died last time", id),
+            output: "half of it".into(),
+            ..Default::default()
+        };
+        let first = build_turns(&shared, &agent, &mk("aaaa1111-w", "Alpha"), &root, "t#1");
+        let second = build_turns(&shared, &agent, &mk("bbbb2222-w", "Beta"), &root, "t#2");
+        let (pa, pb) = (&first[0].turn.prompt, &second[0].turn.prompt);
+        let common: String =
+            pa.chars().zip(pb.chars()).take_while(|(x, y)| x == y).map(|(x, _)| x).collect();
+
+        assert!(common.contains(&agent.body), "the persona is in the shared prefix");
+        assert!(common.contains("Write tests first."), "and so is _shared.md");
+        assert!(common.contains("main.iter.md"), "and the always-loaded project context");
+        assert!(!common.contains("aaaa1111-w"), "nothing item-specific may reach the shared prefix");
+
+        // The divider is the work-item header: everything above it is shared.
+        let divider = pa.find("\n\n# Work item\n").expect("the work item section exists");
+        assert!(divider <= common.len(), "the prefix must run all the way to the item header");
+        // ...and the item's own material really is below it.
+        assert!(pa[divider..].contains("aaaa1111-w"));
+        assert!(pa[divider..].contains("# Previous attempt"), "retry context is per-item, so it goes below");
+        assert!(pa.ends_with("do the Alpha thing"), "the request is still the last thing the agent reads");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue 6, the engine half: one hold stands for every worker that hits the
+    /// same closed window, only the first announces it, and a later reset
+    /// extends the hold rather than shortening it.
+    #[test]
+    fn concurrent_limit_errors_fold_into_one_hold() {
+        let root = std::env::temp_dir().join(format!("iterloop-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = test_shared(&root);
+        let now = chrono::Utc::now();
+
+        let (announced, until) =
+            shared.enter_limit_hold(limits::Hold::from_error("You've hit your session limit", now, 300), now);
+        assert!(announced, "the first worker through says it");
+        assert_eq!(until, now + chrono::Duration::seconds(300));
+
+        // A second agent, one second behind, is told the window is already shut.
+        let (announced, until) = shared
+            .enter_limit_hold(limits::Hold::from_error("You've hit your session limit", now, 60), now);
+        assert!(!announced, "no second announcement — this is the log spam the issue is about");
+        assert_eq!(until, now + chrono::Duration::seconds(300), "a shorter guess must not shorten the hold");
+
+        // A third names a real reset further out: that wins, and makes the hold
+        // authoritative, but still does not re-announce.
+        let far = now + chrono::Duration::hours(2);
+        let (announced, until) = shared.enter_limit_hold(
+            limits::Hold { until: far, authoritative: true, set_at: now },
+            now,
+        );
+        assert!(!announced);
+        assert_eq!(until, far);
+        let held = shared.limit_hold.lock().unwrap().clone().expect("still holding");
+        assert!(held.authoritative, "the stated reset now governs the hold");
+
+        // Once the window has actually reopened, the next error opens a NEW
+        // hold, which is announced again.
+        let later = far + chrono::Duration::seconds(1);
+        let (announced, _) =
+            shared.enter_limit_hold(limits::Hold::from_error("session limit", later, 300), later);
+        assert!(announced, "a fresh window closure is news again");
         let _ = std::fs::remove_dir_all(&root);
     }
 

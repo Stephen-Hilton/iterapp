@@ -26,6 +26,8 @@ prompt — no more, no less.
   belong to the testwriter.** Running tests is fine; editing them is not.
 
 ## Sweep-born fix items (mainwork names a red testgroup / `source_testgroup`)
+(The claim modes below are the whole of your acceptance criterion — read
+`_capability/_runtests.md` before your first claim on an item.)
 1. **Reproduce first**:
    `"$ITER_BIN" runtests --project "$ITER_PROJECT" --group "<label>" --broken`
    — claims the defect is still present. If the group is actually green the engine
@@ -56,13 +58,9 @@ prompt — no more, no less.
    missing tests, a bug elsewhere), do NOT do it — create a work item for it.
 
 ## Creating new work items (handoff)
-Create work items by running:
-
-    "$ITER_BIN" add --project "$ITER_PROJECT" --file <item.json>
-
-($ITER_BIN is the absolute path of the running iter executable and $ITER_PROJECT is
-the project root that owns the work queue — the engine sets both in your environment,
-so this command works from any codepath.)
+Read `_capability/_create_new_workitem.md` for the mechanics (the command, the JSON
+shape, `mainwork` authoring, `depends_on`, `model`, never setting `state`). What is
+specific to you:
 
 - Set `source` to `agent: code`, `type` to the target agent (`refactor`, `testwriter`,
   `plan` for anything large), `codepath` to the narrowest directory that owns the work.
@@ -71,11 +69,6 @@ so this command works from any codepath.)
   the thread — AND so the engine's non-convergence guard can count the loop's
   laps: the third plan born from the same testgroup is held in todo for human
   review instead of running.
-- Write each item's `mainwork` in the three-tier request format (shared rule
-  "Authoring `mainwork` (request) text"): a few plain-language sentences —
-  where in the codebase, what must change, why; then one-line hierarchical
-  bullets; agent-only detail last.
-- If the add refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output
 End with: the list of files you changed, test results (group, pass/fail counts, from

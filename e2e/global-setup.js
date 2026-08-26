@@ -11,6 +11,28 @@ const prepare = async () => {
   fs.cpSync(src, dst, { recursive: true });
   // Keep the queue deterministic: pre-flag the Orphanage-review schedule.
   fs.writeFileSync(path.join(dst, '.iter', '.engine', 'orphan_schedule_seeded'), 'e2e');
+  fs.writeFileSync(path.join(dst, '.iter', '.engine', 'tempsweep_schedule_seeded'), 'e2e');
+  // Work items covering the states the 2026-08-26 fixes introduced: the three
+  // kinds of `todo` (issue 7b), a per-item model override, and a CLOSED failed
+  // item whose row must offer Clone/Delete and never a retry (issues 3a + 8).
+  const queue = path.join(dst, '.iter', '.engine', 'workitems.jsonl');
+  const mk = (o) => JSON.stringify(Object.assign({
+    type: 'code', source: 'user', priority: 5, risk: 0, codepath: '.', mainwork: 'm',
+    times: { added: '2026-08-26T09:00:00Z' },
+  }, o));
+  fs.appendFileSync(queue, [
+    mk({ workid: 'e2e-todo-approval', title: 'E2E approval gate', state: 'todo' }),
+    mk({ workid: 'e2e-todo-guard', title: 'E2E guard park', state: 'todo',
+         todo_reason: 'guard', lasterror: 'DEPENDENCY FAILED: upstream closed failed' }),
+    mk({ workid: 'e2e-todo-config', title: 'E2E broken config', state: 'todo',
+         todo_reason: 'config', lasterror: 'CONFIGURATION ERROR — codepath does not exist: /gone' }),
+    mk({ workid: 'e2e-model-override', title: 'E2E cheap model', state: 'paused', model: 'sonnet' }),
+  ].join('\n') + '\n');
+  fs.appendFileSync(path.join(dst, '.iter', '.engine', 'workitems_closed.jsonl'),
+    mk({ workid: 'e2e-closed-failed', title: 'E2E closed failed', state: 'failed', attempts: 50,
+         lasterror: 'attempts exhausted',
+         times: { added: '2026-08-20T09:00:00Z', closed: '2026-08-25T13:16:04Z' } }) + '\n');
+
   // The orphan: a valid V2 code node no children link claims.
   const orphanDir = path.join(dst, 'stray');
   fs.mkdirSync(orphanDir, { recursive: true });

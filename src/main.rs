@@ -97,6 +97,12 @@ enum Command {
         /// Unset inherits the creating parent's mode (user items: review)
         #[arg(long)]
         automation: Option<String>,
+        /// Run this item on a specific model instead of the agent type's
+        /// default: opus | sonnet | haiku | fable. Simple well-specified
+        /// mechanical work (comment sweeps, doc repointing, rename plumbing)
+        /// runs fine on sonnet; complex or fuzzy work wants fable. Omit when unsure
+        #[arg(long)]
+        model: Option<String>,
         /// Raise this item as a QUESTION for the human instead of work to run:
         /// the text is the decision needed (context, options, your pick) and
         /// the item is born in the `question` state, whatever the automation
@@ -327,6 +333,17 @@ enum Command {
         #[arg(long)]
         template: bool,
     },
+    /// Remove aged scratch files from the project's temp directory (the one
+    /// exported to agents as $ITER_TEMP), per
+    /// `globalsettings.temp_file_ttl_days`. `critique-*` files are review
+    /// history and are never swept. Seeded as a daily scheduled workitem.
+    Tempsweep {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// List what would be removed without removing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Queue summary, active agents, and locks
     Status {
         #[arg(long, default_value = ".")]
@@ -353,8 +370,8 @@ fn main() {
     let code = match cli.command {
         Command::Start { project, port } => cmd_start(project, port),
         Command::Run { project, once, until_idle } => cmd_run(project, once, until_idle),
-        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation, question } => {
-            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation, question)
+        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation, model, question } => {
+            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation, model, question)
         }
         Command::Ask { project, question, file } => cmd_ask(project, question, file),
         Command::Critreview { project, file, context, max_retry } => {
@@ -381,6 +398,7 @@ fn main() {
         Command::InvertPriorities { project } => cmd_invert_priorities(project),
         Command::Stubdesc { project } => cmd_stubdesc(project),
         Command::Validate { project, file, fix, template } => cmd_validate(project, file, fix, template),
+        Command::Tempsweep { project, dry_run } => cmd_tempsweep(project, dry_run),
         Command::Status { project } => cmd_status(project),
         Command::Stop { project, wait } => cmd_stop(project, wait),
         Command::Init { dest, from } => cmd_init(dest, from),
@@ -404,6 +422,15 @@ fn boot(project: &Path) -> bool {
         Ok(0) | Err(_) => {} // creation failure is not fatal
         Ok(n) => println!("created {} project head file(s) (config.iter.json / main.iter.md)", n),
     }
+    // …and then the directories those files DECLARE. A config that names a
+    // directory nothing creates is a trap: pointing a usecase item at
+    // {globalusecasedir} — the obvious thing to do — handed the engine a path
+    // that did not exist, which is a configuration error dressed up as a work
+    // failure. Idempotent, so every start heals it.
+    match project::ensure_global_dirs(project) {
+        Ok(0) | Err(_) => {}
+        Ok(n) => println!("created {} declared global director{} (usecase / interface)", n, if n == 1 { "y" } else { "ies" }),
+    }
     let cfg = config::load(project);
     let log_file = if cfg.globalsettings.log_default_path.is_empty() {
         None
@@ -416,18 +443,20 @@ fn boot(project: &Path) -> bool {
     true
 }
 
-/// Seed the DAILY Orphanage-review schedule once (structureV2): a scheduled
-/// shell workitem running `iter orphans --ensure-todo` — the recommendation
-/// TODO it opens is itself deduped, so the schedule can fire every day
-/// harmlessly. Flag-filed so deleting the schedule is a real delete.
-fn seed_orphan_schedule(project: &Path, cfg: &config::Config) {
-    let flag = config::engine_dir(project).join("orphan_schedule_seeded");
+/// Seed a DAILY housekeeping schedule once: a scheduled shell workitem that
+/// itersched clones on cadence, locking nothing (`codepath_ignore: ["**"]`) so
+/// it never contends with real work. Two guards keep it from stacking copies —
+/// a flag file in `.engine/`, so deleting the schedule in the webapp is a real
+/// delete that startup does not undo, and a title check under the queue lock in
+/// case the flag went missing with the .engine directory.
+fn seed_daily_schedule(project: &Path, cfg: &config::Config, flag_name: &str, title: &str, at: &str, mainwork: &str) {
+    let flag = config::engine_dir(project).join(flag_name);
     if flag.exists() {
         return;
     }
     let mut item = WorkItem {
         workid: uuid::Uuid::new_v4().to_string(),
-        title: "Orphanage Review".into(),
+        title: title.into(),
         item_type: "plan".into(),
         state: workitems::STATE_SCHEDULED.into(),
         source: "user".into(),
@@ -435,23 +464,50 @@ fn seed_orphan_schedule(project: &Path, cfg: &config::Config) {
         codepath: ".".into(),
         codepath_ignore: vec!["**".into()], // run-only: locks nothing
         exec: workitems::EXEC_SHELL.into(),
-        mainwork: "\"$ITER_BIN\" orphans --project \"$ITER_PROJECT\" --ensure-todo".into(),
-        sched: workitems::Sched { kind: "daily".into(), at: "06:00".into(), ..Default::default() },
+        mainwork: mainwork.into(),
+        sched: workitems::Sched { kind: "daily".into(), at: at.into(), ..Default::default() },
         ..Default::default()
     };
     item.times.added = workitems::now_iso();
     let queue = Queue::new(project, cfg);
     let seeded = queue.with_lock(|items| {
-        if items.iter().any(|i| i.state == workitems::STATE_SCHEDULED && i.title == "Orphanage Review") {
+        if items.iter().any(|i| i.state == workitems::STATE_SCHEDULED && i.title == title) {
             return false;
         }
         items.push(item.clone());
         true
     });
     if let Ok(true) = seeded {
-        println!("seeded the daily \"Orphanage Review\" scheduled workitem (edit or pause it in the webapp)");
+        println!("seeded the daily \"{}\" scheduled workitem (edit or pause it in the webapp)", title);
     }
     let _ = std::fs::write(&flag, workitems::now_iso());
+}
+
+/// Resolve `--project` to a real project the way git resolves a repo, and say
+/// out loud when the answer came from a parent directory. Read-only commands
+/// use this so a directory that is not a project reads as an error instead of
+/// an empty project — `iter status` from a repo root printed "queue: 0 open"
+/// with 40+ items open one directory down, and no output distinguished the two.
+fn resolve_project(given: &Path) -> Result<PathBuf, String> {
+    let root = project::find_root(given)?;
+    let asked = given.canonicalize().unwrap_or_else(|_| given.to_path_buf());
+    if root != asked {
+        // stderr, so `iter markers` / `iter resolve` stdout stays machine-readable.
+        eprintln!("note: no .iter/ at {} — using the iter project at {}", asked.display(), root.display());
+    }
+    Ok(root)
+}
+
+/// `resolve_project` with the refusal already reported — every read-only
+/// command fails the same way, with exit 2 (bad invocation).
+fn project_or_bail(given: &Path) -> Option<PathBuf> {
+    match resolve_project(given) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("error: {}", e);
+            None
+        }
+    }
 }
 
 fn cmd_run(project: PathBuf, once: bool, until_idle: bool) -> i32 {
@@ -471,9 +527,25 @@ fn cmd_start(project: PathBuf, port: Option<u16>) -> i32 {
     if !boot(&project) {
         return 1;
     }
-    // The daily Orphanage-review schedule seeds on the SERVER path only — a
-    // bare `iter run --until-idle` (tests, one-shot ticks) must still drain.
-    seed_orphan_schedule(&project, &config::load(&project));
+    // The daily housekeeping schedules seed on the SERVER path only — a bare
+    // `iter run --until-idle` (tests, one-shot ticks) must still drain.
+    let cfg = config::load(&project);
+    seed_daily_schedule(
+        &project,
+        &cfg,
+        "orphan_schedule_seeded",
+        "Orphanage Review",
+        "06:00",
+        "\"$ITER_BIN\" orphans --project \"$ITER_PROJECT\" --ensure-todo",
+    );
+    seed_daily_schedule(
+        &project,
+        &cfg,
+        "tempsweep_schedule_seeded",
+        "Temp Sweep",
+        "05:30",
+        "\"$ITER_BIN\" tempsweep --project \"$ITER_PROJECT\"",
+    );
     let project = match project.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -509,6 +581,25 @@ fn cmd_start(project: PathBuf, port: Option<u16>) -> i32 {
     }
 }
 
+/// The project's `default_automation`, validated. The setting decides whether
+/// a whole lineage of work runs unattended, so a typo must not resolve to
+/// either mode by accident: anything that is not one of the two known modes
+/// falls back to the pre-setting behavior (review, the gated one) and says so
+/// rather than silently automating a queue the user believes is gated.
+fn default_automation(cfg: &config::Config) -> String {
+    let mode = cfg.globalsettings.default_automation.trim();
+    if mode == workitems::AUTOMATION_AUTO || mode == workitems::AUTOMATION_REVIEW {
+        return mode.to_string();
+    }
+    if !mode.is_empty() {
+        eprintln!(
+            "warning: globalsettings.default_automation is \"{}\" — expected \"auto\" or \"review\"; using \"review\"",
+            mode
+        );
+    }
+    workitems::AUTOMATION_REVIEW.to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_add(
     project: PathBuf,
@@ -525,6 +616,7 @@ fn cmd_add(
     depends_on: Vec<String>,
     depends_on_shallow: bool,
     automation: Option<String>,
+    model: Option<String>,
     question: Option<String>,
 ) -> i32 {
     let cfg = config::load(&project);
@@ -576,6 +668,9 @@ fn cmd_add(
     if let Some(v) = automation {
         item.automation = v;
     }
+    if let Some(v) = model {
+        item.model = v;
+    }
     if let Some(v) = question {
         item.question = v;
     }
@@ -583,6 +678,18 @@ fn cmd_add(
     let mode = item.automation.trim().to_string();
     if !mode.is_empty() && mode != workitems::AUTOMATION_REVIEW && mode != workitems::AUTOMATION_AUTO {
         eprintln!("error: automation must be \"review\" or \"auto\" (got \"{}\")", mode);
+        return 2;
+    }
+    // Same reasoning for the model override, and the same moment: an unknown
+    // model only shows up when the session fails at dispatch, which can be
+    // hours after the item was written and looks like a work failure.
+    item.model = item.model.trim().to_string();
+    if !item.model.is_empty() && !workitems::KNOWN_MODELS.contains(&item.model.as_str()) {
+        eprintln!(
+            "error: --model must be one of {} (got \"{}\"); omit it to use the agent type's default",
+            workitems::KNOWN_MODELS.join(", "),
+            item.model
+        );
         return 2;
     }
 
@@ -695,6 +802,14 @@ fn cmd_add(
             );
             item.state = derived.into();
         }
+    } else if item.automation.trim().is_empty() {
+        // A user-filed item is the TOP of a lineage: there is no parent to
+        // inherit from, so the project decides. This was hard-coded "review",
+        // which made every child of every handoff born `todo` — a queue the
+        // user believed was automated stalled at every stage boundary
+        // overnight. The item's OWN state is untouched; only what it passes
+        // down changes.
+        item.automation = default_automation(&cfg);
     }
 
     // Dependency resolution: suffixes → full workids, refusing unknown or
@@ -721,6 +836,9 @@ fn cmd_add(
             .count();
         if prior_plans >= 2 && item.state == workitems::STATE_QUEUED {
             item.state = workitems::STATE_TODO.into();
+            // A guard put this here, not an approval gate — the UI shows the
+            // two differently because only one of them needs judgment.
+            item.todo_reason = workitems::TODO_REASON_GUARD.into();
             item.mainwork = format!(
                 "NON-CONVERGENCE: this is plan #{} born from testgroup \"{}\" — two full \
                  fix→plan→build laps have not turned it green, so this loop is not converging \
@@ -1018,6 +1136,7 @@ fn cmd_validate(project: PathBuf, file: Option<PathBuf>, fix: bool, template: bo
             }
         };
     }
+    let Some(project) = project_or_bail(&project) else { return 2 };
     let roots = server::scan_roots(&project);
     let report = match validate::run(&roots, file.as_deref(), fix) {
         Ok(r) => r,
@@ -1222,6 +1341,7 @@ fn cmd_teststate(
     clear: Vec<String>,
     list: bool,
 ) -> i32 {
+    let Some(project) = project_or_bail(&project) else { return 2 };
     let scan_now = || markers::scan_project(&project).1;
 
     let edits: Vec<(markers::TestStateAction, &Vec<String>)> = vec![
@@ -1283,6 +1403,7 @@ fn cmd_teststate(
 /// The structureV2 DAG as JSON, for agents: the same scan the
 /// webapp/sweep/validate share, printed instead of served.
 fn cmd_markers(project: PathBuf) -> i32 {
+    let Some(project) = project_or_bail(&project) else { return 2 };
     let (_p, scan) = markers::scan_project(&project);
     match serde_json::to_string_pretty(&scan) {
         Ok(json) => {
@@ -1300,6 +1421,7 @@ fn cmd_markers(project: PathBuf) -> i32 {
 /// pattern with the project vars (plus a node's file-relative keys when
 /// --node names one). Prints one value per line; --files globs them.
 fn cmd_resolve(project: PathBuf, node: Option<String>, pattern: String, files: bool) -> i32 {
+    let Some(project) = project_or_bail(&project) else { return 2 };
     let (proj, scan) = markers::scan_project(&project);
     let mut vars = proj.vars();
     if let Some(target) = node {
@@ -1344,6 +1466,7 @@ fn cmd_resolve(project: PathBuf, node: Option<String>, pattern: String, files: b
 /// dedups against any still-open orphanage item, so the daily schedule never
 /// stacks duplicates (and creates nothing when the orphanage is empty).
 fn cmd_orphans(project: PathBuf, ensure_todo: bool) -> i32 {
+    let Some(project) = project_or_bail(&project) else { return 2 };
     let (_p, scan) = markers::scan_project(&project);
     if scan.orphans.is_empty() {
         println!("orphanage: empty — every discovered node file is linked into the DAG");
@@ -1468,12 +1591,140 @@ fn probe_tokens(project: &Path) -> Result<(), String> {
         .map(|_| ())
 }
 
+/// Files whose names start with this are NOT scratch: a critique is the record
+/// of what a reviewer caught before an item shipped, and it lives in the temp
+/// directory only until issue 11 moves critiques into a database. Until then
+/// the sweeper must not eat the review history it is walking past.
+const CRITIQUE_PREFIX: &str = "critique-";
+
+#[derive(Debug, Default)]
+struct TempSweep {
+    removed: Vec<PathBuf>,
+    kept_critiques: usize,
+    kept_fresh: usize,
+    skipped_symlinks: usize,
+    pruned_dirs: usize,
+    errors: Vec<String>,
+}
+
+/// Delete files under `dir` last modified more than `ttl_days` ago.
+///
+/// Three rules keep it from taking anything it shouldn't. Critique files are
+/// kept whatever their age (see CRITIQUE_PREFIX). Symlinks are never followed
+/// and never removed — a link planted in the temp directory must not become a
+/// path OUT of it, so the walk only ever descends into real directories, which
+/// is also what confines the sweep to the tree it was handed. And a file whose
+/// timestamp cannot be read (or sits in the future) is kept: an unreadable age
+/// is not evidence of old age.
+fn sweep_temp(dir: &Path, ttl_days: u64, now: std::time::SystemTime, dry_run: bool) -> TempSweep {
+    let mut report = TempSweep::default();
+    let cutoff = std::time::Duration::from_secs(ttl_days.saturating_mul(86_400));
+    sweep_temp_dir(dir, cutoff, now, dry_run, &mut report);
+    report
+}
+
+fn sweep_temp_dir(dir: &Path, cutoff: std::time::Duration, now: std::time::SystemTime, dry_run: bool, report: &mut TempSweep) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            report.errors.push(format!("{}: {}", dir.display(), e));
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if meta.file_type().is_symlink() {
+            report.skipped_symlinks += 1;
+            continue;
+        }
+        if meta.is_dir() {
+            sweep_temp_dir(&path, cutoff, now, dry_run, report);
+            // A subdirectory the sweep emptied is itself litter. The temp root
+            // is never removed — agents and $ITER_TEMP expect it to be there.
+            if !dry_run && std::fs::read_dir(&path).map(|mut e| e.next().is_none()).unwrap_or(false) && std::fs::remove_dir(&path).is_ok() {
+                report.pruned_dirs += 1;
+            }
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with(CRITIQUE_PREFIX) {
+            report.kept_critiques += 1;
+            continue;
+        }
+        let aged_out = meta
+            .modified()
+            .or_else(|_| meta.created())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|age| age >= cutoff)
+            .unwrap_or(false);
+        if !aged_out {
+            report.kept_fresh += 1;
+            continue;
+        }
+        if dry_run {
+            report.removed.push(path);
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => report.removed.push(path),
+            Err(e) => report.errors.push(format!("{}: {}", path.display(), e)),
+        }
+    }
+}
+
+/// `iter tempsweep` — the daily housekeeping pass over $ITER_TEMP. The temp
+/// directory grew to 187 files over weeks on pdy-dev because nothing ever
+/// removed anything from it; every one of them was scratch for a work item
+/// that had long since closed.
+fn cmd_tempsweep(project: PathBuf, dry_run: bool) -> i32 {
+    let Some(project) = project_or_bail(&project) else { return 2 };
+    let cfg = config::load(&project);
+    let dir = config::temp_dir(&project, &cfg);
+    let ttl = cfg.globalsettings.temp_file_ttl_days;
+    if ttl == 0 {
+        println!("tempsweep: temp_file_ttl_days is 0 — sweeping is off; {} left untouched", dir.display());
+        return 0;
+    }
+    if !dir.is_dir() {
+        println!("tempsweep: {} does not exist — nothing to sweep", dir.display());
+        return 0;
+    }
+    let report = sweep_temp(&dir, ttl, std::time::SystemTime::now(), dry_run);
+    for path in &report.removed {
+        println!("  {} {}", if dry_run { "would remove" } else { "removed" }, path.display());
+    }
+    println!(
+        "tempsweep: {} {} file(s) older than {} day(s) in {}; kept {} newer and {} critique file(s){}{}",
+        if dry_run { "would remove" } else { "removed" },
+        report.removed.len(),
+        ttl,
+        dir.display(),
+        report.kept_fresh,
+        report.kept_critiques,
+        if report.skipped_symlinks > 0 { format!(", skipped {} symlink(s)", report.skipped_symlinks) } else { String::new() },
+        if report.pruned_dirs > 0 { format!(", pruned {} empty director(y/ies)", report.pruned_dirs) } else { String::new() },
+    );
+    for e in &report.errors {
+        eprintln!("warning: cannot sweep {}", e);
+    }
+    if report.errors.is_empty() { 0 } else { 1 }
+}
+
 fn cmd_status(project: PathBuf) -> i32 {
+    let Some(project) = project_or_bail(&project) else { return 2 };
     let cfg = config::load(&project);
     let queue = Queue::new(&project, &cfg);
     let items = queue.load();
     let count = |s: &str| items.iter().filter(|i| i.state == s).count();
     println!("queue: {} open", items.len());
+    // What follows is a FILE read, not the running engine's memory. The stamp
+    // says how old it is — reading hours-stale states as current is how a
+    // session concluded four completed items were still parked in todo.
+    match queue.read_meta() {
+        Some(m) => println!("  snapshot written {} by pid {}", m.written, m.pid),
+        None => println!("  snapshot age unknown (no queue.meta.json — nothing has written the queue yet)"),
+    }
     for state in ["queued", "in-progress", "paused", "failed", "todo", "question"] {
         let n = count(state);
         if n > 0 {
@@ -1587,10 +1838,13 @@ fn cmd_init(dest: PathBuf, from: Option<PathBuf>) -> i32 {
     match result {
         Ok(n) => {
             let head_added = project::ensure_head_files(&dest).unwrap_or(0);
+            // The declared usecase/interface directories exist from the first
+            // minute, so the first item filed against one dispatches.
+            let dirs_added = project::ensure_global_dirs(&dest).unwrap_or(0);
             println!(
                 "initialized {} — {} file(s) added{} (existing files untouched)",
                 dest.join(".iter").display(),
-                n + head_added,
+                n + head_added + dirs_added,
                 external.as_ref().map(|d| format!(" from {}", d.display())).unwrap_or_default()
             );
             0
@@ -1599,6 +1853,142 @@ fn cmd_init(dest: PathBuf, from: Option<PathBuf>) -> i32 {
             eprintln!("error: init failed: {}", e);
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("iter-main-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The sweep is aged out by moving the CLOCK forward rather than the files
+    /// back — nothing in std sets an mtime, and `now` is a parameter precisely
+    /// so the age rule is testable.
+    fn later(days: u64) -> SystemTime {
+        SystemTime::now() + Duration::from_secs(days * 86_400)
+    }
+
+    #[test]
+    fn tempsweep_removes_aged_files_and_keeps_fresh_ones() {
+        let dir = tmpdir("sweep-age");
+        std::fs::write(dir.join("k1-draft.json"), "{}").unwrap();
+        std::fs::write(dir.join("dissolve.py"), "x").unwrap();
+
+        // Nothing is old enough yet.
+        let report = sweep_temp(&dir, 14, SystemTime::now(), false);
+        assert!(report.removed.is_empty());
+        assert_eq!(report.kept_fresh, 2);
+        assert!(dir.join("k1-draft.json").is_file());
+
+        // Twenty days on, both are scratch for items long since closed.
+        let report = sweep_temp(&dir, 14, later(20), false);
+        assert_eq!(report.removed.len(), 2, "{:?}", report);
+        assert!(!dir.join("k1-draft.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Critique files are review history that issue 11 will move into a
+    /// database; the sweeper must not eat them meanwhile, at any age.
+    #[test]
+    fn tempsweep_never_touches_critique_files() {
+        let dir = tmpdir("sweep-critique");
+        std::fs::write(dir.join("critique-round1-abc.md"), "findings").unwrap();
+        std::fs::write(dir.join("scratch.txt"), "x").unwrap();
+
+        let report = sweep_temp(&dir, 1, later(365), false);
+        assert_eq!(report.kept_critiques, 1);
+        assert_eq!(report.removed.len(), 1);
+        assert!(dir.join("critique-round1-abc.md").is_file(), "a year old and still kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tempsweep_dry_run_reports_without_removing() {
+        let dir = tmpdir("sweep-dry");
+        std::fs::write(dir.join("old.txt"), "x").unwrap();
+        let report = sweep_temp(&dir, 7, later(30), true);
+        assert_eq!(report.removed.len(), 1);
+        assert!(dir.join("old.txt").is_file(), "--dry-run removes nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tempsweep_descends_real_dirs_and_prunes_them_empty() {
+        let dir = tmpdir("sweep-nested");
+        std::fs::create_dir_all(dir.join("run-42")).unwrap();
+        std::fs::write(dir.join("run-42/out.log"), "x").unwrap();
+        let report = sweep_temp(&dir, 1, later(30), false);
+        assert_eq!(report.removed.len(), 1);
+        assert_eq!(report.pruned_dirs, 1, "an emptied subdirectory is litter too");
+        assert!(dir.is_dir(), "the temp root itself is never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink in the temp directory is a path OUT of it; the sweep neither
+    /// follows one nor deletes through one, which is what confines it to the
+    /// tree it was handed.
+    #[cfg(unix)]
+    #[test]
+    fn tempsweep_never_follows_symlinks_out_of_the_temp_dir() {
+        let dir = tmpdir("sweep-symlink");
+        let outside = tmpdir("sweep-outside");
+        std::fs::write(outside.join("precious.txt"), "not temp").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("escape")).unwrap();
+        std::os::unix::fs::symlink(outside.join("precious.txt"), dir.join("precious-link")).unwrap();
+
+        let report = sweep_temp(&dir, 1, later(30), false);
+        assert!(report.removed.is_empty());
+        assert_eq!(report.skipped_symlinks, 2);
+        assert!(outside.join("precious.txt").is_file(), "the sweep stayed inside its own tree");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn default_automation_falls_back_to_the_gated_mode_on_a_bad_setting() {
+        let mut cfg = config::Config::default();
+        assert_eq!(default_automation(&cfg), "auto", "the shipped default automates");
+        cfg.globalsettings.default_automation = "review".into();
+        assert_eq!(default_automation(&cfg), "review");
+        // A typo must not decide that a whole lineage runs unattended.
+        cfg.globalsettings.default_automation = "autoo".into();
+        assert_eq!(default_automation(&cfg), "review");
+        cfg.globalsettings.default_automation = String::new();
+        assert_eq!(default_automation(&cfg), "review");
+    }
+
+    /// Issue 12c: the model set is closed, and `iter add` is where an unknown
+    /// one is caught — not the dispatch that happens hours later.
+    #[test]
+    fn known_models_are_the_four_accepted_names() {
+        assert!(workitems::KNOWN_MODELS.contains(&"sonnet"));
+        assert!(workitems::KNOWN_MODELS.contains(&"fable"));
+        assert!(!workitems::KNOWN_MODELS.contains(&"gpt-4"));
+        assert!(!workitems::KNOWN_MODELS.contains(&"claude-opus-4"));
+    }
+
+    /// Issue 4: a directory that is not a project resolves to the project
+    /// above it, and one with no project anywhere above is refused.
+    #[test]
+    fn read_only_commands_find_the_project_or_refuse() {
+        let dir = tmpdir("resolve");
+        std::fs::create_dir_all(dir.join(".iter/.engine")).unwrap();
+        let deep = dir.join("src/deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(project_or_bail(&deep), Some(dir.canonicalize().unwrap()));
+
+        let bare = tmpdir("resolve-bare");
+        assert_eq!(project_or_bail(&bare), None, "no zeros for a non-project");
+        assert_eq!(cmd_status(bare.clone()), 2, "and a non-zero exit");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 }
 

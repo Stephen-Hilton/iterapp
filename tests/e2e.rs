@@ -73,6 +73,11 @@ case "$args" in
     ;;
 esac
 case "$args" in
+  # Issue 9: the engine hands agents an ABSOLUTE scratch directory, so a
+  # relative .iter/temp/ literal can never mint a stray tree again.
+  *TEMPENV_TRIGGER*) printf '%s' "$ITER_TEMP" > "$ITER_PROJECT/seen-temp.txt";;
+esac
+case "$args" in
   *FAIL_TRIGGER*) echo "stub failure" >&2; exit 1;;
 esac
 echo '{"type":"result","session_id":"fake-sess-1","result":"fake agent output"}'
@@ -379,7 +384,9 @@ fn codepath_guards_and_matching_short_ids() {
 
     // The regression itself: a bad SECOND entry. Before the fix this skipped
     // validation, hit the lock scan, logged "codepath busy" and requeued with
-    // its attempt refunded — forever, so max_attempts never tripped.
+    // its attempt refunded — forever, so max_attempts never tripped. Now every
+    // entry is validated, and a validation failure PARKS the item for a human
+    // (issue 1) rather than spending the retry budget on an error no retry fixes.
     let json = root.join("multi.json");
     std::fs::write(
         &json,
@@ -395,12 +402,17 @@ fn codepath_guards_and_matching_short_ids() {
 
     run_engine(&root, &stub, Duration::from_secs(60));
 
-    let multi = closed_items(&root)
+    assert!(
+        !closed_items(&root).iter().any(|i| i["workid"] == "e2e-cp-multi"),
+        "a configuration error must not burn the retry budget and close as failed"
+    );
+    let multi = open_items(&root)
         .into_iter()
         .find(|i| i["workid"] == "e2e-cp-multi")
-        .expect("a broken codepath list must FAIL the item, not requeue it forever");
-    assert_eq!(multi["state"], "failed");
-    assert_eq!(multi["attempts"], 3, "attempts advance, so max_attempts trips");
+        .expect("a broken codepath list parks in the open queue for a human");
+    assert_eq!(multi["state"], "todo");
+    assert_eq!(multi["todo_reason"], "config", "so the UI can tell this from an approval gate");
+    assert_eq!(multi["attempts"], 0, "the attempt is refunded — no retry was ever going to help");
     let why = multi["lasterror"].as_str().unwrap();
     assert!(why.contains("codepath does not exist"), "{}", why);
     assert!(why.contains("gone"), "the message names the offending entry: {}", why);
@@ -605,6 +617,232 @@ fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> String {
     resp
 }
 
+/// Issue 1 (pdy-dev field report, 2026-08-25): a work item whose codepath did
+/// not exist burned all 50 retries over five days without ever launching an
+/// agent. Dispatch validation runs before any agent starts, so a missing
+/// directory fails identically every time — it is a CONFIGURATION error, and
+/// retrying cannot fix it. It must park for a human on the FIRST occurrence.
+#[test]
+fn missing_codepath_parks_for_review_instead_of_burning_retries() {
+    let (root, stub) = setup_project("nonretry", 3, 200);
+    seed(
+        &root,
+        &workitem_json("e2e-badcp", "code", "points at a moved directory", "./gone-dir", "m", "", ""),
+    );
+
+    run_engine(&root, &stub, Duration::from_secs(60));
+
+    assert!(
+        closed_items(&root).is_empty(),
+        "a configuration error must not consume the retry budget and close as failed"
+    );
+    let open = open_items(&root);
+    assert_eq!(open.len(), 1);
+    let parked = &open[0];
+    assert_eq!(parked["state"], "todo", "it parks for a human the first time");
+    assert_eq!(parked["todo_reason"], "config", "and says WHY it is parked, so the UI can distinguish it");
+    assert!(
+        parked["attempts"].as_u64().unwrap() <= 1,
+        "no retry storm: attempts stayed at {} across a full run-to-idle",
+        parked["attempts"]
+    );
+    let why = parked["lasterror"].as_str().unwrap_or_default();
+    assert!(why.contains("gone-dir"), "the reason names the offending path: {}", why);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Issue 9: agents were told to write scratch to the relative literal
+/// `.iter/temp/...`, which resolves against the agent's working directory — so
+/// an agent running anywhere but the project root minted a fresh `.iter/temp/`
+/// right there. The engine now exports the resolved directory as $ITER_TEMP,
+/// the same way it already exports $ITER_BIN and $ITER_PROJECT.
+#[test]
+fn agents_receive_an_absolute_temp_directory() {
+    let (root, stub) = setup_project("tempenv", 3, 200);
+    seed(&root, &workitem_json("e2e-tempenv", "code", "writes scratch", "./src", "go TEMPENV_TRIGGER", "", ""));
+
+    run_engine(&root, &stub, Duration::from_secs(60));
+
+    let seen = std::fs::read_to_string(root.join("seen-temp.txt")).expect("the agent session had $ITER_TEMP");
+    let seen = Path::new(seen.trim());
+    assert!(seen.is_absolute(), "a relative $ITER_TEMP would reintroduce the whole bug: {}", seen.display());
+    // canonicalize both sides: on macOS the temp root resolves through /private.
+    let real_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+    assert!(
+        seen.canonicalize().unwrap_or_else(|_| seen.to_path_buf()).starts_with(&real_root),
+        "scratch belongs to THIS project: {}",
+        seen.display()
+    );
+    assert!(seen.ends_with("temp"), "{}", seen.display());
+    assert!(seen.is_dir(), "the engine creates it, so an agent can write immediately");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Issue 4: `iter status` run from the repo root (so --project defaulted there)
+/// printed "queue: 0 open" while 40+ items were open in the real project one
+/// directory down — a zero indistinguishable from a genuinely empty queue.
+#[test]
+fn status_finds_the_project_upward_and_refuses_a_non_project() {
+    let (root, _stub) = setup_project("statusroot", 3, 200);
+    seed(&root, &workitem_json("e2e-st-1", "code", "real work", ".", "m", "", ""));
+    let status = |dir: &Path| {
+        Command::new(BIN).args(["status", "--project", dir.to_str().unwrap()]).output().unwrap()
+    };
+
+    // From a SUBDIRECTORY: walk up, find the project, and report its real queue.
+    let sub = root.join("src");
+    let found = status(&sub);
+    let text = String::from_utf8_lossy(&found.stdout).into_owned();
+    assert_eq!(found.status.code(), Some(0), "a subdirectory of a project is still that project");
+    assert!(text.contains("1 open"), "it reports the REAL queue, not zeros: {}", text);
+
+    // Somewhere with no project above it at all: an error, never a false zero.
+    let bare = std::env::temp_dir().join(format!("iterloop-e2e-bare-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bare);
+    std::fs::create_dir_all(&bare).unwrap();
+    let miss = status(&bare);
+    assert_ne!(miss.status.code(), Some(0), "a non-project must not exit 0 with zeros");
+    let err = String::from_utf8_lossy(&miss.stderr).into_owned();
+    assert!(err.contains("no iter project"), "and must say so: {}", err);
+    assert!(
+        !String::from_utf8_lossy(&miss.stdout).contains("0 open"),
+        "printing a zero queue for a non-project is the whole bug"
+    );
+
+    let _ = std::fs::remove_dir_all(&bare);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Issue 9: temp files are swept on a TTL — except critique documents, which are
+/// review history that issue 11 will move into a database. Until then the
+/// sweeper must not eat them.
+#[test]
+fn tempsweep_removes_old_scratch_but_never_critiques() {
+    let (root, _stub) = setup_project("tempsweep", 3, 200);
+    let temp = root.join(".iter/temp");
+    std::fs::create_dir_all(&temp).unwrap();
+    let old = |name: &str| {
+        let p = temp.join(name);
+        std::fs::write(&p, "scratch").unwrap();
+        // Well past any plausible TTL, and fixed so the test never drifts.
+        Command::new("touch").args(["-t", "202001010000", p.to_str().unwrap()]).status().unwrap();
+        p
+    };
+    let stale_draft = old("k1-draft.json");
+    let stale_critique = old("critique-abc123.md");
+    let fresh_draft = temp.join("k2-draft.json");
+    std::fs::write(&fresh_draft, "today's scratch").unwrap();
+
+    let out = Command::new(BIN).args(["tempsweep", "--project", root.to_str().unwrap()]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+
+    assert!(!stale_draft.exists(), "an old scratch file is what the sweeper is for");
+    assert!(stale_critique.exists(), "critique history must survive the sweeper");
+    assert!(fresh_draft.exists(), "a file inside the TTL stays");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Issue 12c: a work item may name the model it runs on, so expensive models
+/// spend only where judgment lives. An unknown name refuses rather than
+/// silently falling back.
+#[test]
+fn add_accepts_a_known_model_and_refuses_an_unknown_one() {
+    let (root, _stub) = setup_project("modelfield", 3, 200);
+    let add = |model: &str| {
+        Command::new(BIN)
+            .args([
+                "add", "--project", root.to_str().unwrap(), "--type", "code", "--title", "t",
+                "--mainwork", "m", "--model", model,
+            ])
+            .output()
+            .unwrap()
+    };
+
+    assert_eq!(add("sonnet").status.code(), Some(0));
+    assert_eq!(open_items(&root)[0]["model"], "sonnet", "the choice is stored on the item");
+
+    let bad = add("gpt-9");
+    assert_eq!(bad.status.code(), Some(2), "an unknown model refuses instead of guessing");
+    let err = String::from_utf8_lossy(&bad.stderr).into_owned();
+    assert!(err.contains("sonnet"), "and names the valid values: {}", err);
+    assert_eq!(open_items(&root).len(), 1, "the refused item was not appended");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Issues 3 and 8: every action verb used to route through an open-queue lookup,
+/// so an ARCHIVED item answered "no such open work item" — for retry (which the
+/// UI still offered, so the user clicked it repeatedly) and for delete (which
+/// nothing else implemented, making the archive append-only forever).
+#[test]
+fn closed_items_can_be_deleted_and_other_verbs_explain_themselves() {
+    let dest = std::env::temp_dir().join(format!("iterloop-e2e-closed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(dest.join(".iter/.engine")).unwrap();
+    std::fs::write(
+        dest.join(".iter/.engine/config.json"),
+        r#"{"engine":{"tick_interval_sec":1},"globalsettings":{"log_default_path":""}}"#,
+    )
+    .unwrap();
+    std::fs::write(dest.join(".iter/.engine/orphan_schedule_seeded"), "test").unwrap();
+    std::fs::write(dest.join(".iter/.engine/tempsweep_schedule_seeded"), "test").unwrap();
+    std::fs::write(
+        dest.join("main.iter.md"),
+        "---\nprojectname: \"Closed Item Test\"\nprojectdescription: \"d\"\n---\nbody\n",
+    )
+    .unwrap();
+
+    let port = 43000 + (std::process::id() % 2000) as u16;
+    let mut child = Command::new(BIN)
+        .args(["start", "--project", dest.to_str().unwrap(), "--port", &port.to_string()])
+        .env("ITER_CLAUDE_BIN", "/usr/bin/false")
+        .env("HOME", &dest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "server never came up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Create an item, then close it by completing it — the archive path.
+    let created = http(port, "POST", "/api/workitems", Some(r#"{"type":"code","title":"doomed","mainwork":"m","state":"todo"}"#));
+    let body = created.split("\r\n\r\n").nth(1).unwrap_or("");
+    let id = serde_json::from_str::<serde_json::Value>(body).unwrap()["workid"].as_str().unwrap().to_string();
+    let done = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"complete"}"#));
+    assert!(done.contains("complete"), "{}", done);
+
+    // A non-delete verb on an archived item: refused, and the refusal explains.
+    let retry = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"queue"}"#));
+    assert!(retry.contains("409"), "queueing a closed item must refuse: {}", retry);
+    assert!(
+        retry.contains("closed") && retry.contains("clone"),
+        "the message must say it is closed and what to do instead: {}",
+        retry
+    );
+    assert!(!retry.contains("no such open work item"), "that message is the bug: {}", retry);
+
+    // Delete now reaches the archive.
+    let del = http(port, "POST", &format!("/api/workitems/{}/action", id), Some(r#"{"action":"delete"}"#));
+    assert!(del.contains("deleted"), "a closed item must be deletable: {}", del);
+    let list = http(port, "GET", "/api/workitems", None);
+    let parsed: serde_json::Value =
+        serde_json::from_str(list.split("\r\n\r\n").nth(1).unwrap_or("")).expect("list parses");
+    assert!(
+        !parsed["closed"].as_array().unwrap().iter().any(|i| i["workid"] == id.as_str()),
+        "the archive entry is really gone"
+    );
+
+    let _ = http(port, "POST", "/api/engine", Some(r#"{"action":"shutdown"}"#));
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
 #[test]
 fn api_crud_history_markers_and_settings() {
     let dest = std::env::temp_dir().join(format!("iterloop-e2e-api-{}", std::process::id()));
@@ -634,9 +872,10 @@ fn api_crud_history_markers_and_settings() {
     )
     .unwrap();
     std::fs::write(dest.join("svc/bizreq.iter.md"), "---\nname: svc reqs\ndescription: d\nchildren:\n  reqpaths: []\n---\nBR-1\n").unwrap();
-    // Keep the queue deterministic for the cap assertions: pre-flag the
-    // Orphanage-review schedule as seeded so `iter start` adds nothing.
+    // Keep the queue deterministic for the cap assertions: pre-flag BOTH daily
+    // housekeeping schedules as seeded so `iter start` adds nothing of its own.
     std::fs::write(dest.join(".iter/.engine/orphan_schedule_seeded"), "test").unwrap();
+    std::fs::write(dest.join(".iter/.engine/tempsweep_schedule_seeded"), "test").unwrap();
 
     let port = 22000 + (std::process::id() % 20000) as u16;
     let mut child = Command::new(BIN)
