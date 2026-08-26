@@ -170,12 +170,18 @@ pub fn find_active_lock(codepath: &Path, ignore: &[String], now: DateTime<Utc>) 
 /// An ancestor lock whose `ignore` patterns exclude `codepath` does not cover it —
 /// the walk continues upward past it.
 pub fn find_ancestor_lock(codepath: &Path, now: DateTime<Utc>) -> Option<PathBuf> {
+    find_ancestor_lock_info(codepath, now).map(|(p, _)| p)
+}
+
+/// Same probe, keeping the lock's contents — the caller usually wants to name
+/// WHO holds it, not just that something does.
+pub fn find_ancestor_lock_info(codepath: &Path, now: DateTime<Utc>) -> Option<(PathBuf, CodepathLockInfo)> {
     let mut dir = Some(codepath.to_path_buf());
     while let Some(d) = dir {
         if let Some((p, info)) = check_lock_file(&d.join(CODEPATH_LOCK_NAME), now) {
             let rel = codepath.strip_prefix(&d).unwrap_or(Path::new(""));
             if !ignored(rel, &info.ignore) {
-                return Some(p);
+                return Some((p, info));
             }
         }
         dir = d.parent().map(|p| p.to_path_buf());
@@ -253,6 +259,77 @@ pub fn acquire_codepath_lock(
     Ok(CodepathLock { path, workid: workid.to_string() })
 }
 
+/// Every `.iter.lock` under `root`, with its contents. Skips the directories a
+/// lock never lives in, so this is cheap enough to run at startup.
+pub fn collect_all(root: &Path, out: &mut Vec<(PathBuf, CodepathLockInfo)>) {
+    if let Some((p, info)) = std::fs::read_to_string(root.join(CODEPATH_LOCK_NAME))
+        .ok()
+        .and_then(|t| serde_json::from_str::<CodepathLockInfo>(&t).ok())
+        .map(|i| (root.join(CODEPATH_LOCK_NAME), i))
+    {
+        out.push((p, info));
+    }
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".git" || name == "target" || name == "node_modules" {
+            continue;
+        }
+        collect_all(&path, out);
+    }
+}
+
+/// Is a process still running? Unknown answers count as ALIVE — this only ever
+/// authorizes deleting someone's lock, so uncertainty must not.
+///
+/// `ps -p`, not `kill -0`: kill exits nonzero both for "no such process" and for
+/// "not yours to signal", so a lock written by another user's engine would read
+/// as dead. `ps` reports existence regardless of owner.
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
+}
+
+/// Startup crash recovery, second half: an engine killed mid-run leaves its
+/// items' `.iter.lock` files on disk. `workitems::recover_orphans` moves those
+/// items back to `queued`, but the abandoned lock kept blocking their scope —
+/// and everything under it — until the timeout expired, up to an hour later. A
+/// whole-tree scope meant the engine ran ONE item at a time until then.
+///
+/// Deliberately narrow: a lock is dropped only when it belongs to an item we
+/// just recovered AND its writing process is gone. A lock held by a live engine
+/// is never touched, whoever owns it.
+pub fn release_orphaned(code_root: &Path, recovered: &[String]) -> Vec<(PathBuf, String)> {
+    if recovered.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    collect_all(code_root, &mut found);
+    let mut freed = Vec::new();
+    for (path, info) in found {
+        if !recovered.contains(&info.workid) || pid_alive(info.pid) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            freed.push((path, info.workid));
+        }
+    }
+    freed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +339,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The other half of startup recovery: a lock abandoned by a dead engine is
+    /// released, and one held by a live process is never touched — otherwise a
+    /// second engine's running item would have its scope stolen.
+    #[test]
+    fn orphaned_locks_are_released_live_ones_are_not() {
+        let dir = tmpdir("orphan");
+        for d in ["dead", "alive", "other"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let write = |sub: &str, workid: &str, pid: u32| {
+            let info = CodepathLockInfo {
+                workid: workid.into(),
+                agent: "code".into(),
+                pid,
+                created: crate::workitems::now_iso(),
+                timeout: (Utc::now() + Duration::seconds(3600)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ignore: vec![],
+            };
+            std::fs::write(dir.join(sub).join(CODEPATH_LOCK_NAME), serde_json::to_string(&info).unwrap()).unwrap();
+        };
+        // pid 1 always exists; a pid this process just reaped does not. 999999
+        // is beyond the default pid_max on macOS and Linux alike.
+        write("dead", "w-orphan", 999_999);
+        write("alive", "w-orphan", 1);
+        write("other", "w-elsewhere", 999_999);
+
+        let freed = release_orphaned(&dir, &["w-orphan".to_string()]);
+        assert_eq!(freed.len(), 1, "exactly one lock qualifies: {:?}", freed);
+        assert!(freed[0].0.starts_with(dir.join("dead")), "{:?}", freed);
+        assert!(!dir.join("dead").join(CODEPATH_LOCK_NAME).exists(), "the abandoned lock is gone");
+        assert!(dir.join("alive").join(CODEPATH_LOCK_NAME).exists(), "a live process keeps its lock");
+        assert!(dir.join("other").join(CODEPATH_LOCK_NAME).exists(), "another item's lock is not ours to free");
+        // Nothing recovered → nothing touched, however dead the pids are.
+        assert!(release_orphaned(&dir, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

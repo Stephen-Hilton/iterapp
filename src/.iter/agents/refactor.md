@@ -42,6 +42,10 @@ so this command works from any codepath.)
 
 - Set `source` to `agent: refactor`. Typical handoffs: `testwriter` for coverage gaps,
   `code` for bugs discovered mid-refactor.
+- Write each item's `mainwork` in the three-tier request format (shared rule
+  "Authoring `mainwork` (request) text"): a few plain-language sentences —
+  where in the codebase, what must change, why; then one-line hierarchical
+  bullets; agent-only detail last.
 - If the add refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output

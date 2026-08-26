@@ -97,6 +97,28 @@ enum Command {
         /// Unset inherits the creating parent's mode (user items: review)
         #[arg(long)]
         automation: Option<String>,
+        /// Raise this item as a QUESTION for the human instead of work to run:
+        /// the text is the decision needed (context, options, your pick) and
+        /// the item is born in the `question` state, whatever the automation
+        /// mode says. It queues when a human answers it in the webapp
+        #[arg(long)]
+        question: Option<String>,
+    },
+    /// Ask the human a question from inside a running work item ($ITER_WORKID):
+    /// the CALLING item parks in the `question` state carrying your text, and
+    /// queues itself again once a human answers it in the webapp. Use when a
+    /// decision only a person can make blocks the work — no retries are burned
+    /// and the turns you already ran are kept as the research behind the ask.
+    Ask {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// The question: context, the decision, two to four researched options
+        /// with their trade-offs, and which one you recommend
+        #[arg(long)]
+        question: Option<String>,
+        /// Read the question from a file instead (for anything multi-paragraph)
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
     /// Synchronous critical review: runs the `_critic.md` persona as a subprocess
     /// and prints its feedback to stdout — no work items involved
@@ -331,9 +353,10 @@ fn main() {
     let code = match cli.command {
         Command::Start { project, port } => cmd_start(project, port),
         Command::Run { project, once, until_idle } => cmd_run(project, once, until_idle),
-        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation } => {
-            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation)
+        Command::Add { project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation, question } => {
+            cmd_add(project, file, item_type, title, mainwork, codepath, codepath_ignore, priority, risk, source, source_testgroup, depends_on, depends_on_shallow, automation, question)
         }
+        Command::Ask { project, question, file } => cmd_ask(project, question, file),
         Command::Critreview { project, file, context, max_retry } => {
             cmd_critreview(project, file, context, max_retry)
         }
@@ -502,6 +525,7 @@ fn cmd_add(
     depends_on: Vec<String>,
     depends_on_shallow: bool,
     automation: Option<String>,
+    question: Option<String>,
 ) -> i32 {
     let cfg = config::load(&project);
     let mut item: WorkItem = match &file {
@@ -552,6 +576,9 @@ fn cmd_add(
     if let Some(v) = automation {
         item.automation = v;
     }
+    if let Some(v) = question {
+        item.question = v;
+    }
     // A typo'd mode silently meaning "review" is the wrong failure mode.
     let mode = item.automation.trim().to_string();
     if !mode.is_empty() && mode != workitems::AUTOMATION_REVIEW && mode != workitems::AUTOMATION_AUTO {
@@ -588,6 +615,20 @@ fn cmd_add(
         }
     }
 
+    // A file as a codepath is wrong the moment it is written — refuse it here
+    // rather than at dispatch hours later (the engine cannot lock a file, and a
+    // file scope inherits its parent directory's conflicts).
+    item.normalize_codepaths();
+    let code_root = config::code_root(&project, &cfg);
+    if let Err(e) = scheduler::reject_file_codepath(&code_root, &item) {
+        eprintln!("error: {}", e);
+        return 2;
+    }
+    // Warned, never refused: a whole-tree lock is sometimes exactly right.
+    if let Some(w) = scheduler::whole_tree_warning(&code_root, &item) {
+        eprintln!("warning: {}", w);
+    }
+
     // Warn at add, enforce at pick.
     let known: Vec<String> = agents::discover(&project).into_iter().map(|a| a.type_name).collect();
     if !known.is_empty() && !known.contains(&item.item_type) {
@@ -607,6 +648,25 @@ fn cmd_add(
     // auto → queued (fully automated). Prompts do not decide state: a
     // prompt-written todo/queued is overridden (and said so); an explicit
     // `paused` survives. Guards applied below (non-convergence) still win.
+    // A question outranks the automation mode (features/Question_state.md): an
+    // item that exists to get a human decision is a human gate by definition, so
+    // `automation: auto` must not queue it unanswered. Stated out loud, like the
+    // automation override below.
+    // An item that arrives with the answer ALREADY on it (a clone of an answered
+    // item, a hand-authored replay) is not waiting on anybody — only an
+    // unanswered question parks.
+    let asks_question = !item.question.trim().is_empty() && item.answer.trim().is_empty();
+    if asks_question && item.state != workitems::STATE_QUESTION {
+        if item.state != workitems::STATE_QUEUED {
+            eprintln!(
+                "note: state \"{}\" overridden to \"question\" — an item carrying a question waits for a human answer",
+                item.state
+            );
+        }
+        item.state = workitems::STATE_QUESTION.into();
+        item.times.asked = workitems::now_iso();
+    }
+
     let in_workitem = std::env::var("ITER_WORKID").ok().filter(|w| !w.is_empty());
     if let Some(parent_id) = &in_workitem {
         if item.automation.trim().is_empty() {
@@ -1035,6 +1095,67 @@ fn cmd_reject(project: PathBuf, reason: String) -> i32 {
     }
 }
 
+/// Question-flag writer (`iter ask`, features/Question_state.md): the same
+/// file-flag pattern as reject, but the engine parks the item in `question`
+/// instead of `todo` — waiting on a person, not on a re-evaluation. Requires
+/// ITER_WORKID: outside an engine run there is no item to park (create a
+/// standalone question with `iter add --question` instead).
+fn cmd_ask(project: PathBuf, question: Option<String>, file: Option<PathBuf>) -> i32 {
+    let workid = std::env::var("ITER_WORKID").unwrap_or_default();
+    if workid.is_empty() {
+        eprintln!(
+            "error: ITER_WORKID is not set — iter ask parks the CALLING work item, so it only works \
+             inside an engine-run item. To raise a standalone question, use: iter add --question \"...\""
+        );
+        return 2;
+    }
+    let text = match (&question, &file) {
+        (Some(_), Some(_)) => {
+            eprintln!("error: pass either --question or --file, not both");
+            return 2;
+        }
+        (Some(q), None) => q.clone(),
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: cannot read the question from {}: {}", path.display(), e);
+                return 1;
+            }
+        },
+        (None, None) => {
+            eprintln!("error: --question \"<text>\" or --file <path> is required");
+            return 2;
+        }
+    };
+    let text = text.trim();
+    // A question with no options is a question the human has to research
+    // themselves — the whole point is that the agent already did that work.
+    if text.len() < 40 {
+        eprintln!(
+            "error: the question is too short to be answerable. State the context, the decision, \
+             two to four researched options with their trade-offs, and which one you recommend"
+        );
+        return 2;
+    }
+    let path = scheduler::question_path(&project, &workid);
+    match std::fs::write(&path, text) {
+        Ok(()) => {
+            println!(
+                "work item {} flagged with a question; the engine parks it in the `question` state at \
+                 this turn's boundary, and it queues again when a human answers it in the webapp. \
+                 Summarize the question and your research in your output and finish the turn — do no \
+                 further work on it.",
+                workid
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("error: cannot write question flag {}: {}", path.display(), e);
+            1
+        }
+    }
+}
+
 /// Record-level `children.codenodes` editor for use-case files (structureV2:
 /// codenodes replaced the V1 participants list). Applies removes then adds
 /// (deduped) and rewrites only the codenodes sub-key — the rest of the
@@ -1353,7 +1474,7 @@ fn cmd_status(project: PathBuf) -> i32 {
     let items = queue.load();
     let count = |s: &str| items.iter().filter(|i| i.state == s).count();
     println!("queue: {} open", items.len());
-    for state in ["queued", "in-progress", "paused", "failed", "todo"] {
+    for state in ["queued", "in-progress", "paused", "failed", "todo", "question"] {
         let n = count(state);
         if n > 0 {
             println!("  {}: {}", state, n);
@@ -1375,7 +1496,11 @@ fn cmd_status(project: PathBuf) -> i32 {
         println!(
             "  [{}] {} \"{}\" type={} prio={} source={} attempts={}{}",
             item.state,
-            &item.workid.chars().take(8).collect::<String>(),
+            // The LAST 12 — the house convention the webapp header, the
+            // dependency notes, and `--depends-on` suffixes all use. Printing
+            // the first 8 here meant the CLI and the UI shared no characters,
+            // so neither id could be pasted into the other.
+            workitems::short12(&item.workid),
             item.title,
             item.item_type,
             item.priority,

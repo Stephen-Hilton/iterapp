@@ -92,6 +92,10 @@ so this command works from any codepath.)
 - Set `source` to `agent: plan`, `type` to the target agent, and `codepath` to the
   narrowest directory the work owns (this is the lock scope — narrower = more
   parallelism). Never set `state` — the automation mode decides (shared rule).
+- Write each item's `mainwork` in the three-tier request format (shared rule
+  "Authoring `mainwork` (request) text"): a few plain-language sentences first —
+  where in the codebase, what must change, why; then the specifics as one-line
+  hierarchical bullets; agent-only detail (commands, ids, raw listings) last.
 - The test directory name comes from `globalsettings.test_dir` (exported as
   `$ITER_TEST_DIR`); never guess it. The engine also enforces code/testwriter
   scope disjointness deterministically — but write it correctly anyway.

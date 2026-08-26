@@ -325,6 +325,7 @@ fn api_state(project: &Path, engine: &Engine, port: u16) -> Resp {
                 "queued": count(workitems::STATE_QUEUED),
                 "in-progress": count(workitems::STATE_IN_PROGRESS),
                 "todo": count(workitems::STATE_TODO),
+                "question": count(workitems::STATE_QUESTION),
                 "paused": count(workitems::STATE_PAUSED),
                 "failed": count(workitems::STATE_FAILED)
                     + closed.iter().filter(|i| i.state == workitems::STATE_FAILED).count(),
@@ -420,10 +421,17 @@ fn api_list(project: &Path) -> Resp {
     // Dependency-gated items get their gate's live status injected (computed
     // against the FULL closed archive, before truncation), so the webapp header
     // can show the blocked-by chain without re-deriving engine semantics.
+    // The picker's own skip reasons (written each tick). A dependency gate has
+    // always had a chip; a LOCK gate had nothing, so a queue full of runnable
+    // work with one agent on it looked like the engine ignoring it.
+    let blocked = crate::scheduler::read_blocked(project);
     let open_vals: Vec<Value> = open
         .iter()
         .map(|i| {
             let mut v = serde_json::to_value(i).expect("workitem serializes");
+            if let Some(b) = blocked.get(&i.workid) {
+                v["lock_status"] = serde_json::to_value(b).unwrap_or(Value::Null);
+            }
             if !i.depends_on.is_empty() {
                 let (state, by) = match workitems::dep_status(i, &open, &closed) {
                     workitems::DepStatus::Satisfied => ("ok", Value::Null),
@@ -470,8 +478,16 @@ fn api_create(req: &Req, project: &Path) -> Resp {
         if !matches!(item.state.as_str(), "scheduled" | "paused") {
             item.state = workitems::STATE_SCHEDULED.into();
         }
-    } else if !matches!(item.state.as_str(), "queued" | "todo" | "paused") {
+    } else if !matches!(item.state.as_str(), "queued" | "todo" | "paused" | "question") {
         item.state = workitems::STATE_QUEUED.into();
+    }
+    // A question needs a question (features/Question_state.md) — an empty one
+    // parks the item in a bucket that tells nobody anything.
+    if item.state == workitems::STATE_QUESTION && item.question.trim().is_empty() {
+        return err_resp(400, "a work item in the question state needs a question");
+    }
+    if item.state == workitems::STATE_QUESTION && item.times.asked.is_empty() {
+        item.times.asked = workitems::now_iso();
     }
     {
         let mode = item.automation.trim();
@@ -479,6 +495,12 @@ fn api_create(req: &Req, project: &Path) -> Resp {
             return err_resp(400, &format!("automation must be \"review\" or \"auto\" (got \"{}\")", mode));
         }
     }
+    item.normalize_codepaths();
+    let code_root = config::code_root(project, &cfg);
+    if let Err(e) = crate::scheduler::reject_file_codepath(&code_root, &item) {
+        return err_resp(400, &e);
+    }
+    let tree_warning = crate::scheduler::whole_tree_warning(&code_root, &item);
     if !item.depends_on.is_empty() {
         // Schedules are cadence-driven; mixing gates and cadence invites a
         // silent never-runs, so templates never carry dependencies.
@@ -493,7 +515,11 @@ fn api_create(req: &Req, project: &Path) -> Resp {
     }
     let known: Vec<String> = crate::agents::discover(project).into_iter().map(|a| a.type_name).collect();
     let warning = (item.exec != workitems::EXEC_SHELL && !known.is_empty() && !known.contains(&item.item_type))
-        .then(|| format!("type \"{}\" matches no agent in .iter/agents/", item.item_type));
+        .then(|| format!("type \"{}\" matches no agent in .iter/agents/", item.item_type))
+        .into_iter()
+        .chain(tree_warning)
+        .collect::<Vec<_>>();
+    let warning = (!warning.is_empty()).then(|| warning.join(" · "));
     if let Err(e) = queue.append(&item) {
         return err_resp(500, &format!("cannot append: {}", e));
     }
@@ -516,37 +542,73 @@ fn api_get(project: &Path, id: &str) -> Resp {
 }
 
 const EDITABLE: &[&str] = &[
-    "title", "type", "priority", "risk", "source", "codepath", "codepath_ignore", "context", "testfiles", "prework",
-    "postwork", "mainwork", "exec", "sched", "depends_on", "depends_on_shallow", "automation",
+    "title", "type", "priority", "risk", "source", "codepath", "codepaths", "codepath_ignore", "context", "testfiles",
+    "prework", "postwork", "mainwork", "exec", "sched", "depends_on", "depends_on_shallow", "automation", "question",
+    "answer",
+];
+
+/// States whose items a PATCH may rewrite. `queued` is included: an item that
+/// is merely WAITING has nothing in flight to corrupt, and excluding it meant a
+/// malformed lock scope could only be repaired by delete-and-recreate. The
+/// check runs inside the record lock, so an item the picker claims first is
+/// already `in-progress` here and refuses — the engine still owns running work.
+const PATCHABLE: &[&str] = &[
+    workitems::STATE_TODO,
+    workitems::STATE_PAUSED,
+    workitems::STATE_SCHEDULED,
+    workitems::STATE_QUESTION,
+    workitems::STATE_QUEUED,
 ];
 
 fn api_patch(req: &Req, project: &Path, id: &str) -> Resp {
     let Ok(Value::Object(patch)) = serde_json::from_slice::<Value>(&req.body) else {
         return err_resp(400, "body must be a JSON object of editable fields");
     };
+    // A field the server does not edit must not answer 200 — a caller that
+    // patches `codepaths` (or a typo'd key) and reads the item back unchanged
+    // has been told the write succeeded when nothing happened.
+    let unknown: Vec<&str> =
+        patch.keys().map(|k| k.as_str()).filter(|k| !EDITABLE.contains(k)).collect();
+    if !unknown.is_empty() {
+        return err_resp(
+            400,
+            &format!("not an editable field: {} (editable: {})", unknown.join(", "), EDITABLE.join(", ")),
+        );
+    }
+    let cfg = config::load(project);
+    let code_root = config::code_root(project, &cfg);
     let queue = queue_for(project);
     let closed = queue.load_closed();
     let result = queue.with_lock(|items| {
         let Some(pos) = items.iter().position(|i| i.workid == id) else {
             return Err((404, "no such open work item".to_string()));
         };
-        if items[pos].state != workitems::STATE_TODO
-            && items[pos].state != workitems::STATE_PAUSED
-            && items[pos].state != workitems::STATE_SCHEDULED
-        {
-            return Err((409, format!("only todo/paused/scheduled items are editable (state: {})", items[pos].state)));
+        if !PATCHABLE.contains(&items[pos].state.as_str()) {
+            return Err((
+                409,
+                format!("{} items are not editable (editable: {})", items[pos].state, PATCHABLE.join("/")),
+            ));
         }
         let mut v = serde_json::to_value(&items[pos]).expect("serializes");
         for (key, val) in &patch {
-            if EDITABLE.contains(&key.as_str()) {
-                v[key] = val.clone();
-            }
+            v[key] = val.clone();
+        }
+        // Setting the singular `codepath` alone means "this is the scope now".
+        // Without clearing the stored list, normalize_codepaths would resolve
+        // the disagreement the other way — codepaths[0] silently overwriting
+        // the edit the caller just made.
+        if patch.contains_key("codepath") && !patch.contains_key("codepaths") {
+            v["codepaths"] = json!([]);
         }
         match serde_json::from_value::<WorkItem>(v) {
             Ok(mut updated) => {
                 let mode = updated.automation.trim();
                 if !mode.is_empty() && mode != workitems::AUTOMATION_REVIEW && mode != workitems::AUTOMATION_AUTO {
                     return Err((400, format!("automation must be \"review\" or \"auto\" (got \"{}\")", mode)));
+                }
+                updated.normalize_codepaths();
+                if let Err(e) = crate::scheduler::reject_file_codepath(&code_root, &updated) {
+                    return Err((400, e));
                 }
                 if !updated.depends_on.is_empty() {
                     if !updated.sched.is_none() {
@@ -565,7 +627,10 @@ fn api_patch(req: &Req, project: &Path, id: &str) -> Resp {
         }
     });
     match result {
-        Ok(Ok(item)) => json_resp(200, json!({ "item": item })),
+        Ok(Ok(item)) => {
+            let warning = crate::scheduler::whole_tree_warning(&code_root, &item);
+            json_resp(200, json!({ "item": item, "warning": warning }))
+        }
         Ok(Err((code, msg))) => err_resp(code, &msg),
         Err(e) => err_resp(500, &e.to_string()),
     }
@@ -627,6 +692,39 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
                 items[pos].state = workitems::STATE_TODO.into();
                 Ok(json!({ "state": "todo" }))
             }
+            // features/Question_state.md — the human's half of the round trip.
+            // Storing the answer IS the transition: the item queues with the
+            // decision in hand (the engine prepends the Q&A to its mainwork
+            // turn). `queue: false` saves a half-formed reply without running it.
+            "answer" => {
+                let answer = body.get("answer").and_then(|a| a.as_str()).unwrap_or("").trim();
+                if answer.is_empty() {
+                    return Err((400, "an answer needs text — that text is what the agent acts on".to_string()));
+                }
+                if items[pos].question.trim().is_empty() {
+                    return Err((409, "this work item carries no question to answer".to_string()));
+                }
+                items[pos].answer = answer.to_string();
+                items[pos].times.answered = workitems::now_iso();
+                let queue_it = body.get("queue").and_then(|q| q.as_bool()).unwrap_or(true);
+                if queue_it {
+                    items[pos].state = workitems::STATE_QUEUED.into();
+                    items[pos].lasterror.clear();
+                }
+                Ok(json!({ "state": items[pos].state, "answered": items[pos].times.answered }))
+            }
+            // Park an item as a question (the human's own escalation, or a
+            // re-park after editing the question text).
+            "question" => {
+                if items[pos].question.trim().is_empty() {
+                    return Err((400, "a work item in the question state needs a question".to_string()));
+                }
+                items[pos].state = workitems::STATE_QUESTION.into();
+                if items[pos].times.asked.is_empty() {
+                    items[pos].times.asked = workitems::now_iso();
+                }
+                Ok(json!({ "state": "question" }))
+            }
             "pause" => {
                 items[pos].state = workitems::STATE_PAUSED.into();
                 Ok(json!({ "state": "paused" }))
@@ -661,7 +759,10 @@ fn api_action(req: &Req, project: &Path, id: &str) -> Resp {
                 items.push(copy);
                 Ok(json!({ "state": "todo", "workid": workid }))
             }
-            _ => Err((400, "action must be queue|todo|pause|schedule|complete|delete|clone|stop".to_string())),
+            _ => Err((
+                400,
+                "action must be queue|todo|pause|schedule|answer|question|complete|delete|clone|stop".to_string(),
+            )),
         }
     });
     match result {

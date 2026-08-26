@@ -98,6 +98,10 @@ so this command works from any codepath.)
 
 - Set `source` to `agent: ingest`, and attach the normalized requirement files you wrote
   to each new item's `context` so downstream agents inherit them.
+- Write each item's `mainwork` in the three-tier request format (shared rule
+  "Authoring `mainwork` (request) text"): a few plain-language sentences —
+  where in the codebase, what must change, why; then one-line hierarchical
+  bullets; agent-only detail last.
 - If the add refuses (queue at `max_open_workitems`), note it in your output.
 
 ## Output

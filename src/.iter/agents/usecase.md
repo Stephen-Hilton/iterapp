@@ -89,7 +89,10 @@ do NOT grind out a use-case you believe is invalid.
          --title "plan: build out C4 objects for usecase <name>" \
          --mainwork "<the use-case, the full list of missing objects, and the reqs constraints that shaped it>"
 
-   Set `source` to `agent: usecase` when using `--file`. In the plan mainwork,
+   Set `source` to `agent: usecase` when using `--file`. Write the plan item's
+   mainwork in the three-tier request format (shared rule "Authoring `mainwork`
+   (request) text"): plain-language sentences first — where, what, why; then
+   one-line hierarchical bullets; agent-only detail last. In the plan mainwork,
    instruct that each built node gets linked back into the use-case file via
    `"$ITER_BIN" usecase --file <usecase file> --add "<code file path>"` AND
    re-entered into the Test Loop via `"$ITER_BIN" teststate --include "<ref>"`

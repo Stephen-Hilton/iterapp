@@ -62,6 +62,17 @@ case "$args" in
     ;;
 esac
 case "$args" in
+  *ASK_TRIGGER*)
+    # features/Question_state.md: ask the first time round; once the human's
+    # answer is in the prompt (ANSWERED_MARKER), record the prompt and work.
+    case "$args" in
+      *ANSWERED_MARKER*) printf '%s' "$args" > "$ITER_PROJECT/ask-prompt.txt";;
+      *) "$ITER_BIN" ask --project "$ITER_PROJECT" \
+           --question "Storage for the ledger: A) sqlite, small and dependency-free; B) postgres, scales but needs a server. I recommend A." >/dev/null 2>&1;;
+    esac
+    ;;
+esac
+case "$args" in
   *FAIL_TRIGGER*) echo "stub failure" >&2; exit 1;;
 esac
 echo '{"type":"result","session_id":"fake-sess-1","result":"fake agent output"}'
@@ -238,6 +249,174 @@ fn failure_retries_then_terminal_close() {
     assert_eq!(item["attempts"], 2, "max_attempts=2 → exactly 2 attempts");
     assert!(item["lasterror"].as_str().unwrap().contains("mainwork"));
     assert!(!item["times"]["closed"].as_str().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// features/Question_state.md, the whole round trip: an agent hits a decision
+/// only a human can make → `iter ask` parks the item in `question` → the human
+/// answers → the item queues itself → the NEXT run gets the question and the
+/// answer at the top of its request and finishes the work.
+#[test]
+fn ask_parks_for_a_human_then_the_answer_reaches_the_agent() {
+    let (root, stub) = setup_project("ask", 3, 200);
+    seed(&root, &workitem_json("e2e-ask-1", "code", "needs a decision", "./src", "build it ASK_TRIGGER", "", ""));
+
+    // --- the ask
+    run_engine(&root, &stub, Duration::from_secs(60));
+
+    assert!(closed_items(&root).is_empty(), "an asked question is not a closed item");
+    let open = open_items(&root);
+    assert_eq!(open.len(), 1);
+    let parked = &open[0];
+    assert_eq!(parked["state"], "question", "the item parks for a human, not in todo and not failed");
+    assert!(parked["question"].as_str().unwrap().contains("sqlite"), "the agent's text is stored verbatim");
+    assert!(parked["answer"].as_str().is_none(), "nothing answered yet");
+    assert_eq!(parked["attempts"], 0, "asking burns no attempt");
+    assert!(!parked["times"]["asked"].as_str().unwrap().is_empty());
+    assert!(!root.join("ask-prompt.txt").exists(), "the agent has not been given an answer to act on");
+
+    // A parked question is inert: the engine finds nothing to do.
+    run_engine(&root, &stub, Duration::from_secs(30));
+    assert_eq!(open_items(&root)[0]["state"], "question", "still parked — questions are never auto-dispatched");
+
+    // --- the human answers (what the webapp's Answer and Queue does)
+    let mut item = open_items(&root).remove(0);
+    item["answer"] = serde_json::json!("Go with A, sqlite. ANSWERED_MARKER");
+    item["state"] = serde_json::json!("queued");
+    item["times"]["answered"] = serde_json::json!("2026-08-24T18:00:00Z");
+    std::fs::write(root.join(".iter/.engine/workitems.jsonl"), format!("{}\n", item)).unwrap();
+
+    // --- the answered run
+    run_engine(&root, &stub, Duration::from_secs(60));
+
+    let prompt = std::fs::read_to_string(root.join("ask-prompt.txt")).expect("the answered run reached mainwork");
+    assert!(prompt.contains("A question on this work item was answered"), "the block is composed into the turn");
+    assert!(prompt.contains("sqlite, small and dependency-free"), "the agent sees what was ASKED");
+    assert!(prompt.contains("Go with A, sqlite"), "the agent sees what was DECIDED");
+    assert!(prompt.contains("build it ASK_TRIGGER"), "the original request is still there, unrewritten");
+
+    let closed = closed_items(&root);
+    assert_eq!(closed.len(), 1, "the answered item runs to completion");
+    assert_eq!(closed[0]["state"], "complete");
+    assert!(closed[0]["question"].as_str().unwrap().contains("sqlite"), "the Q&A survives on the closed record");
+    assert!(closed[0]["answer"].as_str().unwrap().contains("Go with A"));
+
+    // The guard proves it can fail: outside an engine run there is no item to park.
+    let out = Command::new(BIN)
+        .args(["ask", "--project", root.to_str().unwrap(), "--question",
+               "Which storage backend should the ledger use, sqlite or postgres?"])
+        .env_remove("ITER_WORKID")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "iter ask outside a work item must refuse");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ITER_WORKID"));
+
+    // ...and so does the "do the research first" bar.
+    let out = Command::new(BIN)
+        .args(["ask", "--project", root.to_str().unwrap(), "--question", "sqlite or postgres?"])
+        .env("ITER_WORKID", "e2e-ask-1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "a one-line question with no options must refuse");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `iter add --question` raises a STANDALONE question: it lands in `question`
+/// whatever the automation mode says, because a question is a human gate by
+/// definition (features/Question_state.md).
+#[test]
+fn add_question_lands_in_the_question_state_over_automation() {
+    let (root, _stub) = setup_project("addq", 3, 200);
+    let q = "Which storage backend for the ledger: A) sqlite, no server; B) postgres, scales. I recommend A.";
+
+    let out = Command::new(BIN)
+        .args(["add", "--project", root.to_str().unwrap(), "--type", "code", "--title", "storage?",
+               "--mainwork", "implement whichever is chosen", "--automation", "auto", "--question", q])
+        .env("ITER_WORKID", "some-auto-parent")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+
+    let open = open_items(&root);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0]["state"], "question", "automation:auto must not queue an unanswered question");
+    assert_eq!(open[0]["question"], q);
+    assert!(!open[0]["times"]["asked"].as_str().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Field-report regressions (pdy-dev, 2026-08-25). A codepath is a LOCK SCOPE:
+/// a file can never be one, and a bad entry anywhere in the list must fail the
+/// item rather than masquerade as contention. Plus the id convention: `iter
+/// status` and the webapp must print ids that can be pasted into each other.
+#[test]
+fn codepath_guards_and_matching_short_ids() {
+    let (root, stub) = setup_project("cpguard", 3, 200);
+    std::fs::create_dir_all(root.join("comp")).unwrap();
+    std::fs::write(root.join("comp/comp.code.iter.md"), "marker file, not a directory\n").unwrap();
+    let add = |args: &[&str]| {
+        Command::new(BIN)
+            .args([&["add", "--project", root.to_str().unwrap()][..], args].concat())
+            .output()
+            .unwrap()
+    };
+
+    // A file as a codepath is refused where it is written, not hours later.
+    let out = add(&["--type", "code", "--title", "file scope", "--mainwork", "m", "--codepath", "./comp/comp.code.iter.md"]);
+    assert_eq!(out.status.code(), Some(2), "a file codepath must refuse at add");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is a file"), "{}", err);
+    assert!(err.contains(".iter.lock"), "the refusal explains WHY: {}", err);
+    assert!(open_items(&root).is_empty(), "nothing appended");
+
+    // A directory that does not exist YET is fine at add — an earlier item may
+    // still create it — so this one lands and is caught at dispatch instead.
+    let out = add(&["--type", "code", "--title", "future dir", "--mainwork", "m", "--codepath", "./not/made/yet"]);
+    assert_eq!(out.status.code(), Some(0), "a not-yet-created directory is legitimate work");
+
+    // The regression itself: a bad SECOND entry. Before the fix this skipped
+    // validation, hit the lock scan, logged "codepath busy" and requeued with
+    // its attempt refunded — forever, so max_attempts never tripped.
+    let json = root.join("multi.json");
+    std::fs::write(
+        &json,
+        format!(
+            r#"{{"workid":"e2e-cp-multi","title":"two scopes","type":"code","state":"queued","mainwork":"m",
+                 "codepaths":["{}","{}/gone"]}}"#,
+            root.display(),
+            root.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(add(&["--file", json.to_str().unwrap()]).status.code(), Some(0));
+
+    run_engine(&root, &stub, Duration::from_secs(60));
+
+    let multi = closed_items(&root)
+        .into_iter()
+        .find(|i| i["workid"] == "e2e-cp-multi")
+        .expect("a broken codepath list must FAIL the item, not requeue it forever");
+    assert_eq!(multi["state"], "failed");
+    assert_eq!(multi["attempts"], 3, "attempts advance, so max_attempts trips");
+    let why = multi["lasterror"].as_str().unwrap();
+    assert!(why.contains("codepath does not exist"), "{}", why);
+    assert!(why.contains("gone"), "the message names the offending entry: {}", why);
+
+    // `iter status` prints the last 12 — the same characters the webapp header,
+    // the dependency notes, and --depends-on suffixes use. Printing the first 8
+    // meant the CLI and the UI shared no characters at all.
+    seed(
+        &root,
+        &workitem_json("aaaaaaaa-1111-2222-3333-bbbbbbbbcccc", "code", "id shape", ".", "m", "", "")
+            .replace(r#""state":"queued""#, r#""state":"todo""#),
+    );
+    let status = Command::new(BIN).args(["status", "--project", root.to_str().unwrap()]).output().unwrap();
+    let text = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert!(text.contains("bbbbbbbbcccc"), "status must print the last 12: {}", text);
+    assert!(!text.contains("aaaaaaaa"), "the leading 8 are not what the webapp shows: {}", text);
 
     let _ = std::fs::remove_dir_all(&root);
 }

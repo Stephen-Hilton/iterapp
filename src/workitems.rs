@@ -11,6 +11,10 @@ pub const STATE_IN_PROGRESS: &str = "in-progress";
 pub const STATE_PAUSED: &str = "paused";
 pub const STATE_FAILED: &str = "failed";
 pub const STATE_COMPLETE: &str = "complete";
+/// Blocked on a human decision (features/Question_state.md): parked like `todo`
+/// — never picked by the loop — but carrying a `question` the agent raised and
+/// waiting for the `answer` that queues it again.
+pub const STATE_QUESTION: &str = "question";
 /// A schedule template (itersched.rs): never picked by the loop — itersched
 /// clones it into queued runs on cadence. Pausing it stops the schedule;
 /// completing it retires the schedule.
@@ -70,6 +74,12 @@ pub struct Times {
     pub mainworkdone: String,
     pub postworkdone: String,
     pub closed: String,
+    /// When the item entered the `question` state (features/Question_state.md).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub asked: String,
+    /// When a human answered — the moment the item became queueable again.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub answered: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +159,16 @@ pub struct WorkItem {
     pub mainwork: String,
     pub postwork: Vec<String>,
     pub output: String,
+    /// features/Question_state.md — the decision an agent needs a human to make:
+    /// context, the question, two to four researched recommendations, and the
+    /// agent's own pick. One string, one question; rendered as its own block.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub question: String,
+    /// The human's reply. Storing it beside the question (instead of editing it
+    /// into `mainwork`) keeps the pair as the durable record of the decision —
+    /// the engine injects both into the mainwork turn when the item runs.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub answer: String,
     pub attempts: u32,
     pub lasterror: String,
     pub times: Times,
@@ -183,6 +203,8 @@ impl Default for WorkItem {
             mainwork: String::new(),
             postwork: Vec::new(),
             output: String::new(),
+            question: String::new(),
+            answer: String::new(),
             attempts: 0,
             lasterror: String::new(),
             times: Times::default(),
@@ -546,17 +568,21 @@ fn append_to(path: &Path, line: &str) -> std::io::Result<()> {
 }
 
 /// Startup crash recovery: any in-progress item was orphaned by a dead engine.
-pub fn recover_orphans(queue: &Queue) -> std::io::Result<usize> {
+/// Returns the recovered workids — the caller releases the codepath locks those
+/// items left behind (locks::release_orphaned), which is the other half of the
+/// recovery: a requeued item whose abandoned lock still covers its scope cannot
+/// run, and neither can anything else underneath it.
+pub fn recover_orphans(queue: &Queue) -> std::io::Result<Vec<String>> {
     queue.with_lock(|items| {
-        let mut count = 0;
+        let mut recovered = Vec::new();
         for item in items.iter_mut() {
             if item.state == STATE_IN_PROGRESS {
                 item.state = STATE_QUEUED.into();
                 item.lasterror = format!("orphaned in-progress at engine startup {}", now_iso());
-                count += 1;
+                recovered.push(item.workid.clone());
             }
         }
-        count
+        recovered
     })
 }
 
@@ -759,8 +785,8 @@ mod tests {
         let cfg = Config::default();
         let queue = Queue::new(&root, &cfg);
         queue.append(&WorkItem { workid: "w1".into(), state: STATE_IN_PROGRESS.into(), ..Default::default() }).unwrap();
-        let n = recover_orphans(&queue).unwrap();
-        assert_eq!(n, 1);
+        let recovered = recover_orphans(&queue).unwrap();
+        assert_eq!(recovered, vec!["w1".to_string()], "the caller needs the ids to free their locks");
         assert_eq!(queue.load()[0].state, STATE_QUEUED);
         let _ = std::fs::remove_dir_all(&root);
     }

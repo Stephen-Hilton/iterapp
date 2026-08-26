@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +50,16 @@ struct Shared {
     /// Codepath-conflict backoff: workid → don't re-pick before this instant. Purely
     /// in-memory noise suppression; a restart just retries sooner.
     deferred: Mutex<HashMap<String, Instant>>,
+    /// CONSECUTIVE codepath-lock conflicts per workid, driving the escalating
+    /// backoff in `defer_after_conflict`. Reset the moment the item gets its
+    /// lock; pruned in pick_next when the item leaves the open queue.
+    conflicts: Mutex<HashMap<String, u32>>,
+    /// Why the last pick pass SKIPPED each queued item it could not run:
+    /// workid → the lock scope covering it and who holds it. The picker used to
+    /// skip silently, so a queue full of runnable-looking work with one agent on
+    /// it had no visible explanation. Published to `.iter/.engine/blocked.json`
+    /// each tick for the webapp, and summarized into the log when it changes.
+    blocked: Mutex<HashMap<String, Blocked>>,
     /// Resolved lock scopes of items currently running in THIS engine
     /// (workid → [(path, codepath_ignore)] — structureV2: an item may carry
     /// several codepaths and ALL are claimed). pick_next skips candidates that
@@ -106,6 +117,35 @@ pub fn stop_signal_path(project_root: &Path) -> PathBuf {
     config::engine_dir(project_root).join("stop.signal")
 }
 
+/// One queued item's lock gate, as the picker saw it on its last pass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Blocked {
+    /// The workid holding the covering scope (empty if the lock file is
+    /// unreadable, or belongs to an engine that is gone).
+    pub by: String,
+    /// The lock scope that covers this item's codepath.
+    pub path: String,
+    /// "running" — an item live in THIS engine; "lock" — an `.iter.lock` on
+    /// disk (another engine, or a leftover from a crash).
+    pub kind: String,
+}
+
+/// Where the picker publishes its skip reasons for the webapp to read.
+pub fn blocked_path(project_root: &Path) -> PathBuf {
+    config::engine_dir(project_root).join("blocked.json")
+}
+
+/// The lock gates recorded by the last pick pass. Empty when the engine is not
+/// picking (stopped, draining, or on a usage hold) — the file is cleared then,
+/// so a stale map can never make a runnable queue look blocked.
+pub fn read_blocked(project_root: &Path) -> HashMap<String, Blocked> {
+    std::fs::read_to_string(blocked_path(project_root))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
 /// Fail-flag written by `iter critreview` when a REQUESTED review could not be
 /// delivered (critic crash or usage limit): the engine consumes it at the next
 /// turn boundary and fails the work item deterministically, so a lost review is
@@ -130,6 +170,25 @@ fn take_reject(project_root: &Path, workid: &str) -> Option<String> {
     let _ = std::fs::remove_file(&path);
     let reason = reason.trim();
     Some(if reason.is_empty() { "rejected (no reason recorded)".to_string() } else { reason.to_string() })
+}
+
+/// Question-flag written by `iter ask` (features/Question_state.md): the agent
+/// hit a decision only a human can make. Same turn-boundary consumption as the
+/// reject flag, but the item lands in `question` with the text stored in its
+/// `question` field — parked until a person answers, then queued.
+pub fn question_path(project_root: &Path, workid: &str) -> PathBuf {
+    config::engine_dir(project_root).join(format!("question-{}.txt", workid))
+}
+
+fn take_question(project_root: &Path, workid: &str) -> Option<String> {
+    let path = question_path(project_root, workid);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 /// User-stop flag written by the webapp's Stop action on an IN-PROGRESS item
@@ -179,16 +238,38 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
         queue_mutex: Mutex::new(()),
         stop_now: AtomicBool::new(false),
         deferred: Mutex::new(HashMap::new()),
+        conflicts: Mutex::new(HashMap::new()),
+        blocked: Mutex::new(HashMap::new()),
         running_paths: Mutex::new(HashMap::new()),
         limit_hold: Mutex::new(None),
     });
 
-    // Startup crash recovery.
+    // Startup crash recovery — both halves: the items go back to `queued`, AND
+    // the codepath locks their dead engine abandoned are released. Leaving those
+    // behind used to block their own scope (and everything under it) until the
+    // lock timeout expired, so a restart mid-run could serialize the engine for
+    // an hour with no visible cause.
     {
         let _q = shared.queue_mutex.lock().unwrap();
         match workitems::recover_orphans(&shared.queue()) {
-            Ok(0) => {}
-            Ok(n) => logging::warn("engine", &format!("recovered {} orphaned in-progress item(s) back to queued", n)),
+            Ok(recovered) if recovered.is_empty() => {}
+            Ok(recovered) => {
+                logging::warn(
+                    "engine",
+                    &format!("recovered {} orphaned in-progress item(s) back to queued", recovered.len()),
+                );
+                let code_root = config::code_root(&project_root, &shared.cfg());
+                for (path, workid) in locks::release_orphaned(&code_root, &recovered) {
+                    logging::warn(
+                        "engine",
+                        &format!(
+                            "released the codepath lock {} abandoned by orphaned item {} (its engine is gone)",
+                            path.display(),
+                            short(&workid)
+                        ),
+                    );
+                }
+            }
             Err(e) => logging::error("engine", &format!("orphan recovery failed: {}", e)),
         }
     }
@@ -199,6 +280,8 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
     let mut draining = false;
     let mut tick: u64 = 0;
     let mut last_summary = String::new();
+    let mut last_summary_at = Instant::now();
+    let mut last_blocked: HashMap<String, Blocked> = HashMap::new();
     // Usage-tier throttle state (limits.rs).
     let mut last_tier_cap: Option<Option<usize>> = None;
     let mut stale_warned = false;
@@ -264,18 +347,39 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
         let usage = limits::read_snapshot(&cfg);
         let pct = usage.as_ref().map(|u| u.effective_pct(now_utc));
         let tier = pct.and_then(|p| limits::tier_cap(&cfg.limits, p));
+        let effective_max = tier.map_or(cfg.engine.max_total_agents, |c| c.min(cfg.engine.max_total_agents));
+        // The cap line carries its own inputs. Two of them are not obvious from
+        // the webapp header and made this line look non-deterministic in the
+        // field: the percentage that picks the band is the MAX of the two
+        // windows (each counted as 0 once its reset time has passed), not the
+        // 5h figure alone; and config.json is re-read every tick, so editing
+        // max_agents_at_NN moves the cap live at an unchanged percentage.
         if last_tier_cap != Some(tier) {
             match (tier, pct) {
-                (Some(cap), Some(p)) => logging::warn(
+                (Some(cap), Some(p)) => {
+                    let band = if p >= 95.0 { 95 } else if p >= 90.0 { 90 } else { 80 };
+                    let (h5, d7) = usage
+                        .as_ref()
+                        .map(|u| (u.five_hour_pct, u.seven_day_pct))
+                        .unwrap_or((0.0, 0.0));
+                    logging::warn(
+                        "engine",
+                        &format!(
+                            "account usage {:.0}% (5h {:.0}%, 7d {:.0}% — the throttle uses the higher, \
+                             reset windows counted as 0) → {}% band → max_agents_at_{} = {}; \
+                             effective max agents {} (max_total_agents {})",
+                            p, h5, d7, band, band, cap, effective_max, cfg.engine.max_total_agents
+                        ),
+                    )
+                }
+                (None, Some(p)) => logging::info(
                     "engine",
-                    &format!("account usage {:.0}% → max agents capped at {}", p, cap),
+                    &format!("account usage {:.0}% — below the 80% band, tier throttle off", p),
                 ),
-                (None, Some(p)) => logging::info("engine", &format!("account usage {:.0}% — tier throttle off", p)),
                 _ => {}
             }
             last_tier_cap = Some(tier);
         }
-        let effective_max = tier.map_or(cfg.engine.max_total_agents, |c| c.min(cfg.engine.max_total_agents));
 
         // Usage-limit hold: set by a worker that hit a window limit. Lifted at the
         // recorded reset time, or early when fresh data shows usage back under 95%.
@@ -394,10 +498,65 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
             let _q = shared.queue_mutex.lock().unwrap();
             shared.queue().load()
         };
+        // Publish the picker's skip reasons (features: lock visibility). When the
+        // engine is not picking at all, the map is cleared — a stale one would
+        // make a perfectly runnable queue look lock-blocked.
+        {
+            if stop_picking || holding {
+                shared.blocked.lock().unwrap().clear();
+            }
+            let snapshot = shared.blocked.lock().unwrap().clone();
+            if snapshot != last_blocked {
+                let path = blocked_path(&project_root);
+                if snapshot.is_empty() {
+                    let _ = std::fs::remove_file(&path);
+                } else if let Ok(text) = serde_json::to_string_pretty(&snapshot) {
+                    let _ = std::fs::write(&path, text);
+                }
+                // The log line answers "why is only one thing running": how many
+                // slots are free, how many items are waiting, and on whom.
+                if !snapshot.is_empty() {
+                    let mut holders: Vec<(&str, usize)> = Vec::new();
+                    for b in snapshot.values() {
+                        let key = if b.by.is_empty() { b.path.as_str() } else { b.by.as_str() };
+                        match holders.iter_mut().find(|(k, _)| *k == key) {
+                            Some((_, n)) => *n += 1,
+                            None => holders.push((key, 1)),
+                        }
+                    }
+                    holders.sort_by(|a, b| b.1.cmp(&a.1));
+                    let named: Vec<String> = holders
+                        .iter()
+                        .take(3)
+                        .map(|(k, n)| format!("{} blocks {}", short(k), n))
+                        .collect();
+                    logging::info(
+                        "engine",
+                        &format!(
+                            "{} free agent slot(s), but {} queued item(s) sit inside a locked scope ({})",
+                            effective_max.saturating_sub(running.len()),
+                            snapshot.len(),
+                            named.join(", ")
+                        ),
+                    );
+                }
+                last_blocked = snapshot;
+            }
+        }
+
+        // Logged when it changes — plus a heartbeat at a fixed interval even when
+        // nothing has, so tick numbers advance in the log at least this often. A
+        // silent stream otherwise reads the same whether the queue is quiet or
+        // the loop has died, and the gaps in tick numbering look like lost ticks.
         let summary = summarize(&items, running.len());
-        if summary != last_summary {
-            logging::info("engine", &format!("tick #{} — {}", tick, summary));
+        let beat = last_summary_at.elapsed().as_secs() >= HEARTBEAT_SEC;
+        if summary != last_summary || beat {
+            logging::info(
+                "engine",
+                &format!("tick #{} — {}{}", tick, summary, if beat && summary == last_summary { " (heartbeat)" } else { "" }),
+            );
             last_summary = summary;
+            last_summary_at = Instant::now();
         }
 
         // Usage probe + staleness: only relevant while there is work to run (or a
@@ -509,13 +668,14 @@ fn flip_failed_dependents(queue: &Queue) -> Vec<(String, String)> {
 fn summarize(items: &[WorkItem], running: usize) -> String {
     let count = |s: &str| items.iter().filter(|i| i.state == s).count();
     format!(
-        "queue: {} open ({} queued, {} in-progress, {} paused, {} failed, {} todo); {} agent(s) running",
+        "queue: {} open ({} queued, {} in-progress, {} paused, {} failed, {} todo, {} question); {} agent(s) running",
         items.len(),
         count(workitems::STATE_QUEUED),
         count(workitems::STATE_IN_PROGRESS),
         count(workitems::STATE_PAUSED),
         count(workitems::STATE_FAILED),
         count(workitems::STATE_TODO),
+        count(workitems::STATE_QUESTION),
         running
     )
 }
@@ -536,10 +696,30 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
     };
     let queue = shared.queue();
     let items = queue.load();
+    // Conflict streaks belong to items that still exist; a closed or deleted
+    // workid must not carry its backoff history into a clone of the same id.
+    {
+        let open: std::collections::HashSet<&str> = items.iter().map(|i| i.workid.as_str()).collect();
+        shared.conflicts.lock().unwrap().retain(|id, _| open.contains(id.as_str()));
+    }
     let now = chrono::Utc::now();
     let code_root = config::code_root(&shared.project_root, &cfg);
-    let occupied: Vec<(PathBuf, Vec<String>)> =
-        shared.running_paths.lock().unwrap().values().flatten().cloned().collect();
+    // Scopes held by items live in THIS engine, plus which item holds each —
+    // the owner is what makes a "blocked by" message name a work item rather
+    // than just a directory.
+    let (occupied, running_owner): (Vec<(PathBuf, Vec<String>)>, HashMap<PathBuf, String>) = {
+        let map = shared.running_paths.lock().unwrap();
+        let mut scopes = Vec::new();
+        let mut owner = HashMap::new();
+        for (workid, paths) in map.iter() {
+            for (p, ign) in paths {
+                scopes.push((p.clone(), ign.clone()));
+                owner.insert(p.clone(), workid.clone());
+            }
+        }
+        (scopes, owner)
+    };
+    let mut blocked: HashMap<String, Blocked> = HashMap::new();
     // Closed archive, loaded once per pick and only if a candidate has deps.
     let mut closed_cache: Option<Vec<WorkItem>> = None;
     let mut best: Option<usize> = None;
@@ -577,13 +757,32 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
         let repairs = disjointness_repairs(item, &cand_path, &items, &code_root, &cfg.globalsettings.test_dir);
         let effective_ignore: Vec<String> =
             item.codepath_ignore.iter().cloned().chain(repairs.iter().cloned()).collect();
-        // structureV2: EVERY codepath the item carries must be free.
+        // structureV2: EVERY codepath the item carries must be free. A candidate
+        // that cannot run is skipped — but the reason is RECORDED, so "nine
+        // queued items and one agent" has a visible cause instead of looking
+        // like the engine ignoring work.
         let cand_paths: Vec<PathBuf> =
             item.all_codepaths().iter().map(|p| resolve_codepath(&code_root, p)).collect();
-        if cand_paths.iter().any(|cp| {
-            occupied.iter().any(|(r, r_ign)| scopes_overlap(r, r_ign, cp, &effective_ignore))
-                || locks::find_ancestor_lock(cp, now).is_some()
-        }) {
+        let gate = cand_paths.iter().find_map(|cp| {
+            if let Some((holder, r)) = occupied
+                .iter()
+                .find(|(r, r_ign)| scopes_overlap(r, r_ign, cp, &effective_ignore))
+                .map(|(r, _)| (running_owner.get(r).cloned().unwrap_or_default(), r))
+            {
+                return Some(Blocked {
+                    by: holder,
+                    path: r.to_string_lossy().into_owned(),
+                    kind: "running".into(),
+                });
+            }
+            locks::find_ancestor_lock_info(cp, now).map(|(lock_file, info)| Blocked {
+                by: info.workid,
+                path: lock_file.parent().unwrap_or(&lock_file).to_string_lossy().into_owned(),
+                kind: "lock".into(),
+            })
+        });
+        if let Some(b) = gate {
+            blocked.insert(item.workid.clone(), b);
             continue;
         }
         let better = match best {
@@ -600,6 +799,9 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
             best_repairs = repairs;
         }
     }
+    // Publish before the early return: a pass that finds nothing to run is
+    // exactly the pass whose reasons a human wants to see.
+    *shared.blocked.lock().unwrap() = blocked;
     let workid = items[best?].workid.clone();
     if !best_repairs.is_empty() {
         logging::warn(
@@ -635,6 +837,135 @@ fn pick_next(shared: &Shared, allowed_types: &[&str], allow_shell: bool) -> Opti
             None
         }
     }
+}
+
+/// EVERY codepath an item carries must resolve to a real DIRECTORY before the
+/// run starts — not just the primary one. A bad secondary entry used to skip
+/// this check and fall through to the lock scan, where it surfaced as "codepath
+/// busy": a path that does not exist can never become un-busy, so the item
+/// requeued (with its attempt refunded) every backoff forever, indistinguishable
+/// in the log from ordinary contention.
+///
+/// A path that exists but is a FILE fails here too. A codepath is a lock scope,
+/// and the engine takes that lock by writing `<path>/.iter.lock` — only a
+/// directory can hold one. Worse, a file's ancestor chain is scanned for locks,
+/// so a one-file scope inherits every conflict of the directory holding it.
+fn validate_codepaths(code_root: &Path, item: &WorkItem) -> Result<(), String> {
+    for stored in item.all_codepaths() {
+        let path = resolve_codepath(code_root, &stored);
+        if path.is_dir() {
+            continue;
+        }
+        return Err(if path.exists() {
+            format!(
+                "codepath is a file, not a directory: {} (stored \"{}\", resolved against code_root {}) \
+                 — a codepath is the lock scope the agent owns, taken by writing <path>/.iter.lock, \
+                 which only a directory can hold; name the directory to edit and put the file in mainwork",
+                path.display(),
+                stored,
+                code_root.display()
+            )
+        } else {
+            format!(
+                "codepath does not exist: {} (stored \"{}\", resolved against code_root {})",
+                path.display(),
+                stored,
+                code_root.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+/// Creation-time guard shared by `iter add` and the webapp API: a codepath that
+/// EXISTS and is a file is wrong the moment it is written, so refuse it there
+/// rather than letting it fail hours later at dispatch. Deliberately narrower
+/// than `validate_codepaths` — a path that does not exist YET is allowed,
+/// because a plan routinely creates work for a directory an earlier item makes.
+pub fn reject_file_codepath(code_root: &Path, item: &WorkItem) -> Result<(), String> {
+    for stored in item.all_codepaths() {
+        let path = resolve_codepath(code_root, &stored);
+        if path.is_file() {
+            return Err(format!(
+                "codepath \"{}\" is a file ({}). A codepath is the directory tree the item locks and \
+                 may edit — the engine takes that lock by writing <path>/.iter.lock, which only a \
+                 directory can hold, and a file scope silently inherits every lock conflict of the \
+                 directory containing it. Use the directory, and name the file in mainwork.",
+                stored,
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An item whose lock scope IS the code root owns the entire tree: nothing else
+/// can run while it does, whatever the agent caps say. That is occasionally
+/// exactly right (a cross-repo verification pass), so this WARNS and never
+/// refuses — the cost is just invisible otherwise, and it is the single most
+/// common reason a full queue runs one item at a time.
+pub fn whole_tree_warning(code_root: &Path, item: &WorkItem) -> Option<String> {
+    let root = code_root.canonicalize().unwrap_or_else(|_| code_root.to_path_buf());
+    let hit = item.all_codepaths().into_iter().find(|p| resolve_codepath(code_root, p) == root)?;
+    // `**` carves out everything: the item takes no lock at all, which is the
+    // right shape for a pass that only reads.
+    if locks::ignored(Path::new("anything"), &item.codepath_ignore) {
+        return None;
+    }
+    Some(format!(
+        "codepath \"{}\" resolves to the code root ({}), so this item LOCKS THE WHOLE TREE — \
+         no other work item can run while it does. If it only reads across the tree, add \
+         codepath_ignore [\"**\"] to make it lockless; if it writes in one place, scope it there.",
+        hit,
+        root.display()
+    ))
+}
+
+/// Ceiling on the escalating lock-conflict backoff: a genuinely long-lived
+/// conflict rechecks twice an hour instead of four times a minute.
+const MAX_CONFLICT_BACKOFF_SEC: u64 = 1800;
+
+/// How often the tick summary is logged even when nothing changed, so a quiet
+/// log still proves the loop is alive.
+const HEARTBEAT_SEC: u64 = 300;
+
+/// A codepath-lock conflict, with ESCALATING backoff. A flat retry meant a
+/// persistently blocked item came back to the picker every 15s forever, and
+/// because the requeue preserves priority it was re-picked ahead of work that
+/// could actually run. Each consecutive conflict on the same item doubles its
+/// wait (capped), and a streak is called out in the log so a stuck item reads
+/// differently from ordinary contention. The streak resets the moment the item
+/// gets its lock.
+fn defer_after_conflict(shared: &Shared, item: &WorkItem, conflict: &Path, tag: &str) {
+    let base = shared.cfg().engine.codepath_conflict_backoff_sec.max(1);
+    let streak = {
+        let mut map = shared.conflicts.lock().unwrap();
+        let n = map.entry(item.workid.clone()).or_insert(0);
+        *n += 1;
+        *n
+    };
+    let backoff = base.saturating_mul(1u64 << (streak - 1).min(12)).min(MAX_CONFLICT_BACKOFF_SEC);
+    let msg = format!(
+        "codepath busy ({}); requeued {} (conflict #{}, retry in {}s)",
+        conflict.display(),
+        short(&item.workid),
+        streak,
+        backoff
+    );
+    if streak >= 5 {
+        logging::warn(
+            tag,
+            &format!("{} — this item has been blocked {} times in a row; check that the blocking lock is real", msg, streak),
+        );
+    } else {
+        logging::info(tag, &msg);
+    }
+    shared
+        .deferred
+        .lock()
+        .unwrap()
+        .insert(item.workid.clone(), Instant::now() + std::time::Duration::from_secs(backoff));
+    requeue(shared, &item.workid, "codepath lock conflict", true);
 }
 
 /// Acquire the codepath lock on EVERY path an item carries (structureV2: a
@@ -701,15 +1032,10 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
     let codepath = resolve_codepath(&code_root, &item.codepath);
     let lock_timeout = cfg.engine.codepath_lock_timeout_sec.max(agent.max_work_timeout_sec);
 
-    // A codepath that doesn't exist is a broken work item, not a busy one: fail it
-    // (normal attempt/backoff rules apply) instead of requeueing forever.
-    if !codepath.is_dir() {
-        let msg = format!(
-            "codepath does not exist: {} (stored \"{}\", resolved against code_root {})",
-            codepath.display(),
-            item.codepath,
-            code_root.display()
-        );
+    // A codepath that isn't a real directory is a broken work item, not a busy
+    // one: fail it (normal attempt/backoff rules apply) instead of requeueing
+    // forever. EVERY entry is checked, not just the primary.
+    if let Err(msg) = validate_codepaths(&code_root, &item) {
         logging::error(&tag, &msg);
         fail_item(&shared, &item, &msg, String::new(), &tag);
         return;
@@ -719,26 +1045,12 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
     // item locks EVERY codepath it carries, all-or-nothing.
     let lock = match acquire_all_codepath_locks(&code_root, &item, &agent.type_name, lock_timeout) {
         Ok(lock) => {
+            shared.conflicts.lock().unwrap().remove(&item.workid);
             logging::info(&tag, &format!("codepath lock acquired: {}", codepath.display()));
             lock
         }
         Err(conflict) => {
-            let backoff = cfg.engine.codepath_conflict_backoff_sec;
-            logging::info(
-                &tag,
-                &format!(
-                    "codepath busy ({}); requeued {} (retry in {}s)",
-                    conflict.display(),
-                    short(&item.workid),
-                    backoff
-                ),
-            );
-            shared
-                .deferred
-                .lock()
-                .unwrap()
-                .insert(item.workid.clone(), Instant::now() + std::time::Duration::from_secs(backoff));
-            requeue(&shared, &item.workid, "codepath lock conflict", true);
+            defer_after_conflict(&shared, &item, &conflict, &tag);
             return;
         }
     };
@@ -767,6 +1079,7 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
     // race a stop the user sent the moment the item showed in-progress.)
     let _ = std::fs::remove_file(critfail_path(&shared.project_root, &item.workid));
     let _ = std::fs::remove_file(reject_path(&shared.project_root, &item.workid));
+    let _ = std::fs::remove_file(question_path(&shared.project_root, &item.workid));
     let mut outputs: Vec<String> = Vec::new();
 
     // Output of engine-run shell steps, carried into the NEXT LLM turn's prompt.
@@ -860,6 +1173,20 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
                     return;
                 }
             }
+            // `iter ask`: the agent needs a human decision before it can go on.
+            // The item parks in `question`; answering it in the webapp queues it
+            // again with the answer in hand.
+            if turn_result.is_ok() {
+                if let Some(question) = take_question(&shared.project_root, &item.workid) {
+                    logging::warn(
+                        &tag,
+                        &format!("agent asked the human a question → question: {}", first_line(&question)),
+                    );
+                    ask_item(&shared, &item.workid, &question, outputs.join("\n"));
+                    drop(lock);
+                    return;
+                }
+            }
         }
         match turn_result {
             Ok(_) => {}
@@ -948,31 +1275,18 @@ fn run_shell_workitem(shared: Arc<Shared>, item: WorkItem, tag: String) {
     let cfg = shared.cfg();
     let code_root = config::code_root(&shared.project_root, &cfg);
     let codepath = resolve_codepath(&code_root, &item.codepath);
-    if !codepath.is_dir() {
-        let msg = format!(
-            "codepath does not exist: {} (stored \"{}\", resolved against code_root {})",
-            codepath.display(),
-            item.codepath,
-            code_root.display()
-        );
+    if let Err(msg) = validate_codepaths(&code_root, &item) {
         logging::error(&tag, &msg);
         fail_item(&shared, &item, &msg, String::new(), &tag);
         return;
     }
     let lock = match acquire_all_codepath_locks(&code_root, &item, "shell", cfg.engine.codepath_lock_timeout_sec) {
-        Ok(lock) => lock,
+        Ok(lock) => {
+            shared.conflicts.lock().unwrap().remove(&item.workid);
+            lock
+        }
         Err(conflict) => {
-            let backoff = cfg.engine.codepath_conflict_backoff_sec;
-            logging::info(
-                &tag,
-                &format!("codepath busy ({}); requeued {} (retry in {}s)", conflict.display(), short(&item.workid), backoff),
-            );
-            shared
-                .deferred
-                .lock()
-                .unwrap()
-                .insert(item.workid.clone(), Instant::now() + std::time::Duration::from_secs(backoff));
-            requeue(&shared, &item.workid, "codepath lock conflict", true);
+            defer_after_conflict(&shared, &item, &conflict, &tag);
             return;
         }
     };
@@ -1230,6 +1544,43 @@ fn reject_item(shared: &Shared, workid: &str, reason: &str, partial_output: Stri
     });
 }
 
+/// `iter ask` outcome (features/Question_state.md): the item parks in
+/// `question` with the agent's text in its `question` field, waiting on a
+/// person. Deliberately not `todo` — a question is a human BLOCKING a machine,
+/// and the webapp surfaces it as its own bucket. Turns completed so far stay in
+/// output (the research behind the question is what makes it answerable), and a
+/// stale answer from an earlier round is cleared so the new question reads
+/// unambiguously. No retries burned; the attempt is refunded because the item
+/// never got to finish its work.
+fn ask_item(shared: &Shared, workid: &str, question: &str, partial_output: String) {
+    let _q = shared.queue_mutex.lock().unwrap();
+    let queue = shared.queue();
+    let _ = queue.mutate(workid, |it| {
+        it.state = workitems::STATE_QUESTION.into();
+        it.question = question.to_string();
+        it.answer = String::new();
+        it.lasterror = format!("WAITING ON A HUMAN ANSWER: {}", first_line(question));
+        if !partial_output.is_empty() {
+            it.output = partial_output.clone();
+        }
+        it.attempts = it.attempts.saturating_sub(1);
+        it.times.asked = workitems::now_iso();
+        it.times.answered = String::new();
+        it.times.start = String::new();
+    });
+}
+
+/// The first non-empty line of a block of text, trimmed for a log line or an
+/// error field — questions are paragraphs, log lines are not.
+fn first_line(text: &str) -> String {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
+    if line.chars().count() > 160 {
+        format!("{}…", line.chars().take(159).collect::<String>())
+    } else {
+        line
+    }
+}
+
 /// Put an item back in the queue. `refund_attempt` when the run never really started
 /// (lock conflict) so contention doesn't burn attempts.
 fn requeue(shared: &Shared, workid: &str, reason: &str, refund_attempt: bool) {
@@ -1325,7 +1676,7 @@ fn previous_attempt_section(item: &WorkItem) -> String {
 
 /// Resolve a stored codepath to an absolute directory. `base` is the configured
 /// code_root (which defaults to the engine home).
-fn resolve_codepath(base: &Path, codepath: &str) -> PathBuf {
+pub fn resolve_codepath(base: &Path, codepath: &str) -> PathBuf {
     let mut p = codepath.to_string();
     if let Some(rest) = p.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -1335,6 +1686,30 @@ fn resolve_codepath(base: &Path, codepath: &str) -> PathBuf {
     let path = PathBuf::from(&p);
     let abs = if path.is_absolute() { path } else { base.join(path) };
     abs.canonicalize().unwrap_or(abs)
+}
+
+/// The mainwork turn's prompt. Normally just the request — but when the item
+/// carries an ANSWERED question (features/Question_state.md), the decision is
+/// prepended to it. The Q&A is composed into the prompt rather than edited into
+/// `mainwork`, so the request keeps reading as itself and the pair survives as
+/// the record of what was asked and what was decided.
+fn mainwork_prompt(item: &WorkItem) -> String {
+    if item.question.trim().is_empty() || item.answer.trim().is_empty() {
+        return item.mainwork.clone();
+    }
+    format!(
+        "# A question on this work item was answered\n\n\
+         Before this run, work on this item stopped to ask a human a question.\n\
+         The question and the answer are below — the answer is a decision, and it \
+         outranks any assumption in the request that follows.\n\n\
+         ## Asked\n\n{}\n\n## Answer\n\n{}\n\n\
+         Proceed on that answer. If it is ambiguous, or acting on it raises a NEW \
+         decision only a human can make, ask again with `iter ask` rather than \
+         guessing.\n\n---\n\n{}",
+        item.question.trim(),
+        item.answer.trim(),
+        item.mainwork
+    )
 }
 
 /// Compose the turn sequence: spin-up + first step, remaining prework, mainwork,
@@ -1347,7 +1722,7 @@ fn build_turns(shared: &Shared, agent: &AgentDef, item: &WorkItem, codepath: &Pa
     }
     steps.push(StepTurn {
         phase: Phase::Mainwork,
-        turn: Turn { label: "mainwork".into(), prompt: item.mainwork.clone() },
+        turn: Turn { label: "mainwork".into(), prompt: mainwork_prompt(item) },
         shell: None,
     });
     for entry in &item.postwork {
@@ -1539,6 +1914,205 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// features/Question_state.md — the answer reaches the agent by being
+    /// COMPOSED into the mainwork turn, never by editing the request. Both
+    /// halves must be present: a question nobody answered yet changes nothing.
+    #[test]
+    fn answered_question_prefaces_the_mainwork_turn() {
+        let base = WorkItem { mainwork: "Build the thing per BR-5.".into(), ..Default::default() };
+        assert_eq!(mainwork_prompt(&base), base.mainwork, "no question: the request runs as written");
+
+        let asked = WorkItem { question: "A or B?".into(), ..base.clone() };
+        assert_eq!(mainwork_prompt(&asked), base.mainwork, "unanswered: nothing to preface with");
+
+        let answered_only = WorkItem { answer: "B".into(), ..base.clone() };
+        assert_eq!(mainwork_prompt(&answered_only), base.mainwork, "an answer to nothing is not a decision");
+
+        let both = WorkItem { question: "A or B?".into(), answer: "B, and skip the cache.".into(), ..base.clone() };
+        let p = mainwork_prompt(&both);
+        assert!(p.contains("A or B?") && p.contains("B, and skip the cache."), "both halves reach the agent");
+        assert!(p.ends_with(&base.mainwork), "the original request is still the tail of the prompt");
+        assert!(p.find("A or B?") < p.find(&base.mainwork), "the decision comes BEFORE the request it governs");
+        assert!(p.contains("iter ask"), "the agent is told how to escalate a follow-on decision");
+    }
+
+    /// `iter ask` parks the calling item: state, question text, refunded
+    /// attempt, and a cleared stale answer from an earlier round.
+    #[test]
+    fn ask_parks_the_item_and_clears_the_previous_answer() {
+        let root = std::env::temp_dir().join(format!("iterloop-ask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = test_shared(&root);
+        let item = WorkItem {
+            workid: "w-ask".into(),
+            item_type: "code".into(),
+            state: workitems::STATE_IN_PROGRESS.into(),
+            question: "the FIRST question".into(),
+            answer: "the first answer".into(),
+            attempts: 1,
+            ..Default::default()
+        };
+        shared.queue().append(&item).unwrap();
+
+        // The flag round trip: written by `iter ask`, consumed exactly once.
+        std::fs::write(question_path(&root, "w-ask"), "  Second question: A or B?  ").unwrap();
+        let text = take_question(&root, "w-ask").expect("flag is readable");
+        assert_eq!(text, "Second question: A or B?", "trimmed");
+        assert!(take_question(&root, "w-ask").is_none(), "the flag is consumed, never replayed");
+
+        ask_item(&shared, "w-ask", &text, "[mainwork] researched three options".into());
+        let parked = shared.queue().load().into_iter().find(|i| i.workid == "w-ask").unwrap();
+        assert_eq!(parked.state, workitems::STATE_QUESTION);
+        assert_eq!(parked.question, "Second question: A or B?");
+        assert_eq!(parked.answer, "", "a stale answer would read as an answer to the NEW question");
+        assert_eq!(parked.attempts, 0, "asking is not a failed attempt");
+        assert!(parked.output.contains("researched three options"), "the research survives as the ask's backing");
+        assert!(parked.times.asked.len() > 10 && parked.times.answered.is_empty());
+        assert!(
+            !parked.eligible(&Config::default(), chrono::Utc::now()),
+            "a parked question is never dispatched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// EVERY codepath is validated, not just the primary — a bad secondary
+    /// entry used to slip through to the lock scan and livelock there.
+    #[test]
+    fn every_codepath_is_validated_not_just_the_first() {
+        let root = std::env::temp_dir().join(format!("iterloop-cpval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("good")).unwrap();
+        std::fs::create_dir_all(root.join("also")).unwrap();
+        std::fs::write(root.join("good/node.code.iter.md"), "marker").unwrap();
+
+        let mk = |paths: &[&str]| WorkItem {
+            codepaths: paths.iter().map(|p| p.to_string()).collect(),
+            codepath: paths[0].into(),
+            ..Default::default()
+        };
+        assert!(validate_codepaths(&root, &mk(&["good", "also"])).is_ok(), "two real directories are fine");
+
+        // The primary was always caught; the SECOND entry is the regression.
+        let missing = validate_codepaths(&root, &mk(&["good", "gone"])).expect_err("missing secondary must fail");
+        assert!(missing.contains("codepath does not exist"), "{}", missing);
+        assert!(missing.contains("gone"), "the message names the offending entry: {}", missing);
+
+        // A file is rejected with its own message — "does not exist" would send
+        // the reader looking for a path that is right there.
+        let file = validate_codepaths(&root, &mk(&["good", "good/node.code.iter.md"]))
+            .expect_err("a file is not a lock scope");
+        assert!(file.contains("is a file, not a directory"), "{}", file);
+        assert!(file.contains(".iter.lock"), "the message says WHY a file cannot work: {}", file);
+
+        // Creation-time guard is narrower: files refused, not-yet-created dirs allowed.
+        assert!(reject_file_codepath(&root, &mk(&["good", "not/made/yet"])).is_ok(), "future dirs are legitimate");
+        assert!(reject_file_codepath(&root, &mk(&["good/node.code.iter.md"])).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Consecutive conflicts on one item back off exponentially, so a blocked
+    /// item stops returning to the picker every 15s and crowding out work that
+    /// could run. Getting the lock clears the streak.
+    #[test]
+    fn repeated_lock_conflicts_escalate_the_backoff() {
+        let root = std::env::temp_dir().join(format!("iterloop-escal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let shared = test_shared(&root);
+        shared.cfg.lock().unwrap().engine.codepath_conflict_backoff_sec = 10;
+        let item = WorkItem { workid: "w-block".into(), item_type: "code".into(), ..Default::default() };
+        shared.queue().append(&item).unwrap();
+
+        let wait_sec = |shared: &Shared| {
+            let until = shared.deferred.lock().unwrap()[&item.workid];
+            until.saturating_duration_since(Instant::now()).as_secs()
+        };
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            defer_after_conflict(&shared, &item, Path::new("/busy"), "test");
+            seen.push(wait_sec(&shared));
+        }
+        // 10 → 20 → 40 → 80, each strictly longer than the last.
+        assert!(seen.windows(2).all(|w| w[1] > w[0]), "backoff must escalate, got {:?}", seen);
+        assert!(seen[0] < 11 && seen[3] >= 70, "first ~10s, fourth ~80s: {:?}", seen);
+        assert_eq!(*shared.conflicts.lock().unwrap().get("w-block").unwrap(), 4);
+
+        // The cap holds: no amount of blocking pushes the wait past the ceiling.
+        for _ in 0..40 {
+            defer_after_conflict(&shared, &item, Path::new("/busy"), "test");
+        }
+        assert!(wait_sec(&shared) <= MAX_CONFLICT_BACKOFF_SEC, "backoff is capped");
+
+        // Winning the lock resets the streak (what run_workitem does on success).
+        shared.conflicts.lock().unwrap().remove(&item.workid);
+        defer_after_conflict(&shared, &item, Path::new("/busy"), "test");
+        assert!(wait_sec(&shared) < 11, "a fresh conflict starts from the base backoff again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A whole-tree scope WARNS and never refuses — it is occasionally exactly
+    /// right (a cross-repo verification pass), and `**` opts out entirely.
+    #[test]
+    fn whole_tree_scope_warns_but_is_allowed() {
+        let root = std::env::temp_dir().join(format!("iterloop-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("svc")).unwrap();
+        let mk = |cp: &str, ignore: Vec<String>| WorkItem {
+            codepath: cp.into(),
+            codepaths: vec![cp.into()],
+            codepath_ignore: ignore,
+            ..Default::default()
+        };
+        let w = whole_tree_warning(&root, &mk(".", vec![])).expect("`.` is the whole tree");
+        assert!(w.contains("LOCKS THE WHOLE TREE"), "{}", w);
+        assert!(w.contains("codepath_ignore [\"**\"]"), "the warning names the way out: {}", w);
+        // The absolute spelling of the same directory is the same lock.
+        assert!(whole_tree_warning(&root, &mk(&root.to_string_lossy(), vec![])).is_some());
+        // A scope inside the tree is ordinary work.
+        assert!(whole_tree_warning(&root, &mk("svc", vec![])).is_none());
+        // `**` carves out everything: the item takes no lock, so nothing to warn about.
+        assert!(whole_tree_warning(&root, &mk(".", vec!["**".into()])).is_none());
+        // A narrower carve-out is still a whole-tree lock.
+        assert!(whole_tree_warning(&root, &mk(".", vec!["svc/tests/".into()])).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The picker records WHY it skipped each candidate, so a queue full of
+    /// runnable-looking work with one agent on it has a visible cause.
+    #[test]
+    fn picker_publishes_why_it_skipped_each_candidate() {
+        let root = std::env::temp_dir().join(format!("iterloop-blk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["held", "held/inner", "free"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let shared = test_shared(&root);
+        let mk = |id: &str, cp: &str, prio: i64| WorkItem {
+            workid: id.into(),
+            item_type: "code".into(),
+            priority: prio,
+            codepath: root.join(cp).to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        // An on-disk lock over `held/` (as another engine would leave).
+        let _lock = locks::acquire_codepath_lock(&root.join("held"), "w-holder", "code", 600, &[]).unwrap();
+        shared.queue().append(&mk("w-under", "held/inner", 1)).unwrap();
+        shared.queue().append(&mk("w-free", "free", 9)).unwrap();
+
+        // The blocked item sorts FIRST on priority, so a silent skip is exactly
+        // the case that looks like the engine ignoring urgent work.
+        let picked = pick_next(&shared, &["code"], false).expect("the free item still runs");
+        assert_eq!(picked.workid, "w-free", "a locked scope must not stall the queue behind it");
+
+        let blocked = shared.blocked.lock().unwrap().clone();
+        let b = blocked.get("w-under").expect("the skipped item's reason is recorded");
+        assert_eq!(b.by, "w-holder", "the chip names WHO holds the lock");
+        assert_eq!(b.kind, "lock", "an on-disk lock, not an item running in this engine");
+        assert!(b.path.ends_with("held"), "and the scope that covers it: {}", b.path);
+        assert!(!blocked.contains_key("w-free"), "a runnable item is not reported as blocked");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn test_shared(root: &Path) -> Shared {
         std::fs::create_dir_all(root.join(".iter/.engine")).unwrap();
         Shared {
@@ -1547,6 +2121,8 @@ mod tests {
             queue_mutex: Mutex::new(()),
             stop_now: AtomicBool::new(false),
             deferred: Mutex::new(HashMap::new()),
+            conflicts: Mutex::new(HashMap::new()),
+            blocked: Mutex::new(HashMap::new()),
             running_paths: Mutex::new(HashMap::new()),
             limit_hold: Mutex::new(None),
         }

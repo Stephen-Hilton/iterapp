@@ -18,6 +18,7 @@
     --s-queued-bg: #2f7fd6;  --s-queued-fg: #ffffff;
     --s-scheduled-bg: #7c4dbc; --s-scheduled-fg: #ffffff;
     --s-todo-bg: #d4589e;    --s-todo-fg: #ffffff;
+    --s-question-bg: #0d8f9e; --s-question-fg: #ffffff; /* teal — blocked on a human answer */
     --s-failed-bg: #d43a3a;  --s-failed-fg: #ffffff;
     --s-paused-bg: #e07020;  --s-paused-fg: #ffffff;
 
@@ -120,15 +121,23 @@
   .enginechip .lbl { color: var(--text-dim); font-weight: 500; }
 
   /* ---------- summary strip ---------- */
-  .summary { display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; }
+  /* All nine chips on ONE row while the window is wide enough to hold them at
+     full size (the count comes from the STATES table — renderSummary sets
+     --sumcols). Below that the bar drops to a balanced 5+4 rather than
+     squeezing labels to nothing; narrower still, the mobile rule takes over.
+     minmax(0,1fr) keeps a long label from forcing its column wider. */
+  .summary { display: grid; grid-template-columns: repeat(var(--sumcols, 9), minmax(0, 1fr)); gap: 8px; }
   .sumbtn {
     border: none; border-radius: 9px; padding: 9px 6px 7px;
-    display: grid; justify-items: center; gap: 1px;
+    display: grid; justify-items: center; gap: 1px; min-width: 0;
     box-shadow: var(--row-shadow);
     transition: transform 60ms ease, filter 120ms ease, opacity 120ms ease;
   }
   .sumbtn .n { font-size: 21px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.1; }
-  .sumbtn .t { font-size: 11.5px; font-weight: 600; opacity: 0.92; }
+  .sumbtn .t {
+    font-size: 11.5px; font-weight: 600; opacity: 0.92;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+  }
   .sumbtn:hover { filter: brightness(1.06); }
   .sumbtn:active { transform: translateY(1px); }
   .summary.filtered .sumbtn:not(.on):not(.total) { opacity: 0.42; }
@@ -232,6 +241,29 @@
     padding: 9px 12px; font-size: 12.5px; max-height: 60vh; overflow: auto; white-space: pre-wrap;
   }
   .textblock.mono { font-family: var(--mono); font-size: 12px; }
+  /* A question is aimed at a person, so it reads like a note, not like data:
+     a teal left rule and a slightly larger line height set it apart from the
+     request/output blocks around it. The answer echoes it in green. */
+  .textblock.question { border-left: 4px solid var(--s-question-bg); line-height: 1.55; }
+  .textblock.answer   { border-left: 4px solid var(--s-complete-bg); line-height: 1.55; }
+  /* The Answer block holds prose, so it keeps a three-line floor whether it is
+     filled or still empty: a one-line box reads as a label rather than a place
+     an answer goes, and the panel stops jumping when one is written. */
+  .textblock.answer, .textblock.unanswered { min-height: calc(3 * 1.55em + 20px); }
+  .textblock.unanswered { color: var(--text-dim); font-style: italic; line-height: 1.55; }
+  /* The answer is typed where it is read — in the row itself, no lightbox hop.
+     Same box as .textblock.answer so an editable answer and a recorded one look
+     like the same thing, because they are. */
+  .answerbox {
+    width: 100%; background: var(--surface2); color: var(--text);
+    border: 1px solid var(--border); border-left: 4px solid var(--s-complete-bg);
+    border-radius: 7px; padding: 9px 12px; font: inherit; font-size: 12.5px;
+    line-height: 1.55; resize: vertical; min-height: calc(3 * 1.55em + 20px);
+  }
+  .answerbox:focus { outline: none; border-color: var(--accent); border-left-color: var(--s-complete-bg); }
+  .answerrow { display: flex; gap: 12px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .answerstat { color: var(--text-dim); font-size: 12px; }
+  .answerstat.dirty { color: var(--s-question-bg); font-weight: 650; }
   .detailbtns { display: flex; gap: 8px; flex-wrap: wrap; }
 
   /* ---------- lightbox ---------- */
@@ -487,6 +519,12 @@
   .autofix { display: inline-flex; gap: 7px; align-items: center; font-size: 12.5px; font-weight: 600; cursor: pointer; }
   .autofix input { accent-color: var(--accent); width: 15px; height: 15px; }
 
+  /* Too narrow for nine full-size chips: split into two balanced rows instead
+     of shaving the labels. Ceiling of half the count, so 9 → 5 + 4. */
+  @media (max-width: 1180px) {
+    .summary { grid-template-columns: repeat(var(--sumcols-half, 5), minmax(0, 1fr)); }
+  }
+
   @media (max-width: 900px) {
     .app { grid-template-columns: 1fr; }
     .side { display: none; }
@@ -648,7 +686,9 @@ function resolveLine(line, codepathAbs){
 /* live "→ resolves to" hints under a multi-line path box */
 function wirePathHints(textareaId, hintId, codepathInputId){
   const update = () => {
-    const cp = codepathInputId ? absCodepath($(codepathInputId).value) : '';
+    // {codepath} anchors to the PRIMARY codepath — the first line of the
+    // CodePaths box, which may now list several.
+    const cp = codepathInputId ? absCodepath(($(codepathInputId).value.split('\n')[0] || '').trim()) : '';
     const lines = $(textareaId).value.split('\n')
       .map(l => resolveLine(l, cp)).filter(Boolean);
     $(hintId).innerHTML = lines.map(l => '→ ' + esc(l)).join('<br>');
@@ -671,6 +711,7 @@ function absCodepath(cp){
 const STATES = {
   'in-progress': { label:'In-Progress', icon:'⟳', bg:'var(--s-progress-bg)', fg:'var(--s-progress-fg)', order:0 },
   'queued':      { label:'Queued',      icon:'◷', bg:'var(--s-queued-bg)',   fg:'var(--s-queued-fg)',   order:1 },
+  'question':    { label:'Question',    icon:'?', bg:'var(--s-question-bg)', fg:'var(--s-question-fg)', order:1.5 },
   'todo':        { label:'ToDo',        icon:'☐', bg:'var(--s-todo-bg)',     fg:'var(--s-todo-fg)',     order:2 },
   'paused':      { label:'Paused',      icon:'❙❙', bg:'var(--s-paused-bg)',  fg:'var(--s-paused-fg)',   order:3 },
   'scheduled':   { label:'Scheduled',   icon:'⏱', bg:'var(--s-scheduled-bg)', fg:'var(--s-scheduled-fg)', order:3.5 },
@@ -747,6 +788,16 @@ function fmtTimeOnly(iso){
   const p = tzParts(iso, { hour:'2-digit', minute:'2-digit', second:'2-digit' }, 'time');
   return p ? `${p.hour}:${p.minute}:${p.second}` : (iso || '').slice(11,19);
 }
+/* How long ago, coarsely — for "this question has been waiting on you for 3h". */
+function ago(iso){
+  if (!iso) return '';
+  const s = Math.round((Date.now() - new Date(iso)) / 1000);
+  if (!isFinite(s) || s < 0) return '';
+  if (s < 90) return s + 's';
+  if (s < 5400) return Math.round(s/60) + 'm';
+  if (s < 172800) return Math.round(s/3600) + 'h';
+  return Math.round(s/86400) + 'd';
+}
 
 /* THE PATH RULE (one rule, everywhere): every path may be a glob; relative paths
    start at the CODE ROOT (globalsettings.code_root — defaults to where .iter/
@@ -763,9 +814,9 @@ function mk(over) {
     workid: uuid(), title:'', type:'code', state:'todo', source:'user',
     priority:5, risk:0, codepath:'./src', codepath_ignore:[], depends_on:[], automation:'',
     context:[], testfiles:[],
-    prework:[], mainwork:'', postwork:[], output:'', attempts:0, lasterror:'',
+    prework:[], mainwork:'', postwork:[], output:'', question:'', answer:'', attempts:0, lasterror:'',
     tests:null,
-    times:{ added:nowIso(), start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'' },
+    times:{ added:nowIso(), start:'', preworkdone:'', mainworkdone:'', postworkdone:'', closed:'', asked:'', answered:'' },
   }, over);
 }
 
@@ -845,6 +896,43 @@ let items = [
     output:'[prework:git-pull] Repository up to date.\n[mainwork] Reproduced under dash. Attempted fix broke assertion 4 under zsh; reverted. Needs a portable quoting approach.',
     attempts:2, lasterror:'mainwork failed: exit 1: fix regressed assertion 4 under zsh; reverted', tests:{passed:37,total:38},
     times:{ added:'2026-08-11T09:05:00Z', start:'2026-08-11T12:40:00Z', preworkdone:'2026-08-11T12:40:31Z', mainworkdone:'', postworkdone:'', closed:'' } }),
+  mk({ title:'Locale file format for GREET_LOCALE_DIR: which one ships?',
+    type:'code', state:'question', source:'agent: plan', priority:3, risk:4, codepath:'./src',
+    prework:['git-pull'], postwork:['git-commit'],
+    mainwork:'Implement the locale file loader for slice 2 of BR-5 using the format decided in the answer. Parse every *.greeting file in GREET_LOCALE_DIR, extend the built-in table, exit 3 with the offending path on stderr for a malformed file. Acceptance: a locale file adding "de" makes ./src/greet.sh --lang de Ada print the German greeting; the built-in table still wins for en/es/fr.',
+    question:`Slice 2 of BR-5 lets a locale file extend the built-in greeting table (GREET_LOCALE_DIR). Nothing in bizreq.md or techreq.md says what those files look like, and the format is hard to change once people have written files in it.
+
+TR-1 says greet stays ONE POSIX shell script, so whatever we pick has to be parsed in sh with no jq, python, or awk extensions. TR-2 forbids new runtime dependencies.
+
+Which format do we ship?
+
+  A) KEY=value lines (es=¡Hola, {name}!)
+     + Two lines of sh to parse (read + case). Nothing new to learn.
+     + Survives TR-1/TR-2 untouched.
+     − No room to grow: a second field per locale (say, a punctuation rule) needs a new format.
+
+  B) JSON, one object per file
+     + Familiar, and matches how the interfaces under interfaces/ describe data.
+     − Parsing JSON in POSIX sh without jq is a hand-rolled scanner — the biggest
+       risk item in the slice, and TR-2 rules out adding jq.
+
+  C) Directory of one file per locale, filename = code, contents = the template
+     + No parser at all: the filename IS the key, cat gives the value.
+     + Trivially correct under TR-1, and unreadable formats become impossible.
+     − A locale that needs two values later means two files, which reads oddly.
+
+I recommend (A): it costs the least code today, and if a second field is ever
+needed, KEY=value already has room for greeting_es= and punct_es= without a
+format change. (C) is tempting but I think the filename-as-key trick will fight
+us the first time a locale needs more than one string.`,
+    times:{ added:'2026-08-11T16:41:00Z', asked:'2026-08-11T17:12:30Z' },
+    output:'[prework:git-pull] Repository up to date on main (b7e91d3).\n[mainwork] Read BR-5, TR-1..TR-5, greet.sh, and the three interface contracts under interfaces/. The locale file format is not specified anywhere and cannot be inferred from the existing code — asked the human with three researched options. Parked pending an answer.' }),
+  mk({ title:'Add farewell subcommand once BR-7 lands: "bye" mirrors the greeting contract',
+    type:'plan', state:'queued', source:'agent: ingest', priority:5, risk:2, codepath:'.',
+    mainwork:'Plan the "bye" subcommand per the answered question below: slices, test groups, and the follow-on code/testwriter items.',
+    question:'Should "bye" be a subcommand (greet.sh bye Ada) or a flag (greet.sh --bye Ada)?\n\n  A) Subcommand — reads naturally, leaves room for more verbs later, but means a positional-argument parse before the flag loop.\n  B) Flag — one line in the existing flag loop, but "greet --bye" is a contradiction in the CLI text and BR-2 calls it a farewell, not a greeting mode.\n\nI recommend (A): BR-7 already speaks of "commands", and the refactor item on the queue is consolidating flag parsing anyway.',
+    answer:'Go with A, the subcommand. Do the flag-parsing refactor FIRST so the positional parse lands in clean code, and make the refactor item a dependency of the bye work.',
+    times:{ added:'2026-08-11T16:44:00Z', asked:'2026-08-11T16:58:00Z', answered:'2026-08-11T18:20:00Z' } }),
   mk({ title:'Deploy greet 1.1.0 to the demo host after localization ships',
     type:'code', state:'paused', source:'user', priority:8, risk:7, codepath:'.',
     prework:['iterloop-wait-for-stop'], postwork:['deploy','git-pr'],
@@ -1057,6 +1145,53 @@ function depChip(item){
     return `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="Not dispatchable until dependencies close complete${shallow} — waits for: ${esc(ids)}">⛓ blocked-by: ${esc(id12(ds.by))}</span>`;
   return `<span class="chip kv mono" title="Dependencies${ds ? ' satisfied' : ''}${shallow}: ${esc(ids)}">⛓ after: ${esc(ids)}</span>`;
 }
+/* features/Question_state.md — the header is what gets scanned, so an item
+   waiting on a human says so there, with how long it has been waiting. Once
+   answered the chip flips to the decision, so the record stays visible on the
+   item long after it has run. */
+function questionChip(item){
+  if (!item.question) return '';
+  if (item.state === 'question') {
+    const waited = ago(item.times.asked || item.times.added);
+    return `<span class="chip" style="background:var(--s-question-bg);color:var(--s-question-fg)"
+      title="Blocked on your answer — open the row and press Answer…\n\n${esc(item.question.slice(0,400))}">
+      ? awaiting your answer${waited ? ' · ' + waited : ''}</span>`;
+  }
+  return `<span class="chip kv mono" title="Answered ${esc(item.times.answered ? fmtTs(item.times.answered) : '')}: ${esc((item.answer||'').slice(0,300))}">✓ answered</span>`;
+}
+/* A queued item can be perfectly runnable and still never start because another
+   item holds a lock covering its codepath. The dependency gate always had a
+   chip; this is the same courtesy for the LOCK gate — the engine publishes its
+   own skip reasons (.iter/.engine/blocked.json) and /api/workitems injects them
+   as lock_status, so the chip reports what the picker actually decided rather
+   than re-deriving it. */
+function lockChip(item){
+  const ls = item.lock_status;
+  if (!ls) return '';
+  const who = ls.by ? id12(ls.by) : 'another engine';
+  const kind = ls.kind === 'running'
+    ? 'a work item running right now'
+    : 'an .iter.lock on disk (another engine, or left by a crash)';
+  return `<span class="chip" style="background:var(--s-paused-bg);color:#fff"
+    title="The engine skipped this item: its codepath sits inside a locked scope held by ${esc(who)} — ${esc(kind)}.\nLocked scope: ${esc(ls.path)}">🔒 lock-blocked by ${esc(who)}</span>`;
+}
+
+/* The other half of the story: the item everyone is waiting ON. A scope equal to
+   the code root serializes the whole engine, which is sometimes intended and
+   always worth seeing. */
+function wholeTreeChip(item){
+  // Only where the lock is imminent or held. A parked item with codepath "."
+  // is a warning for creation time (which already fires), not a badge on every
+  // row — the point of this chip is explaining a serialized engine.
+  if (!['in-progress', 'queued'].includes(item.state)) return '';
+  const root = normPath(PROJECT_ROOT);
+  const paths = (item.codepaths && item.codepaths.length) ? item.codepaths : [item.codepath];
+  if (!paths.some(p => absCodepath(p) === root)) return '';
+  if ((item.codepath_ignore || []).includes('**')) return '';
+  return `<span class="chip" style="background:var(--s-failed-bg);color:#fff"
+    title="This item's lock scope IS the code root (${esc(root)}) — while it runs, no other work item can start.\nIf it only READS across the tree, codepath_ignore ['**'] makes it lockless.">🌳 locks the whole tree</span>`;
+}
+
 function blocksChip(item){
   const n = items.filter(o => (o.depends_on || []).includes(item.workid) && !o.times.closed).length;
   return n ? `<span class="chip kv mono" title="Open work items gated on this one finishing">blocks: ${n}</span>` : '';
@@ -1082,12 +1217,17 @@ function renderSummary(){
     ['complete','✓ Complete','var(--s-complete-bg)','var(--s-complete-fg)'],
     ['in-progress','⟳ In-Progress','var(--s-progress-bg)','var(--s-progress-fg)'],
     ['queued','◷ Queued','var(--s-queued-bg)','var(--s-queued-fg)'],
+    ['question','? Question','var(--s-question-bg)','var(--s-question-fg)'],
     ['todo','☐ ToDo','var(--s-todo-bg)','var(--s-todo-fg)'],
     ['failed','✕ Failed','var(--s-failed-bg)','var(--s-failed-fg)'],
     ['paused','❙❙ Paused','var(--s-paused-bg)','var(--s-paused-fg)'],
     ['scheduled','⏱ Scheduled','var(--s-scheduled-bg)','var(--s-scheduled-fg)'],
   ];
   $('summary').className = 'summary' + (activeFilters.size ? ' filtered' : '');
+  // Keep the bar one row wide as states are added: the count drives the grid,
+  // and half of it (rounded up) is the two-row fallback on narrow windows.
+  $('summary').style.setProperty('--sumcols', defs.length);
+  $('summary').style.setProperty('--sumcols-half', Math.ceil(defs.length / 2));
   $('summary').innerHTML = defs.map(([key,label,bg,fg]) => {
     const on = key !== 'total' && activeFilters.has(key);
     const n = key === 'total' ? c.total : c[key];
@@ -1177,7 +1317,7 @@ function renderRows(){
             <span class="chip" style="background:var(--s-queued-bg);color:#fff" title="Requested by">${esc(sourceLabel(item.source))}</span>
             ${testChip(item)}
             ${item.source_testgroup ? `<span class="chip" style="background:var(--s-todo-bg);color:#fff" title="Born from this testgroup (sweep provenance)${(item.source_tests||[]).length ? ' — red at birth: ' + esc(item.source_tests.join(', ')) : ''}">TG: ${esc(item.source_testgroup)}</span>` : ''}
-            ${depChip(item)}${blocksChip(item)}
+            ${questionChip(item)}${depChip(item)}${lockChip(item)}${wholeTreeChip(item)}${blocksChip(item)}
             ${item.sched && item.sched.kind ? `<span class="chip mono" style="background:var(--s-scheduled-bg);color:#fff" title="Schedule — last fired: ${esc(item.sched.last_fired || 'never')}">⏱ ${esc(schedDesc(item.sched))}</span>` : ''}
             ${item.source_schedule ? `<span class="chip" style="background:var(--s-scheduled-bg);color:#fff" title="Born from schedule ${esc(item.source_schedule)}">SCHED RUN</span>` : ''}
             ${item.exec === 'shell' ? `<span class="chip mono" style="background:var(--s-paused-bg);color:#fff" title="exec: shell — the engine runs the steps as shell commands; no LLM">⚙ shell</span>` : ''}
@@ -1197,6 +1337,7 @@ function renderRows(){
         <div class="dvalrow"><span class="codepath" title="Lock scope and agent working directory">${esc(absCodepath(item.codepath))}</span>${
           (item.codepath_ignore||[]).length ? `<span class="codepath" title="Subtrees carved out of the lock scope — parallel items may own them" style="opacity:.75">ignoring: ${esc(item.codepath_ignore.join(', '))}</span>` : ''}
           <span class="fullid">ID: ${esc(item.workid)}</span></div>
+        ${questionBlocks(item)}
         <div class="dlabel">Prework</div><div>${pillRow(item.prework,false,'prework')}</div>
         <div class="dlabel">Request</div><div class="textblock">${esc(item.mainwork)||'<i>—</i>'}</div>
         <div class="dlabel">Postwork</div><div>${pillRow(item.postwork,false,'postwork')}</div>
@@ -1211,6 +1352,138 @@ function renderRows(){
       </div></div></div>
     </div>`;
   }).join('');
+}
+
+/* features/Question_state.md — the Question and the Answer are two separate
+   blocks ABOVE the request, because they are the reason the item is sitting
+   here. They stay after the item runs: the pair is the durable record of what
+   was asked and what was decided, and nothing rewrites the request to bury it.
+
+   The answer is typed right here, in the row. The states where the server
+   accepts an edit (question/todo/paused) get a live textarea that autosaves;
+   everywhere else the same box is the read-only record. */
+const ANSWERABLE = ['question', 'todo', 'paused'];
+
+function questionBlocks(item){
+  if (!item.question) return '';
+  const stamp = (label, ts, extra) => ts
+    ? `<span style="color:var(--text-dim);font-weight:500;font-size:11.5px"> — ${label} ${esc(fmtTs(ts))}${extra||''}</span>`
+    : '';
+  const asked = stamp('asked', item.times.asked, ago(item.times.asked) ? ` (${ago(item.times.asked)} ago)` : '');
+  const answered = stamp('answered', item.times.answered);
+  const head = `<div class="dlabel">Question${asked}</div>
+    <div class="textblock question">${esc(item.question)}</div>
+    <div class="dlabel">Answer${answered}</div>`;
+
+  if (!ANSWERABLE.includes(item.state)) {
+    return head + (item.answer
+      ? `<div class="textblock answer">${esc(item.answer)}</div>`
+      : `<div class="textblock unanswered">No answer recorded.</div>`);
+  }
+  const val = answerDrafts.has(item.workid) ? answerDrafts.get(item.workid) : (item.answer || '');
+  return head + `<div>
+      <textarea class="answerbox" data-answer="${item.workid}" rows="3" spellcheck="true"
+        placeholder="Name one of the recommendations, or give a different direction. The agent gets this text verbatim at the top of its request.">${esc(val)}</textarea>
+      <div class="answerrow">
+        <button class="btn primary" data-act="answerqueue" data-id="${item.workid}">Answer and Queue</button>
+        <span class="answerstat" data-astat="${item.workid}">${esc(answerStatus(item))}</span>
+      </div>
+    </div>`;
+}
+
+/* ---- the inline answer editor: type, it saves itself -------------------
+   Typing marks the item dirty; a single 5-second ticker flushes every dirty
+   draft, and leaving the box flushes it immediately. Nothing to press to keep
+   an answer — "Answer and Queue" is only for when you are DONE. */
+const answerDrafts = new Map();   // workid -> what is in the textarea right now
+const answerState  = new Map();   // workid -> 'dirty' | 'saving' | 'saved' | error text
+let answerTicker = null;
+const AUTOSAVE_MS = 5000;
+
+function answerStatus(item){
+  const st = answerState.get(item.workid);
+  if (st === 'dirty')  return 'unsaved — autosaves every 5s';
+  if (st === 'saving') return 'saving…';
+  if (st === 'saved')  return 'saved';
+  if (st) return st;
+  return item.answer ? 'saved' : 'autosaves as you type';
+}
+
+/* Status is written straight to the DOM: while the box has focus the row is
+   deliberately NOT re-rendered (that would eat the caret mid-sentence). */
+function setAnswerState(id, st){
+  answerState.set(id, st);
+  const el = document.querySelector(`[data-astat="${id}"]`);
+  if (!el) return;
+  const item = items.find(i => i.workid === id);
+  el.textContent = item ? answerStatus(item) : '';
+  el.classList.toggle('dirty', st === 'dirty');
+}
+
+function answerDirty(id){
+  const item = items.find(i => i.workid === id);
+  return item && answerDrafts.has(id) && answerDrafts.get(id) !== (item.answer || '');
+}
+
+/* PATCH the answer field alone — no state change. The item stays parked in
+   Question until you decide it is finished. */
+async function flushAnswer(id){
+  if (!answerDirty(id)) return;
+  const item = items.find(i => i.workid === id);
+  // Blurring the box to press "Answer and Queue" flushes first and queues
+  // second; once queued the server rightly refuses edits, so don't chase it.
+  if (!ANSWERABLE.includes(item.state)) { answerDrafts.delete(id); return; }
+  const text = answerDrafts.get(id);
+  setAnswerState(id, 'saving');
+  try {
+    if (LIVE) await api(`/api/workitems/${id}`, { method:'PATCH', body: JSON.stringify({ answer: text }) });
+    item.answer = text;                 // keep the local copy in step with disk
+    setAnswerState(id, 'saved');
+  } catch (e) {
+    setAnswerState(id, 'not saved: ' + e.message);
+  }
+}
+
+function noteAnswerEdit(id, text){
+  answerDrafts.set(id, text);
+  setAnswerState(id, answerDirty(id) ? 'dirty' : 'saved');
+  if (answerTicker) return;
+  answerTicker = setInterval(() => {
+    const dirty = [...answerDrafts.keys()].filter(answerDirty);
+    if (!dirty.length && !document.querySelector('.answerbox:focus')) {
+      clearInterval(answerTicker); answerTicker = null; return;
+    }
+    dirty.forEach(flushAnswer);
+  }, AUTOSAVE_MS);
+}
+
+/* "Answer and Queue": the answer is final, so it becomes the state transition —
+   one POST stores it, stamps times.answered, and queues the item. */
+async function answerAndQueue(id){
+  const item = items.find(i => i.workid === id);
+  const box = document.querySelector(`[data-answer="${id}"]`);
+  const text = (box ? box.value : answerDrafts.get(id) ?? item.answer ?? '').trim();
+  if (!text) {
+    toast('An answer needs text — that text is what the agent acts on');
+    if (box) box.focus();
+    return;
+  }
+  answerDrafts.delete(id);
+  answerState.delete(id);
+  if (!LIVE) {
+    item.answer = text; item.times.answered = nowIso();
+    item.state = 'queued'; item.lasterror = '';
+    render(); toast(`Answered — ${shortId(item)} queued`);
+    return;
+  }
+  try {
+    await api(`/api/workitems/${id}/action`,
+      { method:'POST', body: JSON.stringify({ action:'answer', answer: text, queue: true }) });
+    toast(`Answered — ${shortId(item)} queued`);
+    await loadAll();
+  } catch (e) {
+    toast('Answer failed: ' + e.message);
+  }
 }
 
 function actionButtons(item){
@@ -1236,8 +1509,24 @@ function actionButtons(item){
       <span class="note">Run Now clones this schedule into a queued run (skipped if one is still open).</span>
       <button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete</button>`;
   }
+  if (s === 'question') {
+    // Answering happens in the row itself (open it and type), so the menu only
+    // carries the escapes — including queueing it unanswered, which is the
+    // human's call and not something the engine refuses.
+    return `<button data-act="queue" data-id="${item.workid}" role="menuitem">Queue without answering</button>
+      <button data-act="todo" data-id="${item.workid}" role="menuitem">Move to ToDo</button>
+      <button data-act="pauseedit" data-id="${item.workid}" role="menuitem">Pause &amp; Edit</button>
+      <button data-act="complete" data-id="${item.workid}" role="menuitem">Complete (no work needed)</button>
+      <button data-act="clone" data-id="${item.workid}" role="menuitem">Clone</button>
+      <div class="sep"></div>
+      <span class="note">An agent is waiting on this decision — open the row and type the answer there.</span>
+      <button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete</button>`;
+  }
   const b = [];
   if (s === 'todo' || s === 'paused') b.push(['queue','Queue']);
+  // An item that already carries a question can be parked back into the
+  // Question bucket (e.g. after editing the question text).
+  if (item.question && (s === 'todo' || s === 'paused')) b.push(['question','Move to Question']);
   if ((s === 'todo' || s === 'paused') && item.sched && item.sched.kind) b.push(['schedule','Resume Schedule']);
   if (s === 'failed') b.push(['queue','Requeue (Retry)']);
   // paused/queued/failed can always go back to the ToDo review bucket — the
@@ -1252,7 +1541,16 @@ function actionButtons(item){
   return rows.join('');
 }
 
-function render(){ renderSummary(); renderRows(); }
+/* A rebuild of the rows replaces the DOM wholesale, which would eat the caret
+   out of an answer box mid-sentence. While one has focus the rebuild is held
+   and replayed on blur — the engine's own updates can wait a few seconds; a
+   half-typed answer cannot survive being retyped. */
+let renderHeld = false;
+function render(){
+  if (document.querySelector('.answerbox:focus')) { renderHeld = true; return; }
+  renderHeld = false;
+  renderSummary(); renderRows();
+}
 
 /* ------------------------------------------------------------------ toast */
 let toastTimer;
@@ -1342,6 +1640,10 @@ function lbTimes(item){
     ['Postwork done', t.postworkdone, dur(t.mainworkdone,t.postworkdone) && `postwork ${dur(t.mainworkdone,t.postworkdone)}`],
     ['Closed', t.closed, dur(t.added,t.closed) && `total ${dur(t.added,t.closed)}`],
   ];
+  // A question can be raised at any point in a run, so its two stamps ride at
+  // the end rather than claiming a place in the linear lifecycle above.
+  if (t.asked) steps.push(['Question asked', t.asked, 'parked for a human decision']);
+  if (t.answered) steps.push(['Answered', t.answered, dur(t.asked,t.answered) && `waited ${dur(t.asked,t.answered)} on a human`]);
   const rows = steps.map(([label, ts, note]) =>
     `<div class="tl"><span class="st">${label}</span><span class="ts" title="${ts ? `Stored UTC: ${esc(ts)}` : ''}">${ts ? esc(fmtTs(ts)) : '—'}</span><span class="du">${note||''}</span></div>`).join('');
   openLb('Time Records — ' + shortId(item),
@@ -1361,7 +1663,9 @@ function lbContext(item){
     <table class="t"><thead><tr><th>#</th><th>Turn</th><th>Prompt source</th></tr></thead><tbody>
       ${[
         ...item.prework.map((p,i)=>[`${i+1}`, prepostNames().includes(p)?`prework:${p}`:'prework:inline', prepostNames().includes(p)?`.iter/prepostwork/${p}.${prepostExec(p)==='shell'?'sh':'md'}`:'inline literal from work item']),
-        [`${item.prework.length+1}`, 'mainwork (+ spin-up on first turn)', 'work item request + agent definition + source instructions + context list'],
+        [`${item.prework.length+1}`, 'mainwork (+ spin-up on first turn)',
+          'work item request + agent definition + source instructions + context list'
+          + (item.question && item.answer ? ' — prefaced by the answered question (asked → answer), engine-composed, not stored in the request' : '')],
         ...item.postwork.map((p,i)=>[`${item.prework.length+2+i}`, `postwork:${p}`, `.iter/prepostwork/${p}.${prepostExec(p)==='shell'?'sh':'md'}`]),
         [`${item.prework.length+item.postwork.length+2}`, 'selfcheck', 'engine-composed: re-read agent definition, confirm completion'],
       ].map(([n,t2,s]) => `<tr><td class="mono">${n}</td><td><b>${esc(t2)}</b></td><td style="color:var(--text-dim)">${esc(s)}</td></tr>`).join('')}
@@ -1397,6 +1701,17 @@ function lbLogs(item){
 /* ------------------------------------------------------------------ edit / create form */
 
 let draft = null;   // { mode:'create'|'edit'|'clone'|'followup', base:workid|null, data:{...} }
+
+/* structureV2: an item may lock SEVERAL codepaths (a node's codedirs), with the
+   first as the primary/working directory. The form edits the whole list, so a
+   malformed one can be repaired in place instead of by delete-and-recreate. */
+function formCodepaths(d){
+  const list = (d.codepaths && d.codepaths.length) ? d.codepaths : [d.codepath];
+  return list.map(p => (p || '').trim()).filter(Boolean);
+}
+function codepathLines(){
+  return $('f_codepath').value.split('\n').map(s => s.trim()).filter(Boolean);
+}
 
 function openForm(mode, source, priorState){
   // create with a source = prefilled create (e.g. Create WorkItem from a Projects node)
@@ -1461,11 +1776,12 @@ function openForm(mode, source, priorState){
         </div>
         <div class="pathhint" style="opacity:.75">minute granularity (itersched checks every 59s) · daily/weekly occurrences missed while the server was down are skipped, never backfilled · each run is a CLONE queued at this item’s priority · one open run at a time — a still-open run suppresses the next fire</div>
       </div>
-      <span class="flabel">CodePath</span>
+      <span class="flabel top-align">CodePaths</span>
       <div>
-        <input type="text" id="f_codepath" class="mono" value="${esc(d.codepath)}"
-          placeholder="relative (./src) or absolute — resolved to absolute on save">
-        <div class="pathhint" id="f_pathhint">→ ${esc(absCodepath(d.codepath))}</div>
+        <textarea id="f_codepath" rows="1" style="width:100%" class="mono"
+          placeholder="relative (./src) or absolute — resolved to absolute on save; one DIRECTORY per line, first = primary">${esc(formCodepaths(d).join('\n'))}</textarea>
+        <div class="pathhint" id="f_pathhint">${formCodepaths(d).map(p => '→ ' + esc(absCodepath(p))).join('<br>')}</div>
+        <div class="pathhint" style="opacity:.75">every line is locked for the whole run and all of them feed the agent's context; the first is the working directory · each must be a DIRECTORY — a file cannot hold the <span class="mono">.iter.lock</span> and would inherit its parent's conflicts</div>
       </div>
       <span class="flabel top-align">CodePath ignore</span>
       <div>
@@ -1496,6 +1812,12 @@ function openForm(mode, source, priorState){
           placeholder="…or type an inline literal prework step and press Enter"></div>
       <span class="flabel top-align">Request</span>
       <textarea id="f_mainwork" rows="7" placeholder="The mainwork prompt: exactly what needs to be done, acceptance criteria included.">${esc(d.mainwork)}</textarea>
+      <span class="flabel top-align" id="f_qlabel" style="display:none">Question</span>
+      <div id="f_qrow" style="display:none">
+        <textarea id="f_question" rows="6" style="width:100%" placeholder="The decision a human has to make: where in the codebase this sits and why it matters now, the question itself, two to four researched options with what each buys and costs, and which one you'd take.">${esc(d.question||'')}</textarea>
+        <div class="pathhint" style="opacity:.75">saving into <b>Question</b> parks the item until it is answered — the request above is what runs once it is</div>
+        <textarea id="f_answer_form" rows="3" style="width:100%;margin-top:9px" placeholder="Answer (optional here — the Answer… button on the row is the normal path)">${esc(d.answer||'')}</textarea>
+      </div>
       <span class="flabel top-align">Postwork</span>
       <div>${pillRow(d.postwork, true, 'postwork')}
         <input type="text" id="f_postlit" class="mono" style="margin-top:7px;width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:6px 10px;color:var(--text)"
@@ -1505,7 +1827,7 @@ function openForm(mode, source, priorState){
       // Default target state: new items default to queued; pause & edit defaults to the
       // item's state before pausing. Scheduler-sourced items can only land in
       // scheduled|paused (syncSched below rewrites the options live).
-      const SAVE_STATES = [['queued','Queued'],['todo','ToDo'],['paused','Paused']];
+      const SAVE_STATES = [['queued','Queued'],['todo','ToDo'],['question','Question'],['paused','Paused']];
       const def = mode === 'edit'
         ? (SAVE_STATES.some(([v]) => v === priorState) ? priorState : 'queued')
         : 'queued';
@@ -1520,7 +1842,9 @@ function openForm(mode, source, priorState){
 
   $('f_prelit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('prework', e.target); }});
   $('f_postlit').addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); addLit('postwork', e.target); }});
-  $('f_codepath').addEventListener('input', e => { $('f_pathhint').textContent = '→ ' + absCodepath(e.target.value); });
+  $('f_codepath').addEventListener('input', () => {
+    $('f_pathhint').innerHTML = codepathLines().map(p => '→ ' + esc(absCodepath(p))).join('<br>');
+  });
   // Per-agent defaults (create mode only): picking an agent type pre-fills
   // codepath / codepath_ignore from the agent def's default_codepath(_ignore)
   // frontmatter, so conventions (usecase agent → usecases dir + test-dir carve)
@@ -1535,7 +1859,7 @@ function openForm(mode, source, priorState){
       const cpVal = cp.value.trim();
       if (cpVal === './src' || cpVal === '' || cpVal === applied.codepath) {
         const v = nd.codepath || './src';
-        if (cp.value !== v) { cp.value = v; $('f_pathhint').textContent = '→ ' + absCodepath(v); }
+        if (cp.value !== v) { cp.value = v; cp.dispatchEvent(new Event('input')); }
         applied.codepath = nd.codepath ? v : null;
       }
       const igVal = ig.value.trim();
@@ -1561,7 +1885,7 @@ function openForm(mode, source, priorState){
     $('f_sk_tz').style.display = (kind === 'daily' || kind === 'weekly') ? '' : 'none';
     const cur = $('f_savestate').value;
     const opts = isSched ? [['scheduled','Scheduled'],['paused','Paused']]
-                         : [['queued','Queued'],['todo','ToDo'],['paused','Paused']];
+                         : [['queued','Queued'],['todo','ToDo'],['question','Question'],['paused','Paused']];
     const def = opts.some(([v]) => v === cur) ? cur
       : isSched ? (priorState === 'paused' ? 'paused' : 'scheduled')
       : (mode === 'edit' && opts.some(([v]) => v === priorState) ? priorState : 'queued');
@@ -1571,6 +1895,17 @@ function openForm(mode, source, priorState){
   $('f_source').addEventListener('change', syncSched);
   $('f_sk').addEventListener('change', syncSched);
   syncSched();
+  // The Question/Answer pair is clutter on the 95% of items that are plain
+  // work, so it shows only when this item already carries a question or is
+  // being saved INTO the Question state (features/Question_state.md).
+  const syncQuestion = () => {
+    const on = !!$('f_question').value.trim() || $('f_savestate').value === 'question';
+    $('f_qlabel').style.display = on ? '' : 'none';
+    $('f_qrow').style.display = on ? '' : 'none';
+    if (on && $('f_savestate').value === 'question') $('f_question').focus();
+  };
+  $('f_savestate').addEventListener('change', syncQuestion);
+  syncQuestion();
   wirePathHints('f_context', 'f_ctxhint', 'f_codepath');
   wirePathHints('f_testfiles', 'f_tfhint', 'f_codepath');
   $('saveGo').addEventListener('click', () => saveDraft($('f_savestate').value));
@@ -1592,14 +1927,27 @@ function saveDraft(targetState){
   d.priority = +$('f_priority').value;
   d.risk = +$('f_risk').value;
   d.source = $('f_source').value;
-  d.codepath = absCodepath($('f_codepath').value);   // entered relative, stored absolute
+  // entered relative, stored absolute; first line is the primary
+  d.codepaths = codepathLines().map(absCodepath);
+  if (!d.codepaths.length) d.codepaths = [absCodepath('.')];
+  d.codepath = d.codepaths[0];
   d.codepath_ignore = $('f_codepath_ignore').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.depends_on = $('f_depends').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.context = $('f_context').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.testfiles = $('f_testfiles').value.split('\n').map(s=>s.trim()).filter(Boolean);
   d.mainwork = $('f_mainwork').value;
+  d.question = $('f_question').value.trim();
+  d.answer = $('f_answer_form').value.trim();
   d.exec = $('f_exec').value;
   d.automation = $('f_automation').value;
+  // The Question state exists to carry a question; an empty one parks the item
+  // in a bucket that tells the next reader nothing.
+  if (targetState === 'question' && !d.question) {
+    toast('Write the question first — a Question item without one tells nobody anything');
+    $('f_question').focus();
+    return;
+  }
+  if (targetState === 'question' && !d.times.asked) d.times.asked = nowIso();
   if ($('f_source').value === 'scheduler') {
     d.sched = { kind: $('f_sk').value, every_min: +$('f_severy').value || 0,
       at: $('f_sat').value.trim(), day: $('f_sday').value, tz: $('f_stz').value.trim(),
@@ -1613,15 +1961,17 @@ function saveDraft(targetState){
     const done = () => { draft = null; closeLb(); return loadAll(); };
     if (mode === 'edit') {
       const fields = { title: d.title, type: d.type, priority: d.priority, risk: d.risk,
-        source: d.source, codepath: d.codepath, codepath_ignore: d.codepath_ignore,
+        source: d.source, codepath: d.codepath, codepaths: d.codepaths, codepath_ignore: d.codepath_ignore,
         depends_on: d.depends_on, context: d.context, testfiles: d.testfiles,
         prework: d.prework, postwork: d.postwork, mainwork: d.mainwork,
+        question: d.question, answer: d.answer,
         exec: d.exec, sched: d.sched, automation: d.automation };
       const stateAction = targetState === 'queued' ? 'queue' : targetState === 'todo' ? 'todo'
-        : targetState === 'scheduled' ? 'schedule' : 'pause';
+        : targetState === 'scheduled' ? 'schedule' : targetState === 'question' ? 'question' : 'pause';
+      let warn = '';
       api(`/api/workitems/${draft.base}`, { method: 'PATCH', body: JSON.stringify(fields) })
-        .then(() => postAction(draft.base, stateAction))
-        .then(() => { toast(`Saved as ${targetState}`); return done(); })
+        .then(r => { warn = r && r.warning ? r.warning : ''; return postAction(draft.base, stateAction); })
+        .then(() => { toast(warn ? `Saved as ${targetState} — ${warn}` : `Saved as ${targetState}`); return done(); })
         .catch(e => toast('Save failed: ' + e.message));
     } else {
       d.state = targetState;
@@ -1680,6 +2030,7 @@ git reset --hard ${esc(item.git_start_commit)}</pre>`
 function doAction(act, id){
   const item = items.find(i => i.workid === id);
   if (!item) return;
+  if (act === 'answerqueue') { answerAndQueue(id); return; }
   if (LIVE) {
     // Clone and follow-up stay client-side (they open the prefilled form; the POST
     // happens on save). Everything else is a server action + reload.
@@ -1750,6 +2101,10 @@ function doAction(act, id){
     case 'schedule':
       item.state = 'scheduled';
       toast(`Schedule resumed for ${shortId(item)}`); break;
+    case 'question':
+      item.state = 'question';
+      if (!item.times.asked) item.times.asked = nowIso();
+      toast(`${shortId(item)} → question`); break;
     case 'complete':
       item.state = 'complete'; item.times.closed = nowIso();
       toast(`Marked ${shortId(item)} complete`); break;
@@ -1780,6 +2135,20 @@ function doAction(act, id){
 }
 
 /* ------------------------------------------------------------------ events */
+
+/* The inline answer box (features/Question_state.md). Typing records the draft
+   and arms the 5s autosave; leaving the box flushes it at once and releases any
+   render the typing held back. Delegated, so rebuilt rows stay wired. */
+document.addEventListener('input', (e) => {
+  const box = e.target.closest('.answerbox');
+  if (box) noteAnswerEdit(box.dataset.answer, box.value);
+});
+document.addEventListener('focusout', async (e) => {
+  const box = e.target.closest('.answerbox');
+  if (!box) return;
+  await flushAnswer(box.dataset.answer);
+  if (renderHeld && !document.querySelector('.answerbox:focus')) render();
+}, true);
 
 document.addEventListener('click', (e) => {
   const t = e.target.closest('button, [data-rowclick]');

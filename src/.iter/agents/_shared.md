@@ -8,11 +8,25 @@ never agent types.)
 ## Communicate clearly — a human must get it FAST
 
 Goal: a human developer skimming your output understands the status, the
-feedback, and any issues in seconds. Everything you write (outputs,
-observations, work items, commit messages, docs) follows these rules:
+feedback, and any issues in seconds. Structure EVERY output you write (work
+item outputs, observations, reports) as exactly three tiers, in this order:
 
-- **Lead with a 1–2 sentence summary in simple words.** Put detailed
-  explanations in a separate detail section BELOW the summary.
+1. **High-level summary** — a few sentences, no jargon, generous context. A
+   reader who knows nothing about this work item must come away knowing
+   (a) WHERE in the large codebase this work targets, (b) WHAT changed, and
+   (c) WHY.
+2. **Details** — everything else worth a human's eyes, as hierarchical
+   bullets (nest sub-bullets to show structure). Short but descriptive:
+   each bullet ideally fills one line, two lines at most. Numbered lists
+   when order matters, bullets when it doesn't.
+3. **Agent-level details** — at the BOTTOM: everything only a machine reader
+   needs (exact commands run, raw test output, ids, file-by-file minutiae).
+   Humans will likely never read this section; keep its content out of the
+   two tiers above.
+
+Style rules for all tiers (and everything else you write — commit messages,
+docs):
+
 - **Use specific, common words.** No jargon, no invented terms, no implied
   meanings. Call files and things by their exact names (`testgroup.iter.md`,
   not "the manifest").
@@ -20,10 +34,22 @@ observations, work items, commit messages, docs) follows these rules:
   every later run waits forever" beats "stale lock issue".
 - **Use an analogy when the concept is abstract.** One good comparison to an
   everyday thing speeds understanding more than a paragraph of precision.
-- **Use bullet or numbered lists** whenever you enumerate things or explain a
-  hierarchy. Numbers when order matters, bullets when it doesn't.
 - **Avoid large blocks of dense text** — they slow human readers down. Break
   them up or cut them.
+
+## Authoring `mainwork` (request) text on items you create
+
+Any agent may create work items, and each item's `mainwork` is read twice:
+by a human deciding whether the item should run, and by the agent that runs
+it. Author it in the same three-tier shape as your outputs:
+
+1. Open with a few plain-language sentences: where in the codebase the item
+   operates, what must change, and why — which requirement or test of the
+   current mainwork it serves.
+2. Then the specifics as hierarchical bullets — acceptance criteria, files,
+   constraints — one line each, two max.
+3. Put agent-only detail (exact commands, ids, raw listings the human should
+   not wade through) at the bottom, clearly last.
 
 ## Requesting a critical review
 
@@ -65,7 +91,8 @@ the prompt, decides. Design every handoff to work in BOTH modes: the documents
 and mainwork must stand alone whether a human reads them first or an agent
 picks them up seconds later. (Guards outrank automation: `iter reject`, the
 non-convergence guard, and failed dependencies land items in `todo` in any
-mode.)
+mode, and `--question` lands an item in `question` in any mode — see "Asking
+the human a question" below.)
 
 ## Lock scope and codepath_ignore
 
@@ -116,6 +143,48 @@ bucket, where the user edits and requeues (or deletes) it. No retries are
 burned; nothing gets buried in the completed archive. Your reason and your
 output are what the re-evaluating human sees: name the blocking fact and the
 smallest change that would make the item valid, then end your work.
+
+## Asking the human a question (any agent)
+
+Some decisions are not yours to make: what the product should do, which
+trade-off the project wants to live with, which of two defensible designs to
+carry for years. Guessing one of those and building on it is worse than
+stopping. Ask:
+
+    "$ITER_BIN" ask --project "$ITER_PROJECT" --question "<the question>"
+    "$ITER_BIN" ask --project "$ITER_PROJECT" --file .iter/temp/q-<workid>.md
+
+Your work item moves to the `question` state at the turn boundary — parked,
+no retries burned, your turns so far kept as the research behind the ask. When
+a human answers it in the webapp, the item queues again and the agent that
+picks it up gets the question and the answer at the top of its request.
+Summarize the question in your output and end your turn; do no further work on
+that item.
+
+If the decision does NOT block you, raise it as its own item instead and keep
+going: `"$ITER_BIN" add --type <agent> --title "<the decision, as a question>"
+--question "<the question>" --mainwork "<what to do once it is answered>"`.
+
+**Research before you ask.** A question the repository already answers wastes
+the one resource an agent cannot make more of. Read the relevant
+`*.code.iter.md` node files, the `*.bizreq.iter.md` / `*.techreq.iter.md` under
+them, the global context files, the interface contracts and use-cases, and the
+actual code. Ask only what none of them decide.
+
+**Write the question in four parts**, in this order:
+
+1. **Context** — where in the codebase this sits and why the decision is needed
+   now. Plain sentences; assume the reader has not seen this work item.
+2. **The question** — the one decision, stated as a question. One decision per
+   work item; two questions are two items.
+3. **Two to four options** — concrete, each with what it buys and what it costs
+   (effort, risk, what it forecloses later). Name the requirement, file, or
+   constraint each option honors or breaks.
+4. **Your recommendation** — which one you would take and why, so the human can
+   answer in one word.
+
+Never ask a question whose options you have not researched, and never ask one
+you could answer by reading. An unhelpful question is a rejected question.
 
 ## iter files — the FILENAME declares the nodetype (structureV2)
 
