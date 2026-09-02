@@ -225,4 +225,14 @@ pass "--question-widget helper"
 curl -sf "$BASE/" | grep -q "ITER" || fail "webui not served"
 pass "webui static page served"
 
+# dynamodb mode: drop the isolated e2e tables so the next run starts clean.
+# Deletion is prefix-guarded to iter3_e2e_ — it can never touch anything else.
+if [ "$BACKEND" = "dynamodb" ] && command -v aws >/dev/null; then
+  say "cleaning up iter3_e2e_* tables"
+  set -a; grep -E '^AWS_' "$REPO/.env" > "$SCRATCH/aws.env" || true; . "$SCRATCH/aws.env"; set +a
+  for t in $(aws dynamodb list-tables --output text --query 'TableNames[]' 2>/dev/null); do
+    case "$t" in iter3_e2e_*) aws dynamodb delete-table --table-name "$t" >/dev/null 2>&1 || true;; esac
+  done
+fi
+
 say "ALL E2E CHECKS PASSED ($BACKEND) — logs in $SCRATCH"

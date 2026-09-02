@@ -36,3 +36,7 @@ iter3.db
 iter3.db-wal
 iter3.db-shm
 iter3/.deploy.notes
+
+# iter3 local deploy runtime
+iter3/bin/
+iter3/run/
