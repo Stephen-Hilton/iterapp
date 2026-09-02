@@ -105,7 +105,7 @@ The `question` text is then written in four parts:
 shows the **Question** block and, directly under it, an editable **Answer**
 box — the same box that holds the recorded answer once the item has run, so an
 answer being written and an answer already given look like the one thing they
-are. There is no dialog and no Save button:
+are. Nothing has to be opened and there is no Save button:
 
 - **It saves itself.** Typing marks the draft dirty; a 5-second ticker flushes
   every dirty draft, and leaving the box flushes it immediately. A small status
@@ -120,12 +120,36 @@ The box is live in the states where the server accepts an edit — `question`,
 `todo`, `paused` — and is the read-only record everywhere else, so the UI never
 offers an edit the API would refuse.
 
-While an answer box has focus the row list is deliberately NOT re-rendered: the
-engine's own updates (which arrive over SSE and rebuild the rows wholesale)
-are held and replayed on blur. A few seconds of staleness is cheap; a
-half-typed answer losing its caret mid-sentence is not.
+**In a lightbox, for a question worth reading properly.** The Actions menu's
+first entry on any item that has an unanswered question is **Answer…**, and it
+opens the question in a modal of its own: the question in its own scroll box
+(44vh, so the answer area stays on screen under it), an answer box, and
+**Close** / **Answer and Queue**. It is the same box in the sense that matters —
+it carries the same `data-answer` attribute as the row's, so the drafts map, the
+5-second autosave and the status line treat the two as one box, and typing in
+either keeps the other in step. On an item whose state no longer accepts an
+answer the same lightbox opens read-only: the question, the recorded answer,
+Close.
 
-The Actions menu carries only the escapes: Queue without answering (the
+The reason it exists is length. An agent's question runs to thousands of
+characters, and reading one in the row means reading inside a list the engine
+rewrites every time it writes to its database.
+
+**Repaints are held while a lightbox is open, and while an answer box has
+focus.** The engine's updates arrive over SSE and rebuild the rows wholesale,
+which drops whatever element was scrolled and starts its replacement at the top.
+Both holds work the same way: `render()` records that a paint is owed and
+returns; closing the lightbox (or blurring the box) replays it immediately, so
+the list catches up in one rebuild rather than staleness that waits for the next
+event. Only the PAINT waits — `applyDelta()` keeps patching the data underneath
+and `syncBodies()` keeps fetching row bodies, so nothing arrives late.
+
+The server holds its end up too: an event whose `changed`, `removed` and
+`closed` are all empty AND whose counts match the last event sent is not written
+at all. The database moves on every agent heartbeat and log row; a row a reader
+can see moves far less often, and only the second kind is worth an event.
+
+The rest of the Actions menu carries the escapes: Queue without answering (the
 human's call, not refused), Move to ToDo, Pause & Edit, Complete, Delete.
 
 API:

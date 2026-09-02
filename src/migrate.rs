@@ -396,10 +396,12 @@ pub fn run(project_root: &Path, dry: bool) -> i32 {
     if let Some(m) = &project_marker {
         mig.remove(&m.path, "became main.iter.md");
     }
+    // V1's url_slug and marker_glob have no V2 home: the slug is always derived
+    // from the project name now, and the iterglob is a constant (the dot rule
+    // hardcodes .iter.md anyway).
     let server_cfg = format!(
-        "{{\n  \"mainfile\": \"{{topdir}}/main.iter.md\",\n  \"iterglob\": \"**/*.iter.md\",\n  \"topdir\": \"{}\",\n  \"url_slug\": \"{}\",\n  \"default_context\": {}\n}}\n",
+        "{{\n  \"mainfile\": \"{{topdir}}/main.iter.md\",\n  \"topdir\": \"{}\",\n  \"default_context\": {}\n}}\n",
         topdir_setting,
-        v1_projects["url_slug"].as_str().unwrap_or(""),
         serde_json::to_string(
             &v1_projects["default_context"]
                 .as_array()

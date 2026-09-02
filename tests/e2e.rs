@@ -30,11 +30,8 @@ fn setup_project(name: &str, max_attempts: u32, max_open: usize) -> (PathBuf, Pa
   "engine": {{
     "tick_interval_sec": 1,
     "agent_stagger_ms": 10,
-    "queue_lock_retry_ms": 20,
-    "queue_lock_break_sec": 30,
     "codepath_lock_timeout_sec": 600,
     "codepath_conflict_backoff_sec": 2,
-    "max_total_agents": 8,
     "max_open_workitems": {},
     "retry_backoff_sec": 0,
     "max_attempts": {}
@@ -1033,7 +1030,10 @@ fn api_crud_history_markers_and_settings() {
     );
     assert!(ps.contains("Renamed"), "{}", ps);
     let ps2 = http(port, "GET", "/api/projectsettings", None);
-    assert!(ps2.contains("api-test") && ps2.contains("iterglob"), "head files reflected: {}", ps2);
+    // Retired keys in an old client's payload are ignored, not stored: the slug
+    // derives from the project name and iterglob is a constant (2026-08-27).
+    assert!(ps2.contains("\"url_slug\":\"renamed\""), "derived slug, not the retired override: {}", ps2);
+    assert!(!ps2.contains("api-test") && !ps2.contains("iterglob"), "retired keys gone: {}", ps2);
     assert!(std::fs::read_to_string(dest.join("main.iter.md")).unwrap().contains("Renamed"), "frontmatter edit landed");
 
     // agents: list, edit roundtrip (body + comments untouched), bad names rejected

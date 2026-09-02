@@ -58,7 +58,7 @@ pub struct Sched {
     pub at: String,
     /// "mon".."sun", for weekly.
     pub day: String,
-    /// IANA timezone; empty = globalsettings.user_timezone.
+    /// IANA timezone; empty = UTC (user_timezone is display-only).
     pub tz: String,
     /// ISO timestamp of the last fire (clone creation) — the durable restart
     /// memory; the audit trail is the `sched_log` table (`iter export`).

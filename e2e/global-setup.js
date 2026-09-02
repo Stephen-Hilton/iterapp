@@ -4,6 +4,16 @@
 const fs = require('fs');
 const path = require('path');
 
+// ~4kB of question, the size an agent's real decision request runs to. The
+// numbered lines give the test something exact to look for at the bottom of the
+// scroll box: LINE 001 is off-screen once you have scrolled to LINE 060.
+const LONG_QUESTION =
+  'Which storage backend should the ledger use for the monthly rollup?\n\n' +
+  Array.from({ length: 60 }, (_, i) =>
+    `LINE ${String(i + 1).padStart(3, '0')}: consideration ${i + 1} — the trade-off here is durability against write latency.`
+  ).join('\n') +
+  '\n\nEND OF QUESTION — pick one of the options above.';
+
 const prepare = async () => {
   const src = path.join(__dirname, '..', 'sampleV1');
   const dst = path.join(__dirname, '.fixture');
@@ -38,6 +48,19 @@ const prepare = async () => {
     mk({ workid: 'e2e-todo-config', title: 'E2E broken config', state: 'todo',
          todo_reason: 'config', lasterror: 'CONFIGURATION ERROR — codepath does not exist: /gone' }),
     mk({ workid: 'e2e-model-override', title: 'E2E cheap model', state: 'paused', model: 'sonnet' }),
+    // The Answer-lightbox item: a question long enough that it CANNOT fit in
+    // one screen, so a lost scroll position is visible as a failed assertion
+    // rather than as a judgment call about pixels.
+    mk({ workid: 'e2e-long-question', title: 'E2E long question', state: 'question',
+         question: LONG_QUESTION, times: { added: '2026-08-26T09:00:00Z', asked: '2026-08-26T09:05:00Z' } }),
+    // A second, disposable question item: "Answer and Queue" is a one-way trip,
+    // so the test that takes it needs a row of its own to spend. It depends on
+    // an item that never closes, so once queued it WAITS at the dispatch gate
+    // instead of being picked up and failed by the engine mid-assertion.
+    mk({ workid: 'e2e-answer-submit', title: 'E2E answer and queue', state: 'question',
+         question: 'Should the rollup run nightly or hourly?',
+         depends_on: ['e2e-todo-approval'],
+         times: { added: '2026-08-26T09:00:00Z', asked: '2026-08-26T09:05:00Z' } }),
   ].join('\n') + '\n');
   fs.appendFileSync(path.join(dst, '.iter', '.engine', 'workitems_closed.jsonl'),
     mk({ workid: 'e2e-closed-failed', title: 'E2E closed failed', state: 'failed', attempts: 50,

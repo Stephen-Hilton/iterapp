@@ -42,6 +42,17 @@ impl Usage {
     }
 }
 
+/// Seconds between probe pokes while the engine is working; also the fallback
+/// retry interval after a usage-limit 429 that stated no reset time. Fixed at
+/// the 2026-08-27 settings audit — it was config nobody had a reason to tune.
+pub const PROBE_INTERVAL_SEC: u64 = 300;
+
+/// Warn when the engine is working but the usage snapshot is older than this.
+pub const SNAPSHOT_STALE_WARN_SEC: u64 = 900;
+
+/// Model for the probe session — cheapest available.
+const PROBE_MODEL: &str = "haiku";
+
 pub fn snapshot_path(cfg: &Config) -> PathBuf {
     let raw = cfg.limits.snapshot_path.trim();
     let raw = if raw.is_empty() { "~/.claude/iter-usage-snapshot.json" } else { raw };
@@ -372,7 +383,7 @@ pub fn probe_poke(project_root: &Path, cfg: &Config, poke_count: u64) {
         }
     };
     if !session_exists(mux) {
-        let model = if cfg.limits.probe_model.trim().is_empty() { "haiku" } else { cfg.limits.probe_model.trim() };
+        let model = PROBE_MODEL;
         let created = match mux {
             Mux::Tmux => shell(
                 "tmux",

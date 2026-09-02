@@ -1,5 +1,13 @@
+.env
+
 # Rust
 /target
+
+# The self-hosted iter project (iter/): the deployed binary is a build
+# artifact; the queue home's files (head files, agents, engine config) are
+# tracked like the samples'.
+/iter/iter
+/iter/.iter/server.out
 
 # iterloop runtime artifacts
 *.iter.lock

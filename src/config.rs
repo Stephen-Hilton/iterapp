@@ -4,13 +4,13 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EngineConfig {
+    /// Scheduler pacing. Deliberately NOT in the Settings UI (2026-08-27
+    /// settings audit): no user reason to tune them, but the e2e harness sets a
+    /// 1-second tick to keep the suite fast, so they stay config, not consts.
     pub tick_interval_sec: u64,
     pub agent_stagger_ms: u64,
-    pub queue_lock_retry_ms: u64,
-    pub queue_lock_break_sec: u64,
     pub codepath_lock_timeout_sec: u64,
     pub codepath_conflict_backoff_sec: u64,
-    pub max_total_agents: usize,
     pub max_open_workitems: usize,
     pub retry_backoff_sec: u64,
     pub max_attempts: u32,
@@ -30,11 +30,8 @@ impl Default for EngineConfig {
         EngineConfig {
             tick_interval_sec: 5,
             agent_stagger_ms: 100,
-            queue_lock_retry_ms: 50,
-            queue_lock_break_sec: 60,
             codepath_lock_timeout_sec: 3600,
             codepath_conflict_backoff_sec: 15,
-            max_total_agents: 8,
             max_open_workitems: 200,
             retry_backoff_sec: 300,
             max_attempts: 3,
@@ -54,8 +51,10 @@ impl Default for EngineConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GlobalSettings {
-    /// IANA timezone (e.g. "America/Los_Angeles") used by the webapp to display
-    /// timestamps. Data stays UTC on disk; this is display-only.
+    /// IANA timezone (e.g. "America/Los_Angeles") for DISPLAY ONLY: webapp
+    /// timestamps and human-facing log labels. All engine math is UTC — data
+    /// stays UTC on disk, and a schedule with no tz of its own runs in UTC
+    /// (2026-08-27 decision; it used to fall back to this setting).
     pub user_timezone: String,
     /// Testwriter output bounds: how many tests a testwriter agent produces per
     /// testgroup (floor / ceiling). Read by agents from config.json directly.
@@ -116,37 +115,33 @@ impl Default for GlobalSettings {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LimitsConfig {
-    /// Run the background probe session (tmux/screen + claude) that keeps the
-    /// usage snapshot fresh. Off by default — it spawns a real claude session.
-    pub probe_enabled: bool,
+    /// The base concurrent-agent cap — the below-80% rung of the utilization
+    /// ladder below. Moved here from the engine section (2026-08-27 settings
+    /// audit) so the whole ladder lives together; `load()` carries an old
+    /// config.json's engine.max_total_agents over.
+    pub max_total_agents: usize,
     /// Agent caps by account utilization percent (max of the 5h and 7d windows).
-    /// Below 80% the engine uses max_total_agents unchanged; 0 = stop picking.
+    /// Below 80% max_total_agents applies unchanged; 0 = stop picking.
     pub max_agents_at_80: usize,
     pub max_agents_at_90: usize,
     pub max_agents_at_95: usize,
-    /// Seconds between probe pokes while the engine is working; also the retry
-    /// interval after a hard usage-limit hit when no reset time was parseable.
-    pub probe_interval_sec: u64,
-    /// Warn when the engine is working but the snapshot is older than this.
-    pub snapshot_stale_warn_sec: u64,
+    /// Run the background probe session (tmux/screen + claude) that keeps the
+    /// usage snapshot fresh. Off by default — it spawns a real claude session.
+    pub probe_enabled: bool,
     /// Machine-wide snapshot written by the statusline collector. Account state is
     /// global, so one snapshot serves every iter project on the box.
     pub snapshot_path: String,
-    /// Model for the probe session — cheapest available.
-    pub probe_model: String,
 }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
         LimitsConfig {
-            probe_enabled: false,
+            max_total_agents: 8,
             max_agents_at_80: 4,
             max_agents_at_90: 2,
             max_agents_at_95: 0,
-            probe_interval_sec: 300,
-            snapshot_stale_warn_sec: 900,
+            probe_enabled: false,
             snapshot_path: "~/.claude/iter-usage-snapshot.json".into(),
-            probe_model: "haiku".into(),
         }
     }
 }
@@ -214,8 +209,24 @@ pub fn global_context_files(project_root: &Path) -> Vec<std::path::PathBuf> {
 pub fn load(project_root: &Path) -> Config {
     let path = engine_dir(project_root).join("config.json");
     match std::fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str::<Config>(&text) {
-            Ok(cfg) => cfg,
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(mut v) => {
+                // max_total_agents moved engine → limits (2026-08-27). A file
+                // written before the move still names the cap in engine; honor
+                // it unless limits already states its own.
+                if v.is_object() && v.get("limits").and_then(|l| l.get("max_total_agents")).is_none() {
+                    if let Some(old) = v.get("engine").and_then(|e| e.get("max_total_agents")).cloned() {
+                        v["limits"]["max_total_agents"] = old;
+                    }
+                }
+                match serde_json::from_value::<Config>(v) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        eprintln!("warning: {} is invalid ({}); using defaults", path.display(), e);
+                        Config::default()
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("warning: {} is invalid ({}); using defaults", path.display(), e);
                 Config::default()
@@ -234,8 +245,25 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let cfg = load(&root);
         assert_eq!(cfg.engine.max_open_workitems, 200);
-        assert_eq!(cfg.engine.queue_lock_retry_ms, 50);
+        assert_eq!(cfg.limits.max_total_agents, 8);
         assert_eq!(cfg.globalsettings.testwriter_min_tests_per_group, 20);
+    }
+
+    /// A config.json from before the 2026-08-27 audit names the agent cap as
+    /// engine.max_total_agents; the load shim must carry a customized value
+    /// into limits rather than silently resetting it to the default.
+    #[test]
+    fn old_engine_max_total_agents_moves_to_limits() {
+        let dir = std::env::temp_dir().join(format!("iter-cfg-mta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(engine_dir(&dir)).unwrap();
+        let path = engine_dir(&dir).join("config.json");
+        std::fs::write(&path, r#"{"engine":{"max_total_agents":3}}"#).unwrap();
+        assert_eq!(load(&dir).limits.max_total_agents, 3, "old location honored");
+        // An explicit new-location value wins over a stale old one.
+        std::fs::write(&path, r#"{"engine":{"max_total_agents":3},"limits":{"max_total_agents":5}}"#).unwrap();
+        assert_eq!(load(&dir).limits.max_total_agents, 5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

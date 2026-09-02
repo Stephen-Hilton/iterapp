@@ -7,11 +7,8 @@ pub struct AgentDef {
     pub visible: bool,
     pub max_agent_count: usize,
     pub max_work_timeout_sec: u64,
-    pub max_connection_timeout_sec: u64,
     pub model: String,
     pub model_flags: String,
-    pub llm_run_mode: String,
-    pub sleep_interval_sec: u64,
     /// New-WorkItem form defaults (2026-08-18): when this agent type is
     /// selected, the form pre-fills codepath/codepath_ignore from these — so
     /// users don't have to remember conventions like the usecase agent's
@@ -32,11 +29,8 @@ impl Default for AgentDef {
             visible: true,
             max_agent_count: 1,
             max_work_timeout_sec: 3600,
-            max_connection_timeout_sec: 30,
             model: "opus".into(),
             model_flags: String::new(),
-            llm_run_mode: "headless".into(),
-            sleep_interval_sec: 30,
             default_codepath: String::new(),
             default_codepath_ignore: String::new(),
             body: String::new(),
@@ -114,11 +108,8 @@ pub fn parse(type_name: &str, content: &str) -> AgentDef {
             "visible" => def.visible = val == "true",
             "max_agent_count" => def.max_agent_count = val.parse().unwrap_or(def.max_agent_count),
             "max_work_timeout_sec" => def.max_work_timeout_sec = val.parse().unwrap_or(def.max_work_timeout_sec),
-            "max_connection_timeout_sec" => def.max_connection_timeout_sec = val.parse().unwrap_or(def.max_connection_timeout_sec),
             "model" => def.model = val,
             "model_flags" => def.model_flags = val,
-            "llm_run_mode" => def.llm_run_mode = val,
-            "sleep_interval_sec" => def.sleep_interval_sec = val.parse().unwrap_or(def.sleep_interval_sec),
             "default_codepath" => def.default_codepath = val,
             "default_codepath_ignore" => def.default_codepath_ignore = val,
             _ => {}
@@ -133,11 +124,8 @@ pub const EDITABLE_KEYS: &[&str] = &[
     "visible",
     "max_agent_count",
     "max_work_timeout_sec",
-    "max_connection_timeout_sec",
     "model",
     "model_flags",
-    "llm_run_mode",
-    "sleep_interval_sec",
     "default_codepath",
     "default_codepath_ignore",
 ];
@@ -220,7 +208,6 @@ mod tests {
         assert_eq!(code.max_agent_count, 3);
         assert_eq!(code.model, "opus");
         assert_eq!(code.model_flags, "--dangerously-skip-permissions");
-        assert_eq!(code.llm_run_mode, "headless");
         assert!(code.body.contains("code"));
         assert!(code.default_codepath.is_empty(), "code has no codepath opinion");
         let usecase = agents.iter().find(|a| a.type_name == "usecase").expect("usecase agent");

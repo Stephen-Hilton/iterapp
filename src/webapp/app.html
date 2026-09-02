@@ -401,6 +401,10 @@
   }
   .sethead { margin: 18px 0 8px; font-size: 15px; }
   .sethead small { color: var(--text-dim); font-weight: 500; font-size: 12px; margin-left: 8px; }
+  details.setgroup > summary { cursor: pointer; }
+  details.setgroup > summary h3 { display: inline; }
+  .setrow .range { display: flex; gap: 6px; align-items: center; }
+  .setrow .range input { width: 52px; }
 
   /* ---------- projects ---------- */
   :root {
@@ -1856,14 +1860,33 @@ function answerStatus(item){
 }
 
 /* Status is written straight to the DOM: while the box has focus the row is
-   deliberately NOT re-rendered (that would eat the caret mid-sentence). */
+   deliberately NOT re-rendered (that would eat the caret mid-sentence).
+
+   ALL of them, not the first: one item can have two answer boxes on the page at
+   once — the one in its expanded row and the one in the Answer lightbox — and
+   the row's comes first in document order, so writing only to the first match
+   would leave the box actually being typed in permanently reading "autosaves as
+   you type" while the hidden one behind the modal did the reporting. */
 function setAnswerState(id, st){
   answerState.set(id, st);
-  const el = document.querySelector(`[data-astat="${id}"]`);
-  if (!el) return;
+  const els = document.querySelectorAll(`[data-astat="${id}"]`);
+  if (!els.length) return;
   const item = items.find(i => i.workid === id);
-  el.textContent = item ? answerStatus(item) : '';
-  el.classList.toggle('dirty', st === 'dirty');
+  const text = item ? answerStatus(item) : '';
+  els.forEach(el => { el.textContent = text; el.classList.toggle('dirty', st === 'dirty'); });
+}
+
+/* Which of those boxes holds the text the user means. An open lightbox is the
+   one they are looking at and typing into, so it wins over the row's copy
+   underneath — which may be several keystrokes behind, or from a repaint that
+   happened before the modal opened. */
+function answerBoxFor(id){
+  const ov = $('overlay');
+  if (ov.classList.contains('open')) {
+    const inLb = ov.querySelector(`[data-answer="${id}"]`);
+    if (inLb) return inLb;
+  }
+  return document.querySelector(`[data-answer="${id}"]`);
 }
 
 function answerDirty(id){
@@ -1893,6 +1916,13 @@ async function flushAnswer(id){
 
 function noteAnswerEdit(id, text){
   answerDrafts.set(id, text);
+  /* Keep the OTHER box for this item in step — the row's, while the Answer
+     lightbox has the caret. Leave it stale and closing the modal would put a
+     box holding older words back in front of the user, and the next blur of it
+     would autosave those older words over what was just typed. */
+  document.querySelectorAll(`[data-answer="${id}"]`).forEach(b => {
+    if (b !== document.activeElement && b.value !== text) b.value = text;
+  });
   setAnswerState(id, answerDirty(id) ? 'dirty' : 'saved');
   if (answerTicker) return;
   answerTicker = setInterval(() => {
@@ -1908,7 +1938,7 @@ function noteAnswerEdit(id, text){
    one POST stores it, stamps times.answered, and queues the item. */
 async function answerAndQueue(id){
   const item = items.find(i => i.workid === id);
-  const box = document.querySelector(`[data-answer="${id}"]`);
+  const box = answerBoxFor(id);
   const text = (box ? box.value : answerDrafts.get(id) ?? item.answer ?? '').trim();
   if (!text) {
     toast('An answer needs text — that text is what the agent acts on');
@@ -1944,6 +1974,86 @@ async function answerAndQueue(id){
   }
 }
 
+/* ---- the Answer lightbox: a question you can actually finish reading -------
+   An agent's question runs to thousands of characters, and reading one in the
+   row means reading inside a list the engine rewrites every time it writes to
+   its database. Even with the paint now held (render()'s overlay check), the
+   row is the wrong place for a long read: the question shares its scroll box
+   with the request, the output and everything else on the page.
+
+   So the question gets a room of its own. Think of it as taking a letter out of
+   a moving conveyor belt to read it at a desk: the modal holds its OWN copy of
+   the words and its own scroll position, the belt keeps moving behind it, and
+   putting the letter down (Close) is when the belt is looked at again.
+
+   The answer box carries the same `data-answer` attribute as the row's, so the
+   delegated input/focusout listeners, the draft map, the 5-second autosave and
+   the status line all treat it as the same box — nothing here reimplements
+   any of that. */
+async function openAnswerLb(id){
+  let item = items.find(i => i.workid === id);
+  if (!item) return;
+  /* A summary row carries `has_question: true` but not a word of the question.
+     Opening on one would show an empty box over a question nobody can read —
+     fetch first, and if it is STILL a summary say so rather than lie. */
+  if (isSummary(item)) {
+    await ensureBody(id);
+    item = items.find(i => i.workid === id) || item;
+    if (isSummary(item)) { toast('Still loading this item’s question — try again in a moment'); return; }
+  }
+  if (!hasQuestion(item)) { toast('This item has no question to answer'); return; }
+
+  // The states where the server still accepts an edit get the editor; anywhere
+  // else this is the durable record of what was asked and what was decided.
+  const editable = ANSWERABLE.includes(item.state);
+  const asked = item.times.asked
+    ? ` <span style="color:var(--text-dim);font-weight:500;font-size:11.5px">— asked ${esc(fmtTs(item.times.asked))}${ago(item.times.asked) ? ` (${ago(item.times.asked)} ago)` : ''}</span>`
+    : '';
+  const val = answerDrafts.has(id) ? answerDrafts.get(id) : (item.answer || '');
+  // 44vh, not the .textblock default of 60vh: the answer box and the buttons
+  // have to stay on screen under it, or answering means scrolling away from
+  // the question to find where to type.
+  const answerHtml = editable
+    ? `<textarea class="answerbox" data-answer="${id}" rows="6" spellcheck="true"
+         placeholder="Name one of the recommendations, or give a different direction. The agent gets this text verbatim at the top of its request.">${esc(val)}</textarea>
+       <div class="answerrow"><span class="answerstat" data-astat="${id}">${esc(answerStatus(item))}</span></div>`
+    : (item.answer
+        ? `<div class="textblock answer">${esc(item.answer)}</div>`
+        : `<div class="textblock unanswered">No answer recorded — this item is <b>${esc(item.state)}</b>, a state the server no longer accepts an answer for.</div>`);
+
+  if (typeof lbStack !== 'undefined') lbStack = [];
+  openLb(`Question — ${item.title}`, `
+    <div class="dlabel">Question${asked}</div>
+    <div class="textblock question" data-answerlbq style="max-height:44vh">${esc(item.question)}</div>
+    <div class="dlabel">Answer</div>
+    ${answerHtml}`,
+    editable
+      ? `<button class="btn" data-lbclose>Close</button>
+         <button class="btn primary" id="lbAnswerQueue">Answer and Queue</button>`
+      : `<button class="btn" data-lbclose>Close</button>`);
+
+  // Deliberately NOT focused: the point of this box is reading the question
+  // from the top, and a focused textarea would also be doing render()'s holding
+  // for it — hiding whether the overlay hold actually works.
+  if (!editable) return;
+  $('lbAnswerQueue').addEventListener('click', async () => {
+    const box = $('overlay').querySelector(`[data-answer="${id}"]`);
+    if (!box || !box.value.trim()) {
+      toast('An answer needs text — that text is what the agent acts on');
+      if (box) box.focus();
+      return;
+    }
+    noteAnswerEdit(id, box.value);       // whatever is on screen IS the draft
+    await flushAnswer(id);
+    // answerAndQueue reads the box and paints optimistically before its first
+    // await, so the modal is still open when it takes the modal's text — and
+    // closing right after releases the paint it just held.
+    const done = answerAndQueue(id);
+    closeLb();
+    await done;
+  });
+}
+
 /* issue 7c — the release acts on this item's DESCENDANTS, never on the item, so
    it belongs in every menu including a closed one: the parent that filed a
    review-gated programme is normally complete and archived by the time anyone
@@ -1951,6 +2061,15 @@ async function answerAndQueue(id){
 function gatedMenuItem(item){
   const n = gatedCounts.get(item.workid);
   return `<button data-act="gated" data-id="${item.workid}" role="menuitem">Release${n ? ` ${n}` : ''} gated item${n === 1 ? '' : 's'}…</button>`;
+}
+
+/* "Answer…" — offered whenever there IS a question and the server would still
+   take an answer for it (question, todo, paused). An item parked in ToDo with
+   an unanswered question is the case this catches that the row alone did not:
+   the question is right there in the row, but nothing in the menu said so. */
+function answerMenuItem(item){
+  if (!hasQuestion(item) || !ANSWERABLE.includes(item.state)) return '';
+  return `<button data-act="answerlb" data-id="${item.workid}" role="menuitem">Answer…</button>`;
 }
 
 function actionButtons(item){
@@ -1994,10 +2113,12 @@ function actionButtons(item){
       <button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete</button>`;
   }
   if (s === 'question') {
-    // Answering happens in the row itself (open it and type), so the menu only
-    // carries the escapes — including queueing it unanswered, which is the
-    // human's call and not something the engine refuses.
-    return `<button data-act="queue" data-id="${item.workid}" role="menuitem">Queue without answering</button>
+    // Answering happens in the row OR in the Answer lightbox — the lightbox is
+    // first because a long question is unreadable anywhere else. The rest of
+    // the menu carries the escapes, including queueing it unanswered, which is
+    // the human's call and not something the engine refuses.
+    return `${answerMenuItem(item)}
+      <button data-act="queue" data-id="${item.workid}" role="menuitem">Queue without answering</button>
       <button data-act="todo" data-id="${item.workid}" role="menuitem">Move to ToDo</button>
       <button data-act="pauseedit" data-id="${item.workid}" role="menuitem">Pause &amp; Edit</button>
       <button data-act="complete" data-id="${item.workid}" role="menuitem">Complete (no work needed)</button>
@@ -2021,6 +2142,10 @@ function actionButtons(item){
   if (s === 'complete') b.push(['followup','Create Follow-up Request']);
   b.push(['clone','Clone']);
   const rows = b.map(([a,l]) => `<button data-act="${a}" data-id="${item.workid}" role="menuitem">${l}</button>`);
+  // First in the list: a todo/paused item still carrying an unanswered question
+  // is one someone has to READ before any of the verbs below make sense.
+  const answer = answerMenuItem(item);
+  if (answer) rows.unshift(answer);
   rows.push(gatedMenuItem(item));
   rows.push('<div class="sep"></div>');
   rows.push(`<button class="danger" data-act="delete" data-id="${item.workid}" role="menuitem">Delete</button>`);
@@ -2030,15 +2155,27 @@ function actionButtons(item){
 /* A rebuild of the rows replaces the DOM wholesale, which would eat the caret
    out of an answer box mid-sentence. While one has focus the rebuild is held
    and replayed on blur — the engine's own updates can wait a few seconds; a
-   half-typed answer cannot survive being retyped. */
+   half-typed answer cannot survive being retyped.
+
+   An OPEN LIGHTBOX holds the rebuild for the same reason, one step larger. A
+   question can run to several thousand characters, and reading one takes longer
+   than the gap between two engine writes: every rebuild drops the scrolled
+   element on the floor and the replacement starts back at the top, so the
+   reader is walked to the top of the page every few seconds. A modal is the
+   reader's whole attention — the queue behind it can wait until they close it.
+   Only the PAINT waits; syncBodies() below still runs, and the data underneath
+   keeps being patched by applyDelta() exactly as before. */
 let renderHeld = false;
+function renderBlocked(){
+  return !!document.querySelector('.answerbox:focus') || $('overlay').classList.contains('open');
+}
 function render(){
   // Ahead of the focus check on purpose: a delta can invalidate the body of a
   // row that is open somewhere else on the page while an answer is being typed,
   // and that refetch should start now rather than wait on a blur. The fetch's
   // own render() is held in turn, and the blur replays it.
   syncBodies();
-  if (document.querySelector('.answerbox:focus')) { renderHeld = true; return; }
+  if (renderBlocked()) { renderHeld = true; return; }
   renderHeld = false;
   if (firstLoad) { renderSkeleton(); return; }
   renderSummary(); renderRows();
@@ -2054,12 +2191,25 @@ function toast(msg){
 /* ------------------------------------------------------------------ lightboxes */
 
 function openLb(title, bodyHtml, footHtml){
+  // A modal takes the screen, so the Actions menu that opened it goes away with
+  // it. This used to happen by accident — the next engine event repainted the
+  // rows out from under the menu — and the repaint is now held while a lightbox
+  // is up, so the close has to be said out loud.
+  document.querySelectorAll('.actmenu.open').forEach(m => m.classList.remove('open'));
   $('lbTitle').textContent = title;
   $('lbBody').innerHTML = bodyHtml;
   $('lbFoot').innerHTML = footHtml || '<button class="btn" data-lbclose>Close</button>';
   $('overlay').classList.add('open');
 }
-function closeLb(){ $('overlay').classList.remove('open'); if (typeof lbStack !== 'undefined') lbStack = []; }
+/* Closing releases the hold render() took while the modal was up: everything
+   that arrived behind it is already in `items`, so one rebuild catches the list
+   up to now. Without this the list would sit on whatever it said when the modal
+   opened until the next engine write happened along. */
+function closeLb(){
+  $('overlay').classList.remove('open');
+  if (typeof lbStack !== 'undefined') lbStack = [];
+  if (renderHeld && !renderBlocked()) render();
+}
 
 function fakeGroups(item){
   if (!item.tests) return [];
@@ -2707,6 +2857,9 @@ function doAction(act, id){
   const item = items.find(i => i.workid === id);
   if (!item) return;
   if (act === 'answerqueue') { answerAndQueue(id); return; }
+  // Reading and answering, both modes: the lightbox handles its own body fetch
+  // and its own read-only fallback, so it is the same call live or in the demo.
+  if (act === 'answerlb') { openAnswerLb(id); return; }
   // Acts on this item's descendants, not on the item — so it works the same
   // whether the item is open or archived (issue 7c).
   if (act === 'gated') { releaseGated(id); return; }
@@ -2829,7 +2982,9 @@ document.addEventListener('focusout', async (e) => {
   const box = e.target.closest('.answerbox');
   if (!box) return;
   await flushAnswer(box.dataset.answer);
-  if (renderHeld && !document.querySelector('.answerbox:focus')) render();
+  // Leaving the box in the Answer lightbox releases nothing: the modal is still
+  // up, and the list behind it stays held until it closes.
+  if (renderHeld && !renderBlocked()) render();
 }, true);
 
 document.addEventListener('click', (e) => {
@@ -3083,15 +3238,15 @@ document.addEventListener('mousemove', (e) => {
 });
 
 /* ------------------------------------------------------- iterloop settings */
+/* 2026-08-27 settings audit: the scheduler-pacing knobs (tick_interval_sec,
+   agent_stagger_ms) stay in config.json for the test harness but are NOT
+   editable here; queue_lock_*, probe_interval_sec, snapshot_stale_warn_sec and
+   probe_model were retired outright (dead or hardcoded); max_total_agents
+   moved into limits so the whole agent ladder lives together. */
 const CONFIG = {
   engine: {
-    tick_interval_sec: [5, 'seconds between scheduler ticks'],
-    agent_stagger_ms: [100, 'delay between agent spawns in one tick'],
-    queue_lock_retry_ms: [50, 'record-lock retry interval'],
-    queue_lock_break_sec: [60, 'ghost-lock breaker window'],
     codepath_lock_timeout_sec: [3600, 'codepath lock lifetime'],
     codepath_conflict_backoff_sec: [15, 'wait before re-picking a lock-blocked item'],
-    max_total_agents: [8, 'global concurrent agent cap'],
     max_open_workitems: [200, 'queue cap; iter add refuses beyond this'],
     retry_backoff_sec: [300, 'wait before a failed item retries'],
     max_attempts: [3, 'attempts before terminal failure'],
@@ -3100,13 +3255,13 @@ const CONFIG = {
     shell_timeout_sec: [3600, 'wall-clock budget per shell command in an exec:shell item; overrun kills it and fails the item'],
   },
   globalsettings: {
-    user_timezone: ['UTC', 'timezone for displaying timestamps — data stays UTC on disk; DST handled automatically'],
+    user_timezone: ['UTC', 'display-only timezone: webapp timestamps and log labels — data stays UTC on disk, and everything the engine computes (schedules included) runs in UTC'],
     default_automation: ['auto', 'what a user-filed work item’s automation mode is when it doesn’t say — auto: the items it creates are born Queued (the whole chain runs); review: they are born ToDo and wait for a click at every stage. A per-item setting still overrides this.'],
     temp_dir: ['{dotiter}/temp/', 'where agents put scratch files; exported to every agent session as $ITER_TEMP, absolute — a relative path in an agent prompt resolves against wherever that agent happens to be working and mints a stray temp tree there'],
     temp_file_ttl_days: [14, 'temp files are auto-removed after this many days by the daily sweep; 0 = never sweep. Critique files (critique-*) are never swept — they are review history, not scratch.'],
     critreview_max_rounds: [3, 'max critical-review rounds an agent runs per work item — substituted into _shared.md as {critreview_max_rounds}; each round is a synchronous critic session (minutes + spend), and agents stop earlier when a review has no material findings'],
-    testwriter_min_tests_per_group: [20, 'minimum tests a testwriter agent produces per testgroup (floor)'],
-    testwriter_max_tests_per_group: [100, 'maximum tests a testwriter agent produces per testgroup'],
+    testwriter_min_tests_per_group: [20, 'fewest tests a testwriter agent produces per testgroup'],
+    testwriter_max_tests_per_group: [100, 'most tests a testwriter agent produces per testgroup'],
     test_dir: ['test', 'the per-component test directory name — testwriter items lock <component>/<test_dir>, code items list it in codepath_ignore; exported to agents as ITER_TEST_DIR'],
     log_default_path: ['./logs/{YYYYMMDD-hh}.log', 'engine log file pattern'],
     log_level: ['info', 'debug | info | warn | error'],
@@ -3114,15 +3269,22 @@ const CONFIG = {
     log_max_files: [50, 'rotated files kept'],
   },
   limits: {
+    max_total_agents: [8, 'concurrent agent cap while account usage is BELOW 80% — the base rung of the ladder (usage = max of the 5h and 7d windows)'],
+    max_agents_at_80: [4, 'agent cap once account usage reaches 80%'],
+    max_agents_at_90: [2, 'agent cap at 90%'],
+    max_agents_at_95: [0, 'agent cap at 95% — 0 = stop picking until the window resets (engine stays up and auto-resumes)'],
     probe_enabled: [false, 'run the background probe (tmux/screen + claude) that keeps account usage fresh while the engine works'],
-    max_agents_at_80: [4, 'agent cap once account usage ≥80% — max of the 5h and 7d windows; below 80% max_total_agents applies unchanged'],
-    max_agents_at_90: [2, 'agent cap at ≥90%'],
-    max_agents_at_95: [0, 'agent cap at ≥95% — 0 = stop picking until the window resets (engine stays up and auto-resumes)'],
-    probe_interval_sec: [300, 'seconds between probe pokes while working; also the hold retry interval after a hard limit'],
-    snapshot_stale_warn_sec: [900, 'warn when the usage snapshot is older than this'],
     snapshot_path: ['~/.claude/iter-usage-snapshot.json', 'machine-wide snapshot written by the statusline collector — shared by every iter project on the box'],
-    probe_model: ['haiku', 'model for the probe session — cheapest available'],
   },
+};
+
+/* Friendlier display labels where the raw key hides the mechanism — the agent
+   ladder reads as one set of rungs. Save still targets the real key. */
+const CFG_LABELS = {
+  max_total_agents: 'max agents — below 80%',
+  max_agents_at_80: 'max agents — at 80‑90%',
+  max_agents_at_90: 'max agents — at 90‑95%',
+  max_agents_at_95: 'max agents — at 95%+',
 };
 
 /* Per-agent frontmatter fields — .iter/agents/<name>.md. Same keys the engine's
@@ -3133,19 +3295,15 @@ const AGENT_FIELDS = {
   visible: ['true', 'bool', 'show this type in the New WorkItem selector'],
   max_agent_count: [1, 'num', 'concurrent agents of this type'],
   max_work_timeout_sec: [3600, 'num', 'kill a turn that runs longer than this'],
-  max_connection_timeout_sec: [30, 'num', 'reserved — parsed but not used by the engine yet'],
   model: ['opus', 'text', 'passed to claude --model'],
   model_flags: ['', 'text', 'extra claude CLI flags, e.g. --dangerously-skip-permissions'],
-  llm_run_mode: ['headless', 'text', 'reserved — headless is the only mode today'],
-  sleep_interval_sec: [30, 'num', 'reserved — parsed but not used by the engine yet'],
   default_codepath: ['', 'text', 'pre-fills CodePath when this agent type is picked in New WorkItem — {usecase_dir}/{interface_dir}/{test_dir} placeholders resolve per project; empty = leave the field alone'],
   default_codepath_ignore: ['', 'text', 'pre-fills CodePath ignore (comma-separated patterns; same placeholders resolve) — e.g. the usecase agent carves {test_dir}/ so testwriters work in parallel'],
 };
 const MOCK_AGENT_DEFS = AGENTS.map(t => ({
   type: t, description: `the ${t} agent`, visible: true,
-  max_agent_count: t === 'code' ? 3 : 1, max_work_timeout_sec: 3600, max_connection_timeout_sec: 30,
-  model: 'opus', model_flags: '--dangerously-skip-permissions', llm_run_mode: 'headless',
-  sleep_interval_sec: 30,
+  max_agent_count: t === 'code' ? 3 : 1, max_work_timeout_sec: 3600,
+  model: 'opus', model_flags: '--dangerously-skip-permissions',
   default_codepath: t === 'usecase' ? '{usecase_dir}' : '',
   default_codepath_resolved: t === 'usecase' ? 'usecases' : '',
   default_codepath_ignore: t === 'usecase' ? '{test_dir}/' : '',
@@ -3181,40 +3339,36 @@ function tzSelectHtml(cfgKey, current){
 }
 
 /* One running server per project; iterloop and iterapp are its two halves,
-   so ONE Settings page serves both. Each setting is placed by what it affects
-   — the loop runner under Iterloop; project management, visualization, and
-   file layout in C4 context under Iterapp — regardless of which file stores
-   it: data-cfg inputs save to .iter/.engine/config.json, data-ps inputs to
-   .iter/projects.json. Save All writes both. Built lazily so CONFIG and
-   PROJSET (declared elsewhere) are both in scope at call time. */
+   and ONE Settings page serves both. Groups are organized by the QUESTION a
+   user arrives with (identity, layout, context, automation, budget, testing,
+   logging), never by which file stores a setting: data-cfg inputs save to
+   .iter/.engine/config.json, data-ps inputs to the two head files. Save All
+   writes everything. The last group is Advanced — engine internals, collapsed.
+   Built lazily so CONFIG and PROJSET (declared elsewhere) are in scope. */
 function settingsLayout(){
   const cfg = (section, key) => ({ src: 'cfg', section, key });
   const psi = (key) => ({ src: 'ps', key });
   return [
-    ['Iterloop', 'the loop runner: scheduler, agents, the test loop, spend and usage guards', [
-      ['Engine', 'Scheduler, locking, and retry behavior — .iter/.engine/config.json',
-        Object.keys(CONFIG.engine).map(k => cfg('engine', k))],
-      ['Test', 'Testwriter output bounds and the test-directory layout. The deterministic test loop itself runs as a "Test Loop" scheduled workitem whose command carries every knob as a visible flag — create it below, tune/pause it in WorkItems — see features/TDD.md',
-        ['testwriter_min_tests_per_group','testwriter_max_tests_per_group','test_dir'].map(k => cfg('globalsettings', k))],
-      ['Automation & scratch', 'What new work items are automated by default, and where agents keep their scratch files (exported to them as $ITER_TEMP)',
-        ['default_automation','temp_dir','temp_file_ttl_days'].map(k => cfg('globalsettings', k))],
-      ['Review', 'Critical-review budget: how many critic rounds an agent may run per work item (the cap _shared.md tells every agent; takes effect on the next agent spin-up, no restart needed)',
-        [cfg('globalsettings','critreview_max_rounds')]],
-      ['Usage limits', 'Account-usage throttle: tiered agent caps from Claude Code’s server-reported 5h/7d utilization, kept fresh by the probe session',
-        Object.keys(CONFIG.limits).map(k => cfg('limits', k))],
-      ['Logging', 'Engine log output and rotation',
-        ['log_default_path','log_level','log_max_size_mb','log_max_files'].map(k => cfg('globalsettings', k))],
-    ]],
-    ['Iterapp', 'the project head and the structure map: the two head files, discovery, display', [
-      ['Project head', 'main.iter.md — the evolving project definition, FIRST file in every agent context (its frontmatter keys become {placeholders})',
-        ['projectname','projectdescription','globalcontextfiles'].map(psi)],
-      ['Discovery', 'The server half — .iter/config.iter.json: where the head lives, what gets scanned',
-        ['topdir','mainfile','iterglob','globalscandirs','url_slug'].map(psi)],
-      ['Global dirs & creation defaults', 'Where interfaces and use-cases live ({interfaces} / {usecases}), and the context new work items start with',
-        ['globalinterfacedir','globalusecasedir','default_context'].map(psi)],
-      ['Display', 'Timestamp display',
-        [cfg('globalsettings','user_timezone')]],
-    ]],
+    ['Project', 'Identity and display: how this project names itself and shows timestamps',
+      [psi('projectname'), psi('projectdescription'), cfg('globalsettings','user_timezone')]],
+    ['Layout & discovery', 'Where everything lives: the head files, what gets scanned, and the directory conventions ({interfaces} / {usecases} / the per-component test dir)',
+      [psi('topdir'), psi('mainfile'), psi('globalscandirs'), psi('globalinterfacedir'), psi('globalusecasedir'), cfg('globalsettings','test_dir')]],
+    ['Agent context', 'What agents see and where they scratch: globalcontextfiles is ALWAYS loaded into every agent; default_context only prefills the Context field when a work item is created from a node (editable per item before filing)',
+      [psi('globalcontextfiles'), psi('default_context'), cfg('globalsettings','temp_dir'), cfg('globalsettings','temp_file_ttl_days')]],
+    ['Automation & queue', 'How work flows: automation default for new lineages, the critical-review budget, and queue caps/retries',
+      ['default_automation','critreview_max_rounds'].map(k => cfg('globalsettings', k))
+        .concat(['max_open_workitems','max_attempts','retry_backoff_sec'].map(k => cfg('engine', k)))],
+    ['Budgets & throttling', 'Every "how much at once / how much money" knob: the daily spend cap, the agent ladder (base cap below 80% account usage, then the 80/90/95% rungs — usage is the max of the 5h and 7d windows, re-read every tick), shell workers, and the usage probe',
+      [cfg('engine','max_cost_usd_per_day')]
+        .concat(['max_total_agents','max_agents_at_80','max_agents_at_90','max_agents_at_95'].map(k => cfg('limits', k)))
+        .concat([cfg('engine','max_shell_workers'), cfg('limits','probe_enabled'), cfg('limits','snapshot_path')])],
+    ['Testing', 'Testwriter output bounds. The deterministic test loop itself runs as a "Test Loop" scheduled workitem whose command carries every knob as a visible flag — create it below, tune/pause it in WorkItems — see features/TDD.md',
+      [{ src: 'range', section: 'globalsettings', min: 'testwriter_min_tests_per_group', max: 'testwriter_max_tests_per_group',
+         label: 'tests per group', why: 'how many tests a testwriter agent produces per testgroup (min–max)' }]],
+    ['Logging', 'Engine log output and rotation',
+      ['log_default_path','log_level','log_max_size_mb','log_max_files'].map(k => cfg('globalsettings', k))],
+    ['Advanced', 'Engine internals — set-once values with working defaults; expand only when debugging lock contention or shell runs',
+      ['codepath_lock_timeout_sec','codepath_conflict_backoff_sec','shell_timeout_sec'].map(k => cfg('engine', k))],
   ];
 }
 
@@ -3251,7 +3405,15 @@ async function renderSettings(){
     else if (typeof v === 'boolean') control = `<select data-cfg="${section}.${key}" data-bool="true">
       <option${cur === 'true' ? ' selected' : ''}>true</option><option${cur !== 'true' ? ' selected' : ''}>false</option></select>`;
     else control = `<input type="text" data-cfg="${section}.${key}" data-num="${typeof v === 'number'}" value="${esc(cur)}">`;
-    return `<div class="setrow"><label>${key}</label>${control}<span class="why">${why}</span></div>`;
+    return `<div class="setrow"><label>${CFG_LABELS[key] || key}</label>${control}<span class="why">${why}</span></div>`;
+  };
+  // Two keys, one row: a min–max pair reads as a range, not two settings.
+  const rangeRow = ({ section, min, max, label, why }) => {
+    const input = (key) => {
+      const cur = String(cfgVal(section, key, CONFIG[section][key][0]));
+      return `<input type="text" data-cfg="${section}.${key}" data-num="true" value="${esc(cur)}">`;
+    };
+    return `<div class="setrow"><label>${label}</label><span class="range">${input(min)} – ${input(max)}</span><span class="why">${why}</span></div>`;
   };
   const psRow = ({ key }) => {
     const [v, why] = PROJSET[key];
@@ -3263,9 +3425,9 @@ async function renderSettings(){
            <div class="why" style="margin-top:4px">${why}</div></div></div>`
       : `<div class="setrow"><label>${key}</label><input type="text" data-ps="${key}" value="${esc(value)}"><span class="why">${why}</span></div>`;
   };
-  const row = (item) => item.src === 'cfg' ? cfgRow(item) : psRow(item);
+  const row = (item) => item.src === 'cfg' ? cfgRow(item) : item.src === 'range' ? rangeRow(item) : psRow(item);
   const legend = `<div class="sub" style="border:1px solid var(--border);border-radius:7px;padding:10px 12px;line-height:1.7">
-      <b>How iter files work (structureV2):</b> any file matching <span class="mono">iterglob</span> is iterapp-meaningful;
+      <b>How iter files work (structureV2):</b> any file matching <span class="mono">**/*.iter.md</span> is iterapp-meaningful;
       its <b>FILENAME declares its nodetype</b> via the dot rule — <span class="mono">*.nodetype.iter.md</span>
       (a dot before the nodetype unless the file has no prefix; lowercase):
       <span class="mono">*.main.iter.md</span> → THE project head ·
@@ -3294,10 +3456,15 @@ async function renderSettings(){
         timeout as visible flags. Tune it by editing the workitem's command; stop sweeping by pausing the schedule.
         One per project — the button refuses a duplicate.</div>
     </div></div>`;
-  const groupHtml = ([name, sub, items]) => `<div class="setgroup"><h3>${name}</h3><div class="sub">${sub}</div>
-    ${name === 'Discovery' ? legend : ''}
-    ${name === 'Test' ? testLoopSetup : ''}
-    ${items.map(row).join('')}</div>`;
+  const groupHtml = ([name, sub, items]) => {
+    const inner = `<div class="sub">${sub}</div>
+      ${name === 'Layout & discovery' ? legend : ''}
+      ${name === 'Testing' ? testLoopSetup : ''}
+      ${items.map(row).join('')}`;
+    return name === 'Advanced'
+      ? `<details class="setgroup"><summary><h3>${name}</h3></summary>${inner}</details>`
+      : `<div class="setgroup"><h3>${name}</h3>${inner}</div>`;
+  };
   const agentOptions = agents.map((a, i) =>
     `<option value="${esc(a.type)}"${i === 0 ? ' selected' : ''}>${esc(a.type)}</option>`).join('');
   const agentsGroup = `<div class="setgroup">
@@ -3315,17 +3482,16 @@ async function renderSettings(){
         <button class="btn primary" id="agSave">Save agent file</button>
       </div>` : '<div class="sub">No agent files found in .iter/agents/.</div>'}
     </div>`;
-  const sectionHtml = ([title, subtitle, groups], extra = '') => `<div class="setsection">
-    <h2 class="sethead">${title}<small>${subtitle}</small></h2>
-    ${groups.map(groupHtml).join('')}${extra}
-  </div>`;
+  // One flat run of groups, ordered by how often each is visited; the agent
+  // editor sits between Logging and Advanced, and Advanced renders collapsed.
   const layout = settingsLayout();
   $('view-settings').innerHTML = `<div class="setform">
     <div class="setsearch"><input type="search" id="setSearch"
       placeholder="Search settings — any part of a name, group, or description"
       autocomplete="off" spellcheck="false"></div>
-    ${sectionHtml(layout[0], agentsGroup)}
-    ${sectionHtml(layout[1])}
+    ${layout.slice(0, -1).map(groupHtml).join('')}
+    ${agentsGroup}
+    ${groupHtml(layout[layout.length - 1])}
     <div class="setfoot">
       <button class="btn" id="cfgReload">Reload from disk</button>
       <button class="btn" id="cfgReset">Reset engine config to defaults</button>
@@ -3346,10 +3512,9 @@ async function renderSettings(){
         if (hit) any = true;
       });
       g.style.display = (any || titleHit) ? '' : 'none';
-    });
-    document.querySelectorAll('#view-settings .setsection').forEach(sec => {
-      const any = [...sec.querySelectorAll('.setgroup')].some(g => g.style.display !== 'none');
-      sec.style.display = any ? '' : 'none';
+      // A hit inside the collapsed Advanced group must be visible, not hidden
+      // behind a closed summary.
+      if (g.tagName === 'DETAILS' && q && (any || titleHit)) g.open = true;
     });
   });
   $('mkTestLoop').addEventListener('click', async () => {
@@ -4367,19 +4532,19 @@ const PROJSET = {
   // main.iter.md frontmatter (the project half)
   projectname: ['Paydaay Core Product', 'display name: sidebar, browser tab — main.iter.md frontmatter'],
   projectdescription: ['', 'one line on the project, for UI purposes — main.iter.md frontmatter'],
-  globalscandirs: ['{topdir}/', 'directories the engine scans (with iterglob) for node files — one per line'],
+  globalscandirs: ['{topdir}/', 'directories the engine scans (with the **/*.iter.md glob) for node files — one per line'],
   globalinterfacedir: ['{topdir}/interfaces/', 'the global folder of *.interface.iter.md files — the {interfaces} placeholder'],
   globalusecasedir: ['{topdir}/usecases/', 'the global folder of *.usecase.iter.md files — the {usecases} placeholder'],
-  globalcontextfiles: ['', 'file globs ALWAYS loaded into new agent context (absorbed the old global bizreq/techreq settings) — one per line'],
-  // .iter/config.iter.json (the server half)
+  globalcontextfiles: ['', 'file globs the engine ALWAYS loads into every agent session, right after main.iter.md (absorbed the old global bizreq/techreq settings) — one per line. For the per-item form prefill instead, see default_context.'],
+  // .iter/config.iter.json (the server half). Retired 2026-08-27: url_slug
+  // (always derived from the project name now) and iterglob (a constant —
+  // **/*.iter.md — since the dot rule hardcodes the suffix anyway).
   mainfile: ['{topdir}/main.iter.md', 'path to the main.iter.md project head — config.iter.json'],
-  iterglob: ['**/*.iter.md', 'ONE glob finds every iter node file; the FILENAME dot rule (*.nodetype.iter.md) declares each file’s type'],
   topdir: ['{thisfiledir}/../', 'the singular top directory — the {topdir} every default hangs off ({thisfiledir} = the .iter/ folder)'],
-  url_slug: ['', 'hostname + tab title + favicon tint (empty = derived from the project name): http://<slug>.localhost:{port}/'],
-  default_context: ['{marker}\n{ancestor_markers}\n{interfaces}', 'context prefilled on Create-WorkItem-from-node — one entry per line'],
+  default_context: ['{marker}\n{ancestor_markers}\n{interfaces}', 'prefill TEMPLATE for the Context field when a work item is created from a node — placeholders expand against the clicked node; editable per item before filing. Not loaded by the engine itself (that is globalcontextfiles).'],
 };
 const PS_MULTILINE = ['globalscandirs', 'globalcontextfiles', 'default_context'];
-const PS_SERVER = ['mainfile', 'iterglob', 'topdir', 'url_slug', 'default_context'];
+const PS_SERVER = ['mainfile', 'topdir', 'default_context'];
 if (!LIVE) DEFAULT_CONTEXT = PROJSET.default_context[0].split('\n');
 
 /* -------------------------------------------------- multi-server identity */

@@ -84,11 +84,15 @@ test.describe('settings view (the two head files)', () => {
   test('renders head-file settings with live values', async ({ page }) => {
     await page.goto('/#/settings');
     await expect(page.locator('[data-ps="projectname"]')).toHaveValue('Sample Ledger');
-    await expect(page.locator('[data-ps="iterglob"]')).toHaveValue('**/*.iter.md');
     await expect(page.locator('[data-ps="topdir"]')).toBeVisible();
-    // The retired V1 settings are gone.
+    // The retired settings are gone (V1's, and the 2026-08-27 audit's).
     await expect(page.locator('[data-ps="marker_glob"]')).toHaveCount(0);
     await expect(page.locator('[data-cfg="globalsettings.global_bizreq_path"]')).toHaveCount(0);
+    await expect(page.locator('[data-ps="iterglob"]')).toHaveCount(0);
+    await expect(page.locator('[data-ps="url_slug"]')).toHaveCount(0);
+    await expect(page.locator('[data-cfg="engine.queue_lock_retry_ms"]')).toHaveCount(0);
+    // The agent ladder lives in limits now, base rung included.
+    await expect(page.locator('[data-cfg="limits.max_total_agents"]')).toBeVisible();
   });
 
   test('saving the project half lands in main.iter.md frontmatter', async ({ page }) => {

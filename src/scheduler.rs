@@ -377,7 +377,7 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
         let usage = limits::read_snapshot(&cfg);
         let pct = usage.as_ref().map(|u| u.effective_pct(now_utc));
         let tier = pct.and_then(|p| limits::tier_cap(&cfg.limits, p));
-        let effective_max = tier.map_or(cfg.engine.max_total_agents, |c| c.min(cfg.engine.max_total_agents));
+        let effective_max = tier.map_or(cfg.limits.max_total_agents, |c| c.min(cfg.limits.max_total_agents));
         // The cap line carries its own inputs. Two of them are not obvious from
         // the webapp header and made this line look non-deterministic in the
         // field: the percentage that picks the band is the MAX of the two
@@ -398,7 +398,7 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
                             "account usage {:.0}% (5h {:.0}%, 7d {:.0}% — the throttle uses the higher, \
                              reset windows counted as 0) → {}% band → max_agents_at_{} = {}; \
                              effective max agents {} (max_total_agents {})",
-                            p, h5, d7, band, band, cap, effective_max, cfg.engine.max_total_agents
+                            p, h5, d7, band, band, cap, effective_max, cfg.limits.max_total_agents
                         ),
                     )
                 }
@@ -604,7 +604,7 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
             !running.is_empty() || holding || items.iter().any(|i| i.eligible(&cfg, now_utc));
         if work_present && !stop_picking {
             let stale_sec = usage.as_ref().map(|u| u.age_sec(now_utc)).unwrap_or(i64::MAX);
-            if stale_sec > cfg.limits.snapshot_stale_warn_sec as i64 {
+            if stale_sec > limits::SNAPSHOT_STALE_WARN_SEC as i64 {
                 if !stale_warned {
                     let what = if usage.is_none() { "missing".to_string() } else { format!("{}s old", stale_sec) };
                     logging::warn(
@@ -618,8 +618,8 @@ pub fn run(project_root: PathBuf, mode: RunMode) -> Result<(), String> {
                 stale_warned = false;
             }
             if cfg.limits.probe_enabled
-                && stale_sec > cfg.limits.probe_interval_sec as i64
-                && probe_last.elapsed().as_secs() >= cfg.limits.probe_interval_sec
+                && stale_sec > limits::PROBE_INTERVAL_SEC as i64
+                && probe_last.elapsed().as_secs() >= limits::PROBE_INTERVAL_SEC
                 && !probe_in_flight.load(Ordering::SeqCst)
             {
                 probe_last = Instant::now();
@@ -1291,7 +1291,7 @@ fn run_workitem(shared: Arc<Shared>, agent: AgentDef, item: WorkItem, tag: Strin
                         requeue_with_output(&shared, &item.workid, "credit/account limit reached; engine auto-drained", true, Some(outputs.join("\n")));
                     } else {
                         let now = chrono::Utc::now();
-                        let retry = cfg.limits.probe_interval_sec.max(60) as i64;
+                        let retry = limits::PROBE_INTERVAL_SEC as i64;
                         let (announced, until) =
                             shared.enter_limit_hold(limits::Hold::from_error(&e, now, retry), now);
                         let resuming = limits::local_label(until, &cfg);

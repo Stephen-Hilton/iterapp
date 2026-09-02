@@ -35,13 +35,12 @@ pub const CHECK_INTERVAL_SEC: u64 = 59;
 /// check cadence cannot miss a live occurrence inside 150s.
 const OCCURRENCE_WINDOW_SEC: i64 = 150;
 
-fn tz_of(sched: &Sched, cfg: &Config) -> Tz {
-    let name = if sched.tz.trim().is_empty() {
-        cfg.globalsettings.user_timezone.trim()
-    } else {
-        sched.tz.trim()
-    };
-    name.parse().unwrap_or(chrono_tz::UTC)
+/// A schedule's own tz, or UTC. Deliberately NOT user_timezone: since the
+/// 2026-08-27 audit user_timezone is display-only — everything the ENGINE
+/// computes runs in UTC, and a schedule that wants a local clock says so with
+/// its own tz field.
+fn tz_of(sched: &Sched) -> Tz {
+    sched.tz.trim().parse().unwrap_or(chrono_tz::UTC)
 }
 
 fn parse_hhmm(s: &str) -> Option<NaiveTime> {
@@ -86,7 +85,6 @@ fn last_occurrence(now: DateTime<Utc>, tz: Tz, at: NaiveTime, day: Option<Weekda
 /// last finish", not "when did I last try").
 pub fn due(
     sched: &Sched,
-    cfg: &Config,
     added: &str,
     now: DateTime<Utc>,
     last_completed: Option<DateTime<Utc>>,
@@ -123,7 +121,7 @@ pub fn due(
             } else {
                 None
             };
-            let Some(occ) = last_occurrence(now, tz_of(sched, cfg), at, day) else { return false };
+            let Some(occ) = last_occurrence(now, tz_of(sched), at, day) else { return false };
             if (now - occ).num_seconds() > OCCURRENCE_WINDOW_SEC {
                 return false; // missed while down — skip, never backfill
             }
@@ -261,7 +259,7 @@ pub fn check(project_root: &Path, cfg: &Config) -> Vec<String> {
             .filter(|c| c.source_schedule == parent.workid && c.state == workitems::STATE_COMPLETE)
             .filter_map(|c| workitems::parse_iso(&c.times.closed))
             .max();
-        if !due(&parent.sched, cfg, &parent.times.added, now, last_completed) {
+        if !due(&parent.sched, &parent.times.added, now, last_completed) {
             continue;
         }
         match fire(project_root, cfg, &parent.workid, "due") {
@@ -288,75 +286,71 @@ mod tests {
 
     #[test]
     fn every_fires_on_interval_from_anchor() {
-        let cfg = Config::default();
         let now = Utc::now();
         let mut s = sched("every");
         s.every_min = 30;
         // never fired: anchor = added
         let added = (now - Duration::minutes(31)).to_rfc3339();
-        assert!(due(&s, &cfg, &added, now, None));
+        assert!(due(&s, &added, now, None));
         let added = (now - Duration::minutes(10)).to_rfc3339();
-        assert!(!due(&s, &cfg, &added, now, None));
+        assert!(!due(&s, &added, now, None));
         // fired recently: not due
         s.last_fired = (now - Duration::minutes(10)).to_rfc3339();
-        assert!(!due(&s, &cfg, &iso(""), now, None));
+        assert!(!due(&s, &iso(""), now, None));
         s.last_fired = (now - Duration::minutes(31)).to_rfc3339();
-        assert!(due(&s, &cfg, &iso(""), now, None));
+        assert!(due(&s, &iso(""), now, None));
         s.every_min = 0;
-        assert!(!due(&s, &cfg, &iso(""), now, None), "unset interval never fires");
+        assert!(!due(&s, &iso(""), now, None), "unset interval never fires");
     }
 
     #[test]
     fn stale_anchors_on_newest_of_completion_fire_or_creation() {
-        let cfg = Config::default();
         let now = Utc::now();
         let mut s = sched("stale");
         s.every_min = 60;
         let old = (now - Duration::minutes(120)).to_rfc3339();
         // completed recently → not due, even though last fire is old
         s.last_fired = old.clone();
-        assert!(!due(&s, &cfg, &old, now, Some(now - Duration::minutes(5))));
+        assert!(!due(&s, &old, now, Some(now - Duration::minutes(5))));
         // completion old, fire old → due
-        assert!(due(&s, &cfg, &old, now, Some(now - Duration::minutes(90))));
+        assert!(due(&s, &old, now, Some(now - Duration::minutes(90))));
         // fire recent (failed clone just closed) → not due: no rapid-fire loop
         s.last_fired = (now - Duration::minutes(5)).to_rfc3339();
-        assert!(!due(&s, &cfg, &old, now, Some(now - Duration::minutes(90))));
+        assert!(!due(&s, &old, now, Some(now - Duration::minutes(90))));
     }
 
     #[test]
     fn daily_fires_in_window_and_skips_missed() {
-        let cfg = Config::default(); // user_timezone UTC
         let mut s = sched("daily");
         // "now" fixed at 10:00:30 UTC
         let now = Utc.with_ymd_and_hms(2026, 8, 17, 10, 0, 30).unwrap();
         s.at = "10:00".into();
-        assert!(due(&s, &cfg, "", now, None), "inside the occurrence window");
+        assert!(due(&s, "", now, None), "inside the occurrence window");
         s.last_fired = now.to_rfc3339();
-        assert!(!due(&s, &cfg, "", now, None), "already fired this occurrence");
+        assert!(!due(&s, "", now, None), "already fired this occurrence");
         // engine was down: occurrence 3h old → skip, never backfill
         let mut missed = sched("daily");
         missed.at = "07:00".into();
-        assert!(!due(&missed, &cfg, "", now, None));
+        assert!(!due(&missed, "", now, None));
         // explicit tz: 10:00 America/Los_Angeles is 17:00/18:00 UTC, not now
         let mut la = sched("daily");
         la.at = "10:00".into();
         la.tz = "America/Los_Angeles".into();
-        assert!(!due(&la, &cfg, "", now, None));
+        assert!(!due(&la, "", now, None));
     }
 
     #[test]
     fn weekly_needs_matching_day() {
-        let cfg = Config::default();
         // 2026-08-16 is a Sunday; fix now at Sun 22:00:20 UTC
         let now = Utc.with_ymd_and_hms(2026, 8, 16, 22, 0, 20).unwrap();
         let mut s = sched("weekly");
         s.at = "22:00".into();
         s.day = "sunday".into();
-        assert!(due(&s, &cfg, "", now, None));
+        assert!(due(&s, "", now, None));
         s.day = "mon".into();
-        assert!(!due(&s, &cfg, "", now, None));
+        assert!(!due(&s, "", now, None));
         s.day = "not-a-day".into();
-        assert!(!due(&s, &cfg, "", now, None));
+        assert!(!due(&s, "", now, None));
     }
 
     #[test]

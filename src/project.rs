@@ -17,26 +17,27 @@ use crate::placeholders::Vars;
 pub struct ServerConfig {
     /// Path (placeholder-expanded) to the main.iter.md project definition.
     pub mainfile: String,
-    /// The ONE glob identifying every iter node file. Replaces marker_glob.
-    pub iterglob: String,
     /// The singular top-level directory. The engine never uses `{topdir}`
     /// directly — it exists as the convenience placeholder other settings'
     /// defaults hang off of. `{thisfiledir}` here = the `.iter/` folder.
     pub topdir: String,
-    /// Optional URL slug; empty derives from the project name.
-    pub url_slug: String,
     /// Default context patterns for new work items (was projects.json
     /// `default_context`).
     pub default_context: Vec<String>,
 }
 
+/// The ONE glob identifying every iter node file. A constant since the
+/// 2026-08-27 settings audit: the dot rule hardcodes the `.iter.md` suffix
+/// (`markers::role_of`), so any other glob would collect files the nodetype
+/// parser cannot classify — the old `iterglob` setting was illusory choice.
+/// (Replaced V1's marker_glob before that.)
+pub const ITERGLOB: &str = "**/*.iter.md";
+
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             mainfile: "{topdir}/main.iter.md".into(),
-            iterglob: "**/*.iter.md".into(),
             topdir: "{thisfiledir}/../".into(),
-            url_slug: String::new(),
             default_context: vec!["{marker}".into(), "{ancestor_markers}".into(), "{interfaces}".into()],
         }
     }
@@ -132,7 +133,7 @@ impl Project {
         let mut v = Vars::new();
         v.set("topdir", &format!("{}/", self.topdir.to_string_lossy()));
         v.set("mainfile", &self.mainfile.to_string_lossy());
-        v.set("iterglob", &self.server.iterglob);
+        v.set("iterglob", ITERGLOB);
         v.set("projectname", &self.config.projectname);
         v.set("projectdescription", &self.config.projectdescription);
         v.set("globalinterfacedir", &format!("{}/", self.interfacedir.to_string_lossy()));
@@ -179,10 +180,10 @@ impl Project {
             .unwrap_or_else(|| "project".into())
     }
 
+    /// URL slug (hostname, tab title, favicon tint) — always derived from the
+    /// project name; the url_slug override setting was retired 2026-08-27 as
+    /// cosmetic-only.
     pub fn slug(&self) -> String {
-        if !self.server.url_slug.trim().is_empty() {
-            return self.server.url_slug.trim().to_string();
-        }
         let cleaned: String = self
             .projectname()
             .to_lowercase()

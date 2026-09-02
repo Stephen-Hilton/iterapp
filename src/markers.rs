@@ -124,6 +124,20 @@ impl Front {
 /// but a runaway file must not bloat every response.
 const BODY_CAP: usize = 65536;
 
+/// Truncate to at most BODY_CAP bytes, backing up off a multi-byte character
+/// so the cut never lands mid-codepoint (String::truncate panics there).
+fn cap_body(body: &mut String) -> bool {
+    if body.len() <= BODY_CAP {
+        return false;
+    }
+    let mut cut = BODY_CAP;
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    body.truncate(cut);
+    true
+}
+
 fn clean_value(raw: &str) -> String {
     let raw = raw.trim();
     if raw.len() >= 2
@@ -166,16 +180,13 @@ pub fn parse_front(content: &str) -> Front {
     let trimmed = content.trim_start_matches(['\u{feff}', ' ', '\t', '\n', '\r']);
     let Some(rest) = trimmed.strip_prefix("---") else {
         front.body = content.trim().to_string();
-        if front.body.len() > BODY_CAP {
-            front.body.truncate(BODY_CAP);
-        }
+        cap_body(&mut front.body);
         return front;
     };
     let Some(end) = rest.find("\n---") else { return front };
     front.has_frontmatter = true;
     let mut body = rest[end + 4..].trim_start_matches('-').trim().to_string();
-    if body.len() > BODY_CAP {
-        body.truncate(BODY_CAP);
+    if cap_body(&mut body) {
         body.push_str("\n… (truncated — read the full file on disk)");
     }
     front.body = body;
@@ -454,7 +465,7 @@ pub fn scan(project: &Project) -> Scan {
     let mut files: Vec<PathBuf> = Vec::new();
     for dir in &project.scandirs {
         scan.roots.push(dir.to_string_lossy().into_owned());
-        let pattern = format!("{}/{}", dir.to_string_lossy(), project.server.iterglob);
+        let pattern = format!("{}/{}", dir.to_string_lossy(), crate::project::ITERGLOB);
         files.extend(base_vars.expand_files(&pattern, dir));
     }
     if project.mainfile.is_file() {
@@ -1286,6 +1297,30 @@ mod tests {
         assert_eq!(stem_of(".code.iter.md"), "");
         assert_eq!(stem_of("a.b.code.iter.md"), "a.b");
         assert_eq!(stem_of("notes.iter.md"), "notes", "no role: whole stem");
+    }
+
+    #[test]
+    fn body_cap_backs_off_a_mid_character_cut() {
+        // Position an em dash (3 bytes: E2 80 94) so BODY_CAP lands on its
+        // second byte — the pdy-dev crash: String::truncate panicked there.
+        for lead in [BODY_CAP - 2, BODY_CAP - 1] {
+            let mut body = "a".repeat(lead);
+            body.push('—');
+            body.push_str(&"b".repeat(64));
+            let text = format!("---\nname: x\n---\n{body}");
+            let front = parse_front(&text);
+            assert!(front.body.len() <= BODY_CAP + 64, "capped plus notice");
+            assert!(front.body.ends_with("read the full file on disk)"));
+            // No-frontmatter path caps too.
+            let bare = parse_front(&body);
+            assert!(bare.body.len() <= BODY_CAP);
+        }
+        // A cut on a char boundary still truncates at exactly BODY_CAP.
+        let mut body = "a".repeat(BODY_CAP);
+        body.push_str(&"b".repeat(64));
+        let front = parse_front(&format!("---\nname: x\n---\n{body}"));
+        assert!(front.body.starts_with(&"a".repeat(BODY_CAP)));
+        assert!(front.body.ends_with("read the full file on disk)"));
     }
 
     #[test]

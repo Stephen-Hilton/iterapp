@@ -1,0 +1,9 @@
+{
+  "mainfile": "{topdir}/iter/main.iter.md",
+  "topdir": "{thisfiledir}/../../",
+  "default_context": [
+    "{marker}",
+    "{ancestor_markers}",
+    "{interfaces}"
+  ]
+}

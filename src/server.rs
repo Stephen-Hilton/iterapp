@@ -1311,9 +1311,7 @@ fn agent_json(project: &Path, a: &crate::agents::AgentDef) -> Value {
     json!({
         "type": a.type_name, "description": a.description, "visible": a.visible,
         "max_agent_count": a.max_agent_count, "max_work_timeout_sec": a.max_work_timeout_sec,
-        "max_connection_timeout_sec": a.max_connection_timeout_sec, "model": a.model,
-        "model_flags": a.model_flags, "llm_run_mode": a.llm_run_mode,
-        "sleep_interval_sec": a.sleep_interval_sec,
+        "model": a.model, "model_flags": a.model_flags,
         "default_codepath": a.default_codepath,
         "default_codepath_resolved": resolve_default_codepath(project, &a.default_codepath),
         "default_codepath_ignore": a.default_codepath_ignore,
@@ -1360,7 +1358,7 @@ fn api_agent_put(req: &Req, project: &Path, name: &str) -> Resp {
                 Value::String(s) if s == "true" || s == "false" => s.clone(),
                 _ => return err_resp(400, "visible must be true or false"),
             },
-            "max_agent_count" | "max_work_timeout_sec" | "max_connection_timeout_sec" | "sleep_interval_sec" => {
+            "max_agent_count" | "max_work_timeout_sec" => {
                 match val.as_u64().or_else(|| val.as_str().and_then(|s| s.trim().parse().ok())) {
                     Some(n) => n.to_string(),
                     None => return err_resp(400, &format!("{} must be a non-negative integer", key)),
@@ -2193,6 +2191,25 @@ fn queue_delta(project: &Path, prev: &mut QueueSnapshot) -> Value {
     })
 }
 
+/// An event that would tell the client nothing: no open row changed, none was
+/// archived or deleted, and the header counts read exactly as they did on the
+/// last event this connection sent.
+///
+/// The database moves far more often than anything a reader can SEE moves — an
+/// agent heartbeat, a log row, an attempt counter all land in the write-ahead
+/// log and all trip the file fingerprint below. Every one of those used to ship
+/// `{"changed":[],"removed":[],"closed":[]}`, and the client answered it with a
+/// full rebuild of the work-item list, which throws away the scroll position of
+/// whatever question someone was in the middle of reading. Not writing the
+/// event at all is the fix at the source: no event, no rebuild.
+fn is_empty_delta(value: &Value, last_counts: Option<&Value>) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("delta") {
+        return false; // a `change` is never empty — it means "reload everything"
+    }
+    let empty = |k: &str| value.get(k).and_then(Value::as_array).is_none_or(|a| a.is_empty());
+    empty("changed") && empty("removed") && empty("closed") && value.get("counts") == last_counts
+}
+
 /// Change feed: watch the queue's storage plus the engine's stop signal, and on
 /// every change ship what actually changed. The keepalive stays a bare comment
 /// line — an EventSource with nothing to say still has to say it.
@@ -2219,7 +2236,12 @@ fn sse_events(mut stream: TcpStream, project: &Path) {
     // fetched the same thing, so the first event carries what changed SINCE
     // then rather than the whole queue over again.
     let mut snapshot = QueueSnapshot { open: HashMap::new(), closed: HashSet::new() };
-    let _ = queue_delta(project, &mut snapshot);
+    let seed = queue_delta(project, &mut snapshot);
+    // The counts the CLIENT is showing right now: it fetched the list moments
+    // ago, so the seed's tally is what is on its screen. Every later event is
+    // measured against the last tally actually sent, never against the one the
+    // previous poll happened to compute.
+    let mut last_counts = seed.get("counts").cloned();
     let mut beats: u32 = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(700));
@@ -2227,7 +2249,6 @@ fn sse_events(mut stream: TcpStream, project: &Path) {
         let payload = if now != last {
             let engine_toggled = now.2 != last.2;
             last = now;
-            beats = 0;
             // Always diff, even when we are about to send `change`: the
             // snapshot has to keep up with the files either way, or the next
             // real delta reports rows that moved two events ago.
@@ -2235,7 +2256,21 @@ fn sse_events(mut stream: TcpStream, project: &Path) {
             // The engine's own running/stopped state is not a queue row, so no
             // row-level delta expresses it — the client reloads, as before.
             let value = if engine_toggled { json!({ "type": "change" }) } else { delta };
-            format!("data: {}\n\n", value)
+            if is_empty_delta(&value, last_counts.as_ref()) {
+                // The files moved but the queue did not. Fall through to the
+                // keepalive schedule as if nothing had happened at all.
+                beats += 1;
+                if beats % 20 != 0 {
+                    continue;
+                }
+                ": ping\n\n".to_string()
+            } else {
+                beats = 0;
+                if let Some(c) = value.get("counts") {
+                    last_counts = Some(c.clone());
+                }
+                format!("data: {}\n\n", value)
+            }
         } else {
             beats += 1;
             if beats % 20 != 0 {
@@ -2755,13 +2790,14 @@ mod tests {
     }
 
     #[test]
-    fn slug_from_dirname_and_settings() {
+    fn slug_is_always_derived_from_the_name() {
         let dir = std::env::temp_dir().join(format!("My Project_{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".iter")).unwrap();
         let s = slug(&dir);
         assert!(s.starts_with("my-project-"), "sanitized dirname, got {}", s);
+        // The retired url_slug override is dead config: ignored, not honored.
         std::fs::write(crate::project::config_path(&dir), r#"{"url_slug":"pdy-dev"}"#).unwrap();
-        assert_eq!(slug(&dir), "pdy-dev");
+        assert!(slug(&dir).starts_with("my-project-"), "override retired 2026-08-27");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2771,7 +2807,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".iter")).unwrap();
         let d = project_settings(&dir);
-        assert_eq!(d["server"]["iterglob"], "**/*.iter.md");
+        assert_eq!(d["server"]["default_context"][0], "{marker}");
+        assert!(d["server"].get("iterglob").is_none(), "iterglob is a constant now, not a setting");
         std::fs::write(
             dir.join("main.iter.md"),
             "---\nprojectname: \"X\"\nglobalscandirs: [\"{topdir}/core/\"]\n---\nbody\n",
@@ -2783,5 +2820,46 @@ mod tests {
         assert_eq!(d["project_name"], "X", "legacy alias rides along");
         assert!(d["resolved"]["scandirs"][0].as_str().unwrap().ends_with("core"), "{}", d);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Answer-lightbox requirement, R3: a write-ahead-log commit that moved
+    /// no visible row must not become a client event. The client answers any
+    /// event by rebuilding its whole list, which resets the scroll position of
+    /// a question someone is reading — so "nothing changed" has to travel as
+    /// nothing at all.
+    #[test]
+    fn wal_only_churn_is_not_an_event_but_a_real_change_is() {
+        let counts = json!({ "queued": 2, "todo": 1 });
+        let quiet = json!({
+            "type": "delta", "changed": [], "removed": [], "closed": [], "counts": counts,
+        });
+        assert!(is_empty_delta(&quiet, Some(&counts)), "no rows, same counts: say nothing");
+
+        // One row moved — that is exactly what the feed exists to carry.
+        let moved = json!({
+            "type": "delta", "changed": [{ "workid": "a" }], "removed": [], "closed": [],
+            "counts": counts,
+        });
+        assert!(!is_empty_delta(&moved, Some(&counts)));
+
+        // No row is in `changed` yet the tally moved (a row landed in the
+        // archive, say): the header would go stale if this were swallowed.
+        let recount = json!({
+            "type": "delta", "changed": [], "removed": [], "closed": [],
+            "counts": json!({ "queued": 1, "todo": 1 }),
+        });
+        assert!(!is_empty_delta(&recount, Some(&counts)));
+
+        // Archived and deleted ids are changes even with an unmoved tally.
+        for key in ["removed", "closed"] {
+            let mut v = quiet.clone();
+            v[key] = json!(["a"]);
+            assert!(!is_empty_delta(&v, Some(&counts)), "{} must always ship", key);
+        }
+
+        // "reload everything" is never suppressible, and the first event on a
+        // connection with no tally to compare against always goes out.
+        assert!(!is_empty_delta(&json!({ "type": "change" }), Some(&counts)));
+        assert!(!is_empty_delta(&quiet, None));
     }
 }
