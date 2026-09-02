@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "iter3/iter_core", "iter3/iter_data", "iter3/iter_engine"]
+resolver = "2"
+
 [package]
 name = "iterapp"
 version = "0.1.0"

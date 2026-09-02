@@ -28,3 +28,11 @@ logs/
 **/.iter/.engine/iter.db-shm
 *.jsonl.imported
 **/.iter/.engine/queue.meta.json
+
+# iter3 runtime artifacts (never commit secrets or local dbs)
+iter_data.secret
+*.secret
+iter3.db
+iter3.db-wal
+iter3.db-shm
+iter3/.deploy.notes
