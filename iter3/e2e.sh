@@ -221,6 +221,76 @@ echo '{"title":"","fields":[]}' > "$SCRATCH/w2.json"
 ("$ENGINE_BIN" --question-widget "$SCRATCH/w2.json" || true) | grep -q "INVALID" || fail "--question-widget invalid case"
 pass "--question-widget helper"
 
+# ---------- scheduled workitems (itersched port) ----------
+# template with last_fired in the past -> due on the first check; fires ONCE
+TPL=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"sched: heartbeat file","agent":"exec","exec_shell":"echo sched-ran >> out_sched.txt","state":"scheduled","priority":8,"sched":{"kind":"every","every_min":5,"last_fired":"2026-09-01T00:00:00Z"}}' | jq -r .id)
+[ -n "$TPL" ] && [ "$TPL" != null ] || fail "schedule template create"
+
+# users-only: the engine role must NOT be able to create schedules
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $ENGINE_TOKEN" -H content-type:application/json \
+  -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"rogue schedule","agent":"exec","state":"scheduled","sched":{"kind":"every","every_min":1}}')
+[ "$CODE" = 403 ] || fail "engine role created a schedule (HTTP $CODE)"
+pass "schedules are users-only (engine role got 403)"
+
+say "running engine for schedule fire"
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config.json --ticks 8 > "$SCRATCH/engine-sched.log" 2>&1) || true
+grep -q "schedule 'sched: heartbeat file' fired" "$SCRATCH/engine-sched.log" || { cat "$SCRATCH/engine-sched.log"; fail "schedule did not fire"; }
+[ -f "$SAMPLE/out_sched.txt" ] || fail "scheduled clone did not run"
+NCLONES=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems" | jq "[.[]|select(.source_schedule==\"$TPL\")]|length")
+[ "$NCLONES" = 1 ] || fail "expected exactly 1 clone, got $NCLONES (dedup/refire broken)"
+TPLSTATE=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$TPL" | jq -r .state)
+[ "$TPLSTATE" = scheduled ] || fail "template state changed to $TPLSTATE"
+LF=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$TPL" | jq -r .sched.last_fired)
+[ "$LF" != "2026-09-01T00:00:00Z" ] || fail "last_fired not updated"
+pass "schedule fired once, clone completed, template intact, last_fired claimed"
+
+# ---------- usage%-driven account gating ----------
+export ITER_USAGE_DIR="$SCRATCH/usage"
+mkdir -p "$ITER_USAGE_DIR"
+FUTURE=$(( $(date +%s) + 86400 ))
+ITEM=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT")
+echo "$ITEM" | jq '.accounts=[{"name":"TestAcct","token_envar":"FAKE_TOKEN","order":1,"switch":80,"stop":99}]' \
+  | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null || fail "project accounts update"
+cat > "$ITER_USAGE_DIR/iter3-usage-TestAcct.json" <<EOF
+{"ts":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","rate_limits":{"five_hour":{"used_percentage":99.9,"resets_at":$FUTURE},"seven_day":{"used_percentage":50.0,"resets_at":$FUTURE}}}
+EOF
+WU=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"usage-gated work","agent":"exec","exec_shell":"echo gated > out_gated.txt","priority":3}' | jq -r .id)
+(cd "$SAMPLE" && ITER_USAGE_DIR="$ITER_USAGE_DIR" "$ENGINE_BIN" --config .iter/config.json --ticks 4 > "$SCRATCH/engine-usage.log" 2>&1) || true
+[ ! -f "$SAMPLE/out_gated.txt" ] || fail "engine ran work while all accounts were at stop%"
+grep -q "all accounts at stop%" "$SCRATCH/engine-usage.log" || fail "no stop-hold log line"
+ST=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WU" | jq -r .state)
+[ "$ST" = queued ] || fail "gated item state=$ST (expected queued)"
+pass "all-accounts-at-stop%: engine held all activity"
+cat > "$ITER_USAGE_DIR/iter3-usage-TestAcct.json" <<EOF
+{"ts":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","rate_limits":{"five_hour":{"used_percentage":10.0,"resets_at":$FUTURE},"seven_day":{"used_percentage":5.0,"resets_at":$FUTURE}}}
+EOF
+(cd "$SAMPLE" && ITER_USAGE_DIR="$ITER_USAGE_DIR" "$ENGINE_BIN" --config .iter/config.json --ticks 6 > "$SCRATCH/engine-usage2.log" 2>&1) || true
+[ -f "$SAMPLE/out_gated.txt" ] || { cat "$SCRATCH/engine-usage2.log"; fail "engine did not resume after usage dropped"; }
+ACCT=$(curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01" | jq -r .account)
+[ "$ACCT" = TestAcct ] || fail "engine did not report chosen account (got '$ACCT')"
+pass "usage refresh resumed work; chosen account reported centrally"
+
+# ---------- draining monitoring ----------
+ITEM=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT")
+V=$(echo "$ITEM" | jq -r .version 2>/dev/null || true)
+echo "$ITEM" | jq '.state="Draining"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null || fail "set Draining"
+WD2=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"work during drain","agent":"exec","exec_shell":"echo drained > out_drain.txt","priority":1}' | jq -r .id)
+(cd "$SAMPLE" && ITER_USAGE_DIR="$ITER_USAGE_DIR" "$ENGINE_BIN" --config .iter/config.json --ticks 4 > "$SCRATCH/engine-drain.log" 2>&1) || true
+[ ! -f "$SAMPLE/out_drain.txt" ] || fail "engine started new work while Draining"
+ST=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WD2" | jq -r .state)
+[ "$ST" = queued ] || fail "drain item state=$ST"
+STATUS=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/status")
+[ "$(echo "$STATUS" | jq -r .project_state)" = Draining ] || fail "status project_state"
+[ "$(echo "$STATUS" | jq -r .all_drained)" = true ] || fail "status all_drained"
+echo "$STATUS" | jq -e '.engines|length >= 1' >/dev/null || fail "status has no engines"
+pass "Draining: no new picks; status endpoint reports drain state + engine liveness"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.state="Running"' \
+  | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
+
 # webui served
 curl -sf "$BASE/" | grep -q "ITER" || fail "webui not served"
 pass "webui static page served"

@@ -8,12 +8,12 @@ use serde_json::{Value, json};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub fn execute(api: &Api, engine_name: &str, project: &Project, topdir: &str, item: WorkItem) {
-    let result = run_all(api, project, topdir, &item);
+pub fn execute(api: &Api, engine_name: &str, project: &Project, topdir: &str, item: WorkItem, account: &str) {
+    let result = run_all(api, project, topdir, &item, account);
     close(api, engine_name, project, item, result);
 }
 
-fn run_all(api: &Api, project: &Project, topdir: &str, item: &WorkItem) -> Result<String, String> {
+fn run_all(api: &Api, project: &Project, topdir: &str, item: &WorkItem, account: &str) -> Result<String, String> {
     let is_repo = std::path::Path::new(topdir).join(".git").exists();
     let has_remote = is_repo
         && run_shell(topdir, "git remote", 15).map(|o| !o.trim().is_empty()).unwrap_or(false);
@@ -32,7 +32,7 @@ fn run_all(api: &Api, project: &Project, topdir: &str, item: &WorkItem) -> Resul
         }
         run_shell(topdir, &item.exec_shell, agent_timeout(project, item))?
     } else {
-        run_claude(api, project, topdir, item)?
+        run_claude(api, project, topdir, item, account)?
     };
 
     // git postwork is engine-enforced: changes are ALWAYS committed (and
@@ -98,7 +98,7 @@ fn run_named_ppw(
     }
 }
 
-fn run_claude(api: &Api, project: &Project, topdir: &str, item: &WorkItem) -> Result<String, String> {
+fn run_claude(api: &Api, project: &Project, topdir: &str, item: &WorkItem, account: &str) -> Result<String, String> {
     let agent_def = api
         .get(&format!("/api/agents/{}", item.agent))
         .map_err(|e| format!("agent '{}' not defined in iter_data: {e}", item.agent))?;
@@ -137,20 +137,27 @@ fn run_claude(api: &Api, project: &Project, topdir: &str, item: &WorkItem) -> Re
 
     let mut cmd = Command::new("claude");
     cmd.arg("-p").arg(&prompt).arg("--output-format").arg("text");
+    // usage tracking: wire this session's statusline to the collector, teeing
+    // server-authoritative rate_limits into THIS account's snapshot file
+    cmd.arg("--settings").arg(crate::usage::statusline_settings(account));
     if !model.is_empty() {
         cmd.arg("--model").arg(&model);
     }
     for f in flags.split_whitespace() {
         cmd.arg(f);
     }
-    // route billing to the project's account token when one is configured
-    for acct in &project.accounts {
-        if let Ok(tok) = std::env::var(&acct.token_envar) {
-            if !tok.trim().is_empty() {
-                cmd.env("CLAUDE_CODE_OAUTH_TOKEN", tok.trim());
-                break;
-            }
-        }
+    // route billing to the CHOSEN account's token (ladder + exclusion picked
+    // it); fall back to the first configured token that is set
+    let token = project
+        .accounts
+        .iter()
+        .filter(|a| account.is_empty() || a.name == account)
+        .chain(project.accounts.iter())
+        .find_map(|a| {
+            std::env::var(&a.token_envar).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+        });
+    if let Some(tok) = token {
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", tok);
     }
     cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
     cmd.current_dir(topdir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());

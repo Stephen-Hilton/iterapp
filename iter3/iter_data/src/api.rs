@@ -134,6 +134,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects", get(projects_list))
         .route("/api/projects/{name}", get(project_get).put(project_put).delete(project_delete))
         .route("/api/projects/{name}/versions", get(versions_get))
+        .route("/api/projects/{name}/status", get(project_status))
         .route("/api/projects/{name}/structure", get(structure_get).put(structure_put))
         .route("/api/projects/{name}/prepostwork", get(prepostwork_list))
         .route("/api/prepostwork/{projectname}/{name}", put(prepostwork_put))
@@ -369,6 +370,60 @@ async fn versions_get(_u: AuthUser, State(st): Ctx, Path(name): Path<String>) ->
     Ok(Json(serde_json::to_value(rows).unwrap_or(Value::Null)))
 }
 
+/// Draining monitoring (spec: "carefully monitor all engines for possible
+/// disconnections, to make sure all engines are honoring the command").
+/// Computes, centrally: per-engine liveness (last_seen vs 3x ticksec + 5s
+/// grace), in-progress counts, whether the drain has completed, and which
+/// engines might NOT be honoring it (disconnected while holding work).
+async fn project_status(_u: AuthUser, State(st): Ctx, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    let project = st.store.get("project", &name, NOSK).await?.ok_or_else(notfound)?;
+    let project_state = body_str(&project, "state");
+    let items = st.store.query("workitem", &name).await?;
+    let mut inprogress_by_engine: HashMap<String, i64> = HashMap::new();
+    for i in &items {
+        if body_str(i, "state") == "in-progress" {
+            *inprogress_by_engine.entry(body_str(i, "engine")).or_insert(0) += 1;
+        }
+    }
+    let now = chrono::Utc::now();
+    let mut engines_out = Vec::new();
+    let mut not_honoring = Vec::new();
+    for e in st.store.scan("engine").await? {
+        // only engines that serve this project
+        if e.get("projects").and_then(|p| p.get(&name)).is_none() {
+            continue;
+        }
+        let ename = body_str(&e, "name");
+        let ticksec = e.get("ticksec").and_then(|t| t.as_u64()).unwrap_or(5);
+        let last_seen = body_str(&e, "last_seen");
+        let age_sec = chrono::DateTime::parse_from_rfc3339(&last_seen)
+            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds())
+            .unwrap_or(i64::MAX);
+        let stale = age_sec > (3 * ticksec as i64 + 5);
+        let running = inprogress_by_engine.get(&ename).copied().unwrap_or(0);
+        if project_state == "Draining" && stale && running > 0 {
+            not_honoring.push(ename.clone());
+        }
+        engines_out.push(json!({
+            "name": ename,
+            "state": body_str(&e, "state"),
+            "last_seen": last_seen,
+            "age_sec": if age_sec == i64::MAX { Value::Null } else { json!(age_sec) },
+            "stale": stale,
+            "inprogress": running,
+        }));
+    }
+    let total_inprogress: i64 = inprogress_by_engine.values().sum();
+    Ok(Json(json!({
+        "project": name,
+        "project_state": project_state,
+        "engines": engines_out,
+        "inprogress": total_inprogress,
+        "all_drained": total_inprogress == 0,
+        "not_honoring": not_honoring,
+    })))
+}
+
 // ---------- structure ----------
 
 async fn structure_get(_u: AuthUser, State(st): Ctx, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
@@ -516,6 +571,16 @@ async fn workitem_create(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     user.require_writer()?;
+    // users-only rule (itersched.md): schedules come from humans via the
+    // webui/API — the engine role (the agents' path) may not create them
+    if user.role == "engine"
+        && (body_str(&body, "state") == "scheduled" || body.get("sched").map(|s| !s.is_null()).unwrap_or(false))
+    {
+        return Err(ApiError::Status(
+            StatusCode::FORBIDDEN,
+            "schedules are users-only: the engine/agent path may not create scheduled items".into(),
+        ));
+    }
     let (id, body) = normalize_new_item(&name, body)?;
     st.store.put_versioned("workitem", &name, &id, &body, 0).await?;
     st.store.bump_seq(&name, "workitem").await?;

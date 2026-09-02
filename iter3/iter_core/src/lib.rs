@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod sched;
 pub mod widget;
 
 /// Logical table names — storage backends map these to physical names
@@ -203,6 +204,12 @@ pub struct WorkItem {
     pub ts: WorkItemTs,
     #[serde(default)]
     pub tags: Vec<Tag>,
+    /// schedule spec — present only on "scheduled" templates (see sched module)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sched: Option<sched::Sched>,
+    /// provenance: the template id this run was cloned from
+    #[serde(default)]
+    pub source_schedule: String,
     /// engine currently running it (set on pick)
     #[serde(default)]
     pub engine: String,

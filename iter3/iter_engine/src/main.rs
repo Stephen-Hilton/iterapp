@@ -4,6 +4,7 @@
 
 mod client;
 mod engine;
+mod usage;
 mod work;
 
 use base64::Engine as _;
@@ -108,6 +109,7 @@ fn main() {
         eprintln!("no engine token: set {} (mint via POST /api/users/<engine-user>/token as admin)", cfg.token_envar);
         std::process::exit(2);
     }
+    usage::install_collector();
     let mut rt = engine::EngineRuntime::new(api, cfg.engine_name.clone());
     if args.ticks > 0 {
         rt.max_ticks = Some(args.ticks);

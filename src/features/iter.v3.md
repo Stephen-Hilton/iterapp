@@ -98,6 +98,7 @@ The "accounts" key should list out all accounts available, by name and the envir
 The "state": "Running" is the central state for the project; i.e., if there are multilpe engines, we need to centralize one "Running" / "Draining" / "Stopped" location for ALL engines.  The "Draining" also needs to carefully monitor all engines for possible disconnections, to make sure all engines are honoring the command. 
 
 Note the project "state" is ASPIRATIONAL (the commanded state), while each engine's "state" (in iter3_engine) is ACTUAL.  A project can be "Running" while every engine is offline; when engines come back, they see "Running" and resume.  The UI may display a computed status derived from both.
+Draining monitoring (BUILT 2026-09-02): `GET /api/projects/{name}/status` computes the drain picture centrally — per-engine liveness (last_seen vs 3x ticksec + 5s grace), in-progress counts, `all_drained`, and `not_honoring` (engines that went stale while still holding in-progress work).  Draining also stops schedule firing, not just picks.
 
 Engine definitions live in their own `iter3_engine` table (below); the "engines" list here just links engine names to this project, so one engine serving many small projects is defined once, not duplicated per project.
 
@@ -343,7 +344,7 @@ project json:
 ## ITER_ENGINE
 This is the actual engine that manages the local claude code harness.  iter_engine always pulls and pushes data to/from iter_data so that _data is always up-to-date (instant for updates, 5 second tick by default on idle downloads).
 Each tick, the engine polls the iter3_versions seq rows (one tiny read) and only pulls full tables whose seq moved; every `full_refresh_minutes` (default 360) it reloads everything unconditionally as the seq fallback.  It also writes its heartbeat ("last_seen") to its iter3_engine row each tick.
-Usage% (5hr / 7d consumed) comes from the existing engine-side tracking, same as today's `acct 5h 30% · 7d 14%` readout — that code ports over from V2.
+Usage% (5hr / 7d consumed) uses the V2 mechanism, ported per-account (BUILT 2026-09-02): every spawned claude session gets the statusline collector injected via `--settings`, teeing Claude Code's server-authoritative rate_limits into a per-account snapshot file (`$ITER_USAGE_DIR/iter3-usage-<account>.json`, default dir `~/.claude`; the V2 machine-wide snapshot still feeds the single-account case).  An expired window (resets_at in the past) reads as 0%, which is how the engine detects the usage refresh after an all-accounts-stopped hold.  When ALL accounts are at/over their stop%, the engine holds all activity and logs it.
 
 The only data that resides in iter_engine is the `.iter/config.json` file, which holds data on where and how to authenticate to iter_data, and credntials which should be held in a seperate .env file (and .gitignore'd)
 

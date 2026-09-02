@@ -27,11 +27,7 @@ pub struct EngineRuntime {
     pub max_ticks: Option<u64>,
 }
 
-/// max(5hr%,7d%) usage per account. TODO: port the V2 tracking (`acct 5h 30%
-/// · 7d 14%`) — until then unknown usage reads as 0, which never blocks.
-fn usage_map() -> BTreeMap<String, u8> {
-    BTreeMap::new()
-}
+use crate::usage;
 
 /// maxagents ladder: among ">N%" gates where usage > N pick the LARGEST N
 /// (most restrictive true gate — order-independent equivalent of the spec's
@@ -139,11 +135,12 @@ impl EngineRuntime {
             .filter(|a| !a.is_empty())
             .collect();
 
-        let usage = usage_map();
+        let now = chrono::Utc::now();
         let mut chosen_account = String::new();
         for project_name in engine.projects.keys() {
             if let Some(p) = self.projects.get(project_name) {
-                if let Some(acct) = pick_account(&p.accounts, &usage, &in_use) {
+                let map = usage::usage_map(&p.accounts, now);
+                if let Some(acct) = pick_account(&p.accounts, &map, &in_use) {
                     chosen_account = acct.name.clone();
                     break;
                 }
@@ -221,20 +218,111 @@ impl EngineRuntime {
 
             let Some(project) = self.projects.get(project_name).cloned() else { continue };
             if project.state != "Running" {
-                continue; // Draining/Stopped: finish running work, start nothing new
+                // Draining/Stopped: finish running work, start nothing new,
+                // fire no schedules
+                continue;
             }
+            self.fire_schedules(&project);
             let Some(dirs) = engine.projects.get(project_name) else { continue };
             let topdir = expand_topdir(dirs.dirs.get("topdir").map(String::as_str).unwrap_or("."));
-            self.dispatch(engine, &project, &topdir);
+            self.dispatch(engine, &project, &topdir, &in_use);
         }
     }
 
-    fn dispatch(&mut self, engine: &Engine, project: &Project, topdir: &str) {
+    /// Fire due scheduled templates (itersched port). Race-safe across
+    /// engines: claiming last_fired via a versioned write happens BEFORE the
+    /// clone, so a 409 means another engine won this occurrence — skip.
+    fn fire_schedules(&mut self, project: &Project) {
+        let items = self.items.get(&project.name).cloned().unwrap_or_default();
+        let now = chrono::Utc::now();
+        for tpl in items.iter().filter(|i| i.state == "scheduled") {
+            let Some(sched) = &tpl.sched else { continue };
+            // dedup: while ANY clone is open, the schedule does not fire
+            let open_clone = items
+                .iter()
+                .any(|i| i.source_schedule == tpl.id && iter_core::sched::is_open_state(&i.state));
+            if open_clone {
+                continue;
+            }
+            let last_completed = items
+                .iter()
+                .filter(|i| i.source_schedule == tpl.id && i.state == "complete")
+                .filter_map(|i| iter_core::sched::parse_iso(&i.ts.complete))
+                .max();
+            if !iter_core::sched::due(sched, &tpl.ts.receive, now, last_completed) {
+                continue;
+            }
+            // claim the fire
+            let mut claimed = serde_json::to_value(tpl).unwrap();
+            claimed["sched"]["last_fired"] = json!(now_utc());
+            if self
+                .api
+                .put(
+                    &format!(
+                        "/api/projects/{}/workitems/{}?expect_version={}",
+                        project.name, tpl.id, tpl.version
+                    ),
+                    &claimed,
+                )
+                .is_err()
+            {
+                continue; // lost the race (or transient) — next check re-evaluates
+            }
+            let clone = iter_core::sched::clone_from(tpl);
+            match self.api.post(
+                &format!("/api/projects/{}/workitems", project.name),
+                &serde_json::to_value(&clone).unwrap(),
+            ) {
+                Ok(v) => println!(
+                    "[engine] schedule '{}' fired -> {}",
+                    tpl.name,
+                    v.get("id").and_then(|i| i.as_str()).unwrap_or("?")
+                ),
+                Err(e) => eprintln!("[engine] schedule '{}' clone failed: {e}", tpl.name),
+            }
+        }
+    }
+
+    fn dispatch(&mut self, engine: &Engine, project: &Project, topdir: &str, in_use: &[String]) {
         let project_name = project.name.clone();
         let items = self.items.get(&project_name).cloned().unwrap_or_default();
         let by_id: HashMap<String, &WorkItem> = items.iter().map(|i| (i.id.clone(), i)).collect();
 
-        let usage_pct = 0u8; // see usage_map TODO
+        // real usage drives both the account ladder and the maxagents gates
+        let now = chrono::Utc::now();
+        let usage_pct: u8;
+        let account: Option<iter_core::Account>;
+        if project.accounts.is_empty() {
+            // single-account setup: the default snapshot (V2-compatible)
+            usage_pct = usage::effective_pct_for("", now);
+            account = None;
+        } else {
+            let map = usage::usage_map(&project.accounts, now);
+            match pick_account(&project.accounts, &map, in_use) {
+                Some(a) => {
+                    usage_pct = map.get(&a.name).copied().unwrap_or(0);
+                    account = Some(a.clone());
+                }
+                None => {
+                    // all accounts at/over their stop%: stop all activity and
+                    // monitor for the usage refresh (expiry zeroes windows)
+                    println!(
+                        "[engine] {project_name}: all accounts at stop% — holding until a usage window resets"
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(u) = account.as_ref().and_then(|a| usage::read_usage(&a.name)) {
+            if let Some(age) = u.age_sec(now) {
+                if age > usage::SNAPSHOT_STALE_WARN_SEC && !self.running.is_empty() {
+                    eprintln!(
+                        "[engine] warning: usage snapshot for '{}' is {age}s old",
+                        account.as_ref().map(|a| a.name.as_str()).unwrap_or("default")
+                    );
+                }
+            }
+        }
         let cap = max_agents(&project.maxagents, usage_pct) as usize;
         let running_now = self.running.len();
         if running_now >= cap {
@@ -339,7 +427,8 @@ impl EngineRuntime {
             if item.agent != "exec" && type_running >= type_max {
                 continue;
             }
-            if self.start_item(engine, project, topdir, item) {
+            let account_name = account.as_ref().map(|a| a.name.clone()).unwrap_or_default();
+            if self.start_item(engine, project, topdir, item, &account_name) {
                 slots -= 1;
             }
         }
@@ -351,6 +440,7 @@ impl EngineRuntime {
         project: &Project,
         topdir: &str,
         item: &WorkItem,
+        account: &str,
     ) -> bool {
         // claim: queued -> in-progress via versioned write (loses race gracefully)
         let mut claimed = serde_json::to_value(item).unwrap();
@@ -425,8 +515,9 @@ impl EngineRuntime {
         counter.fetch_add(1, Ordering::SeqCst);
         let agent_type = run_item.agent.clone();
         let workid = run_item.id.clone();
+        let account = account.to_string();
         let handle = std::thread::spawn(move || {
-            crate::work::execute(&api, &engine_name, &project, &topdir, run_item);
+            crate::work::execute(&api, &engine_name, &project, &topdir, run_item, &account);
             counter.fetch_sub(1, Ordering::SeqCst);
         });
         self.running.push((workid, agent_type, handle));
