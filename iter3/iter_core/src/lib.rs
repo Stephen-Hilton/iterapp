@@ -22,6 +22,7 @@ pub const TABLES: &[&str] = &[
     "versions",
     "lock",
     "project_structure",
+    "agent_tooling",
 ];
 
 /// Workitem states (glossary in iter.v3.md).
@@ -166,7 +167,44 @@ pub struct Project {
     pub engines: Vec<String>,
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// the project head file (structureV2): its frontmatter names the global
+    /// context files, interface/usecase dirs and scan dirs the engine surfaces
+    /// to every agent. Default "{topdir}/main.iter.md".
+    #[serde(default = "default_mainfile")]
+    pub mainfile: String,
+    /// context patterns every NEW item inherits when it names none
+    /// ({marker} = nearest *.iter.md above the codepath, {ancestor_markers} =
+    /// the markers of every ancestor directory up to topdir)
+    #[serde(default = "default_context")]
+    pub default_context: Vec<String>,
 }
+fn default_mainfile() -> String { "{topdir}/main.iter.md".into() }
+fn default_context() -> Vec<String> { vec!["{marker}".into(), "{ancestor_markers}".into()] }
+
+/// Agent tooling (decided 2026-09-04): the text V2 kept in .iter/ beside the
+/// agents, now central so every engine assembles the same prompt.
+///   kind = shared     -> appended to every agent prompt (V2 _shared.md)
+///          capability -> indexed in every prompt; full text via `iter capability <name>`
+///          source     -> "source instructions" by requester: user | agent | error
+///          prepost    -> a prose pre/postwork step run as its own agent turn
+///          critic     -> the `iter critreview` persona (model/flags in the row)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentTooling {
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub desc: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub flags: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeoutsec: Option<u64>,
+}
+pub const TOOLING_KINDS: &[&str] = &["shared", "capability", "source", "prepost", "critic"];
 fn default_running() -> String { "Running".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -296,6 +334,14 @@ pub struct WorkItem {
     /// and locks allow, even when the maxagents cap is full; cleared on claim
     #[serde(default)]
     pub run_now: bool,
+    /// context file patterns surfaced to the agent (V2 `context`); empty =
+    /// the project's default_context. {topdir} {codepath} {marker}
+    /// {ancestor_markers} and globs resolve at run time.
+    #[serde(default)]
+    pub context: Vec<String>,
+    /// per-item model override (opus | sonnet | haiku | fable); "" = agent default
+    #[serde(default)]
+    pub model: String,
 }
 fn default_queued() -> String { "queued".into() }
 fn default_priority() -> i64 { 5 }

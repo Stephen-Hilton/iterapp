@@ -3,8 +3,10 @@
 //! everything else lives in iter_data.
 
 mod client;
+mod cli;
 mod engine;
 mod gate;
+mod prompt;
 mod usage;
 mod work;
 
@@ -13,9 +15,18 @@ use clap::Parser;
 use client::Api;
 use serde_json::json;
 
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    /// agent-facing verbs (`iter add|ask|reject|doc|critreview|capability|status`); the
+    /// engine installs `{topdir}/.iter/bin/iter` as a shim to this
+    Cli(cli::CliArgs),
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "iter_engine", about = "iter V3 local engine")]
 struct Args {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
     /// engine config file (data_url, token_envar, engine_name, env_file)
     #[arg(long, default_value = ".iter/config.json")]
     config: String,
@@ -83,6 +94,9 @@ fn load_env_file(path: &str) {
 
 fn main() {
     let args = Args::parse();
+    if let Some(Cmd::Cli(cli_args)) = args.cmd {
+        return cli::run(cli_args);
+    }
 
     let cfg: EngineConfig = match std::fs::read_to_string(&args.config)
         .map_err(|e| e.to_string())

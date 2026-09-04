@@ -129,7 +129,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/users/{user}/pubkey", post(user_pubkey))
         // agents
         .route("/api/agents", get(agents_list))
-        .route("/api/agents/{name}", get(agent_get).put(agent_put))
+        .route("/api/agents/{name}", get(agent_get).put(agent_put).delete(agent_delete))
+        .route("/api/tooling", get(tooling_list))
+        .route("/api/tooling/{name}", get(tooling_get).put(tooling_put).delete(tooling_delete))
         // projects
         .route("/api/projects", get(projects_list))
         .route("/api/projects/{name}", get(project_get).put(project_put).delete(project_delete))
@@ -319,6 +321,42 @@ async fn user_pubkey(
 }
 
 // ---------- agents ----------
+
+async fn agent_delete(user: AuthUser, State(st): Ctx, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    user.require_admin()?;
+    let deleted = st.store.delete("agent", &name, NOSK).await?;
+    st.store.bump_seq(GLOBAL, "agent").await?;
+    Ok(Json(json!({"deleted": deleted})))
+}
+
+// ---------- agent tooling (shared rules, capability docs, source instructions, prose steps, critic) ----------
+
+async fn tooling_list(_u: AuthUser, State(st): Ctx) -> Result<Json<Value>, ApiError> {
+    let mut rows = st.store.scan("agent_tooling").await?;
+    rows.sort_by(|a, b| body_str(a, "kind").cmp(&body_str(b, "kind")).then(body_str(a, "name").cmp(&body_str(b, "name"))));
+    Ok(Json(Value::Array(rows)))
+}
+async fn tooling_get(_u: AuthUser, State(st): Ctx, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(st.store.get("agent_tooling", &name, NOSK).await?.ok_or_else(notfound)?))
+}
+async fn tooling_put(user: AuthUser, State(st): Ctx, Path(name): Path<String>, Json(mut body): Json<Value>) -> Result<Json<Value>, ApiError> {
+    user.require_admin()?;
+    body["name"] = json!(name);
+    let parsed: iter_core::AgentTooling =
+        serde_json::from_value(body.clone()).map_err(|e| bad(format!("tooling does not parse: {e}")))?;
+    if !iter_core::TOOLING_KINDS.contains(&parsed.kind.as_str()) {
+        return Err(bad(format!("kind must be one of {:?}", iter_core::TOOLING_KINDS)));
+    }
+    st.store.put("agent_tooling", &name, NOSK, &body).await?;
+    st.store.bump_seq(GLOBAL, "agent_tooling").await?;
+    Ok(Json(body))
+}
+async fn tooling_delete(user: AuthUser, State(st): Ctx, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    user.require_admin()?;
+    let deleted = st.store.delete("agent_tooling", &name, NOSK).await?;
+    st.store.bump_seq(GLOBAL, "agent_tooling").await?;
+    Ok(Json(json!({"deleted": deleted})))
+}
 
 async fn agents_list(_u: AuthUser, State(st): Ctx) -> Result<Json<Value>, ApiError> {
     Ok(Json(Value::Array(st.store.scan("agent").await?)))

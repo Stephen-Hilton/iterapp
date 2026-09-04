@@ -103,6 +103,9 @@ input,select,textarea{background:var(--bg);color:var(--text);border:1px solid va
 .projrow{display:flex;align-items:center;gap:4px}
 .projrow .proj{flex:1}
 .eng .gear{float:right}
+.eng.compact{padding:3px 4px;font-size:12px}
+.eng.compact .gear{float:none;padding:1px 5px;margin-right:4px}
+#tooling .gear{font-size:12px}
 .sf .frow textarea{font-family:ui-monospace,monospace;font-size:12px}
 .sf .help{color:var(--dim);font-size:11px;margin-top:2px}
 .sf .ro{color:var(--dim);padding-top:7px;font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
@@ -236,13 +239,17 @@ a{color:var(--accent)}
       <div id="projects"></div>
     </div>
     <div class="side-section">
-      <h2>Servers &amp; Engines</h2>
+      <h2>Servers &amp; Engines <button class="gear" id="engine-add" title="register an engine record (engines also self-register on first start)">+</button></h2>
       <div class="eng kv" id="dataserver"></div>
       <div id="engines"></div>
     </div>
     <div class="side-section">
-      <h2>Agents</h2>
+      <h2>Agents <button class="gear" id="agent-add" title="new agent">+</button></h2>
       <div id="agents"></div>
+    </div>
+    <div class="side-section">
+      <h2>Agent Tooling <button class="gear" id="tooling-add" title="new tooling row">+</button></h2>
+      <div id="tooling"></div>
     </div>
   </aside>
   <main>
@@ -324,6 +331,23 @@ $("#refresh").onclick=()=>project&&loadItems(project);
 $("#sort").onchange=()=>{try{localStorage.setItem("iter_sort",$("#sort").value);}catch(e){};renderItems();};
 $("#newitem").onclick=()=>openForm("create",null);
 $("#user-gear").onclick=()=>openSettings("user",me);
+$("#agent-add").onclick=async()=>{
+  const name=prompt("New agent name (letters, digits, - _):");if(!name)return;
+  if(!/^[A-Za-z0-9_-]+$/.test(name)){alert("bad name");return;}
+  try{await api("/api/agents/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify({desc:"",max:2,childstate:"queued",timeoutsec:3600,model:"opus",flags:"--dangerously-skip-permissions",promptbody:"# Agent Definition: "+name+"\n\nYou are the **"+name+"** agent.\n"})});
+    await load();openSettings("agent",name);}catch(e){alert("could not add: "+e.message);}
+};
+$("#tooling-add").onclick=async()=>{
+  const name=prompt("New tooling row name (e.g. _my_capability, or a prose step name):");if(!name)return;
+  if(!/^[A-Za-z0-9_-]+$/.test(name)){alert("bad name");return;}
+  const kind=prompt("kind: shared | capability | source | prepost | critic","capability");if(!kind)return;
+  try{await api("/api/tooling/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify({kind,desc:"",body:""})});await load();openSettings("tooling",name);}catch(e){alert("could not add: "+e.message);}
+};
+$("#engine-add").onclick=async()=>{
+  const name=prompt("Engine name (must match engine_name in that machine's .iter/config.json):");if(!name)return;
+  if(!/^[A-Za-z0-9_-]+$/.test(name)){alert("bad name");return;}
+  try{await api("/api/engines/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify({host:"",state:"Stopped",ticksec:5,full_refresh_minutes:360,queuelock:{retryms:50,breaksec:60},projects:{}})});await load();openSettings("engine",name);}catch(e){alert("could not add: "+e.message);}
+};
 
 async function load(){
   $("#login").style.display="none";$("#layout").style.display="flex";$("#top").style.display="";
@@ -369,8 +393,13 @@ async function load(){
       alert(`No answer from ${name} within 2 minutes — is the engine running?`);await load();
     }catch(e){alert("test failed: "+e.message);await load();}
   });
-  $("#agents").innerHTML=agents.map(a=>`<div class="eng"><button class="gear" data-gear="agent" data-name="${esc(a.name)}" title="${isAdmin()?"edit agent":"view agent (admins edit)"}">${isAdmin()?"⚙":"👁"}</button><b>${esc(a.name)}</b> <span class="kv">${esc(a.model||"—")} · max ${esc(a.max??"—")}</span>
-      <br><span class="kv">${esc((a.desc||"").slice(0,70))}</span></div>`).join("")||"<div class='eng kv'>no agents defined</div>";
+  $("#agents").innerHTML=agents.map(a=>`<div class="eng compact"><button class="gear" data-gear="agent" data-name="${esc(a.name)}" title="${isAdmin()?"edit agent":"view agent (admins edit)"}">${isAdmin()?"⚙":"👁"}</button><b>${esc(a.name)}</b> <span class="kv">${esc(a.model||"—")} · max ${esc(a.max??"—")}</span></div>`).join("")||"<div class='eng kv'>no agents defined</div>";
+  const tooling=await api("/api/tooling").catch(()=>[]);
+  const kinds=[["shared","shared rules"],["capability","capabilities"],["source","source instructions"],["prepost","prose pre/post steps"],["critic","critic persona"]];
+  $("#tooling").innerHTML=kinds.map(([k,label])=>{const rows=tooling.filter(t=>t.kind===k);if(!rows.length)return "";
+    return `<div class="eng compact"><span class="kv">${esc(label)}</span><br>${rows.map(t=>`<button class="gear" data-gear="tooling" data-name="${esc(t.name)}" title="${esc(t.desc||"")}">${isAdmin()?"⚙":"👁"} ${esc(t.name)}</button>`).join(" ")}</div>`;}).join("")||"<div class='eng kv'>none — import with iter_data --migrate-v2 --migrate-scope tooling, or add one</div>";
+  const canAdmin=isAdmin();
+  $("#agent-add").hidden=!canAdmin;$("#tooling-add").hidden=!canAdmin;$("#engine-add").hidden=!canAdmin;
   document.querySelectorAll("[data-gear]").forEach(g=>g.onclick=ev=>{ev.stopPropagation();openSettings(g.dataset.gear,g.dataset.name);});
   if(projects.length&&!project)project=projects[0].name;
   if(project)await loadItems(project);else renderCounts();
@@ -381,7 +410,7 @@ async function loadItems(p){
   try{localStorage.setItem("iter_project",p);}catch(e){}
   document.querySelectorAll("#projects .proj").forEach(b=>b.classList.toggle("sel",b.dataset.p===p));
   const [items]=await Promise.all([api(P()),renderProjectCtl().catch(()=>{})]);
-  itemsCache=items;buildKids(itemsCache);
+  itemsCache=items;buildKids(itemsCache);parentCache={};
   renderCounts();renderItems();
 }
 
@@ -471,28 +500,36 @@ function runGroup(i,byId){
   if(i.state==="failed")return 7;
   return 8;                                                  // complete
 }
-/* tree parent: the first blocker present in the set, else the creator (deep dependency) */
+/* tree parent = the item this one is actually WAITING ON (deep gate): the open
+   blocker, or the open descendant of a complete blocker.  An unblocked item is
+   a root; an item is never shown under the item that created it. */
+let parentCache={};
 function parentOf(i,ids){
-  const dep=(i.blockedby||[]).find(d=>ids.has(d));
-  if(dep)return dep;
-  return (i.createdby&&ids.has(i.createdby)&&i.createdby!==i.id)?i.createdby:null;
+  if(CLOSED.has(i.state)||i.state==="in-progress")return null; // not waiting on anything
+  if(parentCache[i.id]===undefined){
+    const byId={};itemsCache.forEach(x=>{byId[x.id]=x;});
+    const ds=depStatus(i,byId);
+    parentCache[i.id]=ds.waiting||ds.failed||null;
+  }
+  const p=parentCache[i.id];
+  return (p&&p!==i.id&&ids.has(p))?p:null;
 }
-/* items that are runnable, or have a runnable descendant (blockedby OR createdby edges) */
+/* run order: runnable items plus everything they are (transitively) waiting on */
 function runView(items){
-  const byId={},kids={};
-  items.forEach(i=>{byId[i.id]=i;});
-  items.forEach(i=>{
-    (i.blockedby||[]).forEach(d=>{if(byId[d])(kids[d]=kids[d]||[]).push(i.id);});
-    if(i.createdby&&byId[i.createdby]&&i.createdby!==i.id)(kids[i.createdby]=kids[i.createdby]||[]).push(i.id);
+  parentCache={};
+  const byId={};items.forEach(i=>{byId[i.id]=i;});
+  const ids=new Set(items.map(i=>i.id));
+  const keep=new Set();
+  items.filter(runnable).forEach(i=>{
+    let cur=i,guard=0;
+    while(cur&&guard++<64){
+      if(keep.has(cur.id))break;
+      keep.add(cur.id);
+      const p=parentOf(cur,ids);
+      cur=p?byId[p]:null;
+    }
   });
-  const memo={};
-  const has=(id,seen=new Set())=>{
-    if(memo[id]!==undefined)return memo[id];
-    if(seen.has(id))return false;seen.add(id);
-    const r=(kids[id]||[]).some(c=>runnable(byId[c])||has(c,seen));
-    memo[id]=r;return r;
-  };
-  return items.filter(i=>runnable(i)||(!CLOSED.has(i.state)&&has(i.id)));
+  return items.filter(i=>keep.has(i.id));
 }
 const stateOrder={"in-progress":0,"queued":1,"question":2,"paused":3,"parked":4,"scheduled":5,"failed":6,"complete":7};
 function comparator(mode,byId){
@@ -541,8 +578,9 @@ function renderItems(){
     shown=itemsCache.filter(i=>filters.size===0||filters.has(i.state));
     $("#viewnote").textContent=filters.size?`${shown.length} shown (${[...filters].join(" + ")})`:"";
   }
-  /* every view nests: an item sits under its blocker (or its creator), as deep as the chain goes */
+  /* every view nests: an item sits under what it is waiting on, as deep as the chain goes */
   {
+    if(!(mode==="runorder"&&filters.size===0))parentCache={};
     const ids=new Set(shown.map(i=>i.id));
     const children={},roots=[];
     shown.forEach(i=>{const p=parentOf(i,ids);if(p){(children[p]=children[p]||[]).push(i);}else roots.push(i);});
@@ -654,7 +692,7 @@ async function createItem(body,request){
 }
 function cloneBody(i,over={}){
   return {name:i.name,agent:i.agent,exec_shell:i.exec_shell||"",priority:i.priority??5,lockdirs:i.lockdirs||[],
-    blockedby:i.blockedby||[],tags:i.tags||[],prework:i.prework||[],postwork:i.postwork||[],
+    blockedby:i.blockedby||[],tags:i.tags||[],prework:i.prework||[],postwork:i.postwork||[],context:i.context||[],model:i.model||"",
     requestedby:me||"",createdby:me||"",state:"queued",...over};
 }
 async function doAction(act,i){
@@ -727,6 +765,8 @@ function openForm(mode,src){
       <div class="frow"><label>state on save</label><select id="f-state">${stateOpts.map(s=>`<option ${s===curState?"selected":""}>${s}</option>`).join("")}</select></div>
       <div class="frow"><label>lockdirs</label><textarea id="f-lock" rows="2" placeholder="one per line, e.g. {topdir}/core/repos/x/">${esc(lines(i.lockdirs))}</textarea></div>
       <div class="frow"><label>blocked by</label><textarea id="f-dep" rows="2" placeholder="workitem ids, one per line">${esc(lines(i.blockedby))}</textarea></div>
+      <div class="frow"><label>context files</label><textarea id="f-ctx" rows="2" placeholder="one per line; {topdir}/…, {codepath}/…, {marker}, {ancestor_markers}, globs — blank = project default">${esc(lines(i.context))}</textarea></div>
+      <div class="frow"><label>model</label><input id="f-model" value="${esc(i.model||"")}" placeholder="blank = agent default (opus | sonnet | haiku | fable)" style="width:260px"></div>
       <div class="frow"><label>tags</label><input id="f-tags" value="${esc(tagsText)}" placeholder="comma separated; optional color: name:#hex"></div>
       <div class="frow"><label>request</label><textarea id="f-req" rows="16" placeholder="the full request text the agent receives">${esc(i._request??"")}</textarea></div>
       <div style="text-align:right;margin-top:10px"><span class="err" id="f-err" style="margin-right:12px"></span><button id="f-save">${mode==="edit"?"Save":"Create"}</button></div>
@@ -741,7 +781,7 @@ function openForm(mode,src){
     const list=s=>val(s).split("\n").map(x=>x.trim()).filter(Boolean);
     const tags=val("#f-tags").split(",").map(x=>x.trim()).filter(Boolean).map(x=>{const m=x.match(/^(.*?):(#[0-9a-fA-F]{3,8})$/);return m?{text:m[1].trim(),color:m[2]}:{text:x,color:""};});
     const body={name:val("#f-name").trim(),agent:val("#f-agent"),exec_shell:val("#f-exec"),priority:parseInt(val("#f-prio")||"5",10),
-      state:val("#f-state"),lockdirs:list("#f-lock"),blockedby:list("#f-dep"),tags};
+      state:val("#f-state"),lockdirs:list("#f-lock"),blockedby:list("#f-dep"),tags,context:list("#f-ctx"),model:val("#f-model").trim()};
     if(!body.name){err.textContent="name is required";return;}
     try{
       if(mode==="edit"){
@@ -817,6 +857,8 @@ const PROJECT_FIELDS=[
   {key:"desc",label:"description",type:"textarea",rows:5,help:"sent to every agent as project context, on every run"},
   {key:"state",type:"select",options:["Running","Draining","Stopped"],help:"the COMMANDED state; every engine serving this project follows it"},
   {key:"gitrepo",label:"git repo",type:"text"},
+  {key:"mainfile",label:"main file",type:"text",help:"the project head (structureV2); its frontmatter's globalcontextfiles are surfaced to every agent"},
+  {key:"default_context",label:"default context",type:"json",rows:2,help:'context patterns a work item inherits when it names none: ["{marker}","{ancestor_markers}"]'},
   {key:"maxagents",label:"max agents",type:"json",rows:4,help:'usage%-gated cap, evaluated against the higher of 5h/7d usage: {"&gt;95%":0,"&gt;90%":1,"else":4}'},
   {key:"maxdailycost",label:"max daily cost ($)",type:"number",nullable:true,help:"blank = unlimited · 0 = spend nothing (kill switch)"},
   {key:"agents",label:"agent overrides",type:"json",rows:6,help:'per-agent overrides keyed by agent name: {"code":{"max":2,"model":"opus","timeoutsec":3600,"closegate":{"verify":"haiku","requires_commit":true}}}'},
@@ -857,6 +899,7 @@ async function openSettings(kind,name){
     if(kind==="agent")return await agentSettings(name);
     if(kind==="user")return await userSettings(name);
     if(kind==="data")return dataSettings();
+    if(kind==="tooling")return await toolingSettings(name);
   }catch(e){alert("could not open settings: "+e.message);}
 }
 async function projectSettings(name){
@@ -874,12 +917,40 @@ async function projectSettings(name){
 }
 async function agentSettings(name){
   const rec=await api("/api/agents/"+encodeURIComponent(name));
+  const extra=isAdmin()?`<div style="margin-top:18px;border-top:1px solid var(--line);padding-top:12px;text-align:right"><button class="danger sm" id="agent-del">Delete agent</button></div>`:"";
   settingsBox(`Agent — ${name}`,AGENT_FIELDS,rec,async(vals)=>{
     const fresh=await api("/api/agents/"+encodeURIComponent(name));
     Object.assign(fresh,vals);
     await api("/api/agents/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify(fresh)});
-    sdlg.close();agentsCache=await api("/api/agents").catch(()=>agentsCache);
-  },{canSave:isAdmin()});
+    sdlg.close();await load();
+  },{canSave:isAdmin(),extra,note:"the prompt body is the agent's role; at run time the engine appends the shared rules, the capability index, the project head files, source instructions and the work item"});
+  const del=sdlg.querySelector("#agent-del");
+  if(del)del.onclick=async()=>{
+    if(!confirm(`Delete agent "${name}"? This cannot be undone. Work items that name this agent will not be runnable until it exists again.`))return;
+    try{await api("/api/agents/"+encodeURIComponent(name),{method:"DELETE"});sdlg.close();await load();}catch(e){alert("delete failed: "+e.message);}
+  };
+}
+const TOOLING_FIELDS=[
+  {key:"name",type:"readonly"},
+  {key:"kind",type:"select",options:["shared","capability","source","prepost","critic"],help:"shared: appended to every prompt · capability: indexed in every prompt, full text via `iter capability <name>` · source: by requester (user | agent | error) · prepost: a prose step run as its own turn when a work item lists it · critic: the `iter critreview` persona"},
+  {key:"desc",label:"one-line description",type:"text",help:"what the capability index shows"},
+  {key:"model",type:"text",help:"critic only"},{key:"flags",type:"text",help:"critic only"},{key:"timeoutsec",label:"timeout (sec)",type:"number",nullable:true,help:"critic only"},
+  {key:"body",type:"textarea",rows:22},
+];
+async function toolingSettings(name){
+  const rec=await api("/api/tooling/"+encodeURIComponent(name));
+  const extra=isAdmin()?`<div style="margin-top:18px;border-top:1px solid var(--line);padding-top:12px;text-align:right"><button class="danger sm" id="tool-del">Delete tooling row</button></div>`:"";
+  settingsBox(`Agent tooling — ${name}`,TOOLING_FIELDS,rec,async(vals)=>{
+    const fresh=await api("/api/tooling/"+encodeURIComponent(name));
+    Object.assign(fresh,vals);
+    await api("/api/tooling/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify(fresh)});
+    sdlg.close();await load();
+  },{canSave:isAdmin(),extra});
+  const del=sdlg.querySelector("#tool-del");
+  if(del)del.onclick=async()=>{
+    if(!confirm(`Delete tooling row "${name}"? This cannot be undone.`))return;
+    try{await api("/api/tooling/"+encodeURIComponent(name),{method:"DELETE"});sdlg.close();await load();}catch(e){alert("delete failed: "+e.message);}
+  };
 }
 async function engineSettings(name){
   const rec=await api("/api/engines/"+encodeURIComponent(name));
@@ -955,6 +1026,7 @@ async function openDetail(id){
         · completed ${esc(fmtTs(i.ts&&i.ts.complete)||"—")} · attempt ${esc(i.attempt)} · engine ${esc(i.engine||"—")}</div>
       ${(()=>{const byId={};itemsCache.forEach(x=>{byId[x.id]=x;});const ds=depStatus(i,byId);
         return ds.ok?"":`<div class="kv" style="color:var(--warn)">gate: ${ds.failed?"dependency "+esc(ds.failed.slice(-8))+" closed FAILED — retry it and this item flows after it":"waiting on "+esc(ds.waiting.slice(-8))+(ds.via?" (created by blocker "+esc(ds.via.slice(-8))+"; deep dependency)":"")}</div>`;})()}
+      ${(i.context||[]).length?`<div class="kv">context: ${esc(i.context.join(", "))}</div>`:""}${i.model?`<div class="kv">model: <b>${esc(i.model)}</b></div>`:""}
       <div class="kv">lockdirs: ${esc((i.lockdirs||[]).join(", ")||"—")}
         ${i.lasterror?" · <span style='color:var(--bad)'>"+esc(i.lasterror.slice(0,200))+"</span>":""}</div>
       <div id="dl"></div>

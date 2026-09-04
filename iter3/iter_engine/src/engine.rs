@@ -89,11 +89,23 @@ impl EngineRuntime {
                         continue;
                     }
                 },
+                Err(e) if e.status == 404 => {
+                    // self-register (decided 2026-09-04): a new engine creates its own
+                    // record; projects are assigned to it afterwards via the webui gear
+                    let host = std::process::Command::new("hostname").output().ok()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                    let row = json!({"name": self.name, "host": host, "state": "Stopped", "last_seen": "",
+                        "ticksec": 5, "full_refresh_minutes": 360, "account": "",
+                        "queuelock": {"retryms": 50, "breaksec": 60}, "projects": {}});
+                    match self.api.put(&format!("/api/engines/{}", self.name), &row) {
+                        Ok(_) => println!("[engine] registered '{}' with iter_data — assign it projects via the webui (engine gear -> projects served)", self.name),
+                        Err(e2) => eprintln!("[engine] cannot self-register '{}': {e2}", self.name),
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
                 Err(e) => {
-                    eprintln!(
-                        "[engine] cannot load engine '{}' from iter_data ({e}); define it via the API/webui first",
-                        self.name
-                    );
+                    eprintln!("[engine] cannot load engine '{}' from iter_data ({e})", self.name);
                     std::thread::sleep(Duration::from_secs(5));
                     continue;
                 }

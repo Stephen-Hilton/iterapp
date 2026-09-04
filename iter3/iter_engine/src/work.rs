@@ -49,6 +49,18 @@ pub fn execute(api: &Api, engine_name: &str, project: &Project, topdir: &str, it
 
     let head_before = git_head(topdir);
     let result = run_all(api, project, topdir, &item, account, &details);
+    // `iter ask` / `iter reject` move the item to question/parked mid-run; the
+    // close must keep that state (and skip the gate) instead of completing it
+    if item.agent != "exec" {
+        if let Ok(fresh) = api.get(&format!("/api/projects/{}/workitems/{}", project.name, item.id)) {
+            let st = fresh.get("state").and_then(|s| s.as_str()).unwrap_or("");
+            if st == "question" || st == "parked" {
+                println!("[engine] {} '{}': agent moved it to {} during the run — keeping that", short(&item.id), item.name, st);
+                close_keep_state(api, project, item, result, st);
+                return;
+            }
+        }
+    }
     let ctx = if item.agent == "exec" {
         None
     } else {
@@ -107,7 +119,18 @@ fn run_all(
     if is_repo && has_remote {
         run_shell(topdir, "git pull --no-rebase", 120)?;
     }
-    for extra in &item.prework {
+    // prose steps (agent_tooling kind prepost) run as agent turns inside
+    // run_claude; only the rest are engine-run shell steps
+    let prose: std::collections::HashSet<String> = api
+        .get("/api/tooling")
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.get("kind").and_then(|k| k.as_str()) == Some("prepost"))
+        .filter_map(|r| r.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    for extra in item.prework.iter().filter(|p| !prose.contains(*p)) {
         run_named_ppw(api, project, topdir, extra, item)?;
     }
 
@@ -129,7 +152,7 @@ fn run_all(
             run_shell(topdir, "git push", 180)?;
         }
     }
-    for extra in &item.postwork {
+    for extra in item.postwork.iter().filter(|p| !prose.contains(*p)) {
         run_named_ppw(api, project, topdir, extra, item)?;
     }
     Ok(output)
@@ -193,35 +216,272 @@ fn run_claude(
     let agent_def = api
         .get(&format!("/api/agents/{}", item.agent))
         .map_err(|e| format!("agent '{}' not defined in iter_data: {e}", item.agent))?;
-    let promptbody = agent_def.get("promptbody").and_then(|p| p.as_str()).unwrap_or("");
+    let promptbody = agent_def.get("promptbody").and_then(|p| p.as_str()).unwrap_or("").to_string();
     let overrides = project.agents.get(&item.agent).cloned().unwrap_or(Value::Null);
-    let model = overrides
-        .get("model")
-        .and_then(|m| m.as_str())
-        .or_else(|| agent_def.get("model").and_then(|m| m.as_str()))
-        .unwrap_or("")
-        .to_string();
-    let flags = overrides
-        .get("flags")
-        .and_then(|f| f.as_str())
-        .or_else(|| agent_def.get("flags").and_then(|f| f.as_str()))
-        .unwrap_or("")
-        .to_string();
+    let model = if !item.model.trim().is_empty() {
+        item.model.trim().to_string()
+    } else {
+        overrides.get("model").and_then(|m| m.as_str())
+            .or_else(|| agent_def.get("model").and_then(|m| m.as_str())).unwrap_or("").to_string()
+    };
+    let flags = overrides.get("flags").and_then(|f| f.as_str())
+        .or_else(|| agent_def.get("flags").and_then(|f| f.as_str())).unwrap_or("").to_string();
+    let timeout = agent_timeout(project, item);
 
+    // central tooling: shared rules, capability index, source instructions, prose steps
+    let tooling_rows = api.get("/api/tooling").ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    let tooling = crate::prompt::Tooling::from_rows(&tooling_rows);
+    let top = std::path::Path::new(topdir);
+    let head = crate::prompt::read_head(project, top);
+    let codepath = item
+        .lockdirs
+        .first()
+        .map(|d| crate::prompt::expand_topdir_token(d, top))
+        .unwrap_or_else(|| topdir.to_string());
+    let codepath = std::path::PathBuf::from(codepath.trim_end_matches('/'));
+
+    // who asked: a workitem id in createdby means an agent handoff — name its type
+    let createdby_agent = if !item.createdby.is_empty() && item.createdby.len() >= 32 {
+        api.get(&format!("/api/projects/{}/workitems/{}", project.name, item.createdby))
+            .ok().and_then(|p| p.get("agent").and_then(|a| a.as_str()).map(String::from)).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let last_response = details
+        .iter()
+        .filter(|d| d.get("key").and_then(|k| k.as_str()) == Some("response"))
+        .max_by_key(|d| d.get("order").and_then(|o| o.as_i64()).unwrap_or(0))
+        .and_then(|d| d.get("value").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_default();
+
+    let (spin, context_files, warnings) = crate::prompt::spinup(&crate::prompt::SpinupInput {
+        agent_body: &promptbody,
+        tooling: &tooling,
+        head: &head,
+        project,
+        item,
+        codepath: &codepath,
+        topdir: top,
+        requestedby: &item.requestedby,
+        createdby_agent: &createdby_agent,
+        last_response_tail: &last_response,
+        close_gate_paragraph: &format!("\n\n{}", gate::WORKER_CLOSE_GATE_PROMPT),
+    });
+    for w in &warnings {
+        eprintln!("[engine] {} context: {w}", short(&item.id));
+    }
+
+    // the request + an answered question (if the item came back from `question`)
     let request = request_text(details, item);
+    let answered = crate::prompt::answered_question(details);
+    if let Some((order, _, _)) = &answered {
+        // mark the answer as shown so a later run does not repeat it
+        if let Some(row) = details.iter().find(|d| d.get("order").and_then(|o| o.as_i64()) == Some(*order)) {
+            let mut v = row.get("value").cloned().unwrap_or(Value::Null);
+            v["surfaced"] = json!(true);
+            let _ = api.put(
+                &format!("/api/projects/{}/workitems/{}/details/{}", project.name, item.id, order),
+                &json!({"key": "question", "valuetype": "json", "value": v}),
+            );
+        }
+    }
+    let mut main = crate::prompt::mainwork_prompt(&request, answered.map(|(_, q, a)| (q, a)));
     let feedback = gate::feedback_section(details);
-    let mut prompt = format!(
-        "# Project\n{}\n\n# Agent role\n{}\n\n# Workitem: {}\n{}\n\n{}",
-        project.desc, promptbody, item.name, request, gate::WORKER_CLOSE_GATE_PROMPT
-    );
     if !feedback.is_empty() {
-        prompt.push('\n');
-        prompt.push_str(&feedback);
+        main.push_str("\n\n");
+        main.push_str(&feedback);
+    }
+
+    // turn sequence: prose prework → mainwork → prose postwork → self-check
+    let mut turns: Vec<(String, String)> = Vec::new();
+    for step in &item.prework {
+        if let Some(body) = tooling.prepost.get(step) {
+            turns.push((format!("prework:{step}"), body.clone()));
+        }
+    }
+    turns.push(("mainwork".into(), main));
+    for step in &item.postwork {
+        if let Some(body) = tooling.prepost.get(step) {
+            turns.push((format!("postwork:{step}"), body.clone()));
+        }
+    }
+    turns.push(("selfcheck".into(), crate::prompt::selfcheck_prompt(&promptbody, &tooling.shared)));
+
+    // the agent's environment (V2 names kept so the shared rules still apply verbatim)
+    let shim = write_iter_shim(topdir)?;
+    let mut envs: Vec<(String, String)> = vec![
+        ("ITER_BIN".into(), shim.clone()),
+        ("ITER_PROJECT".into(), project.name.clone()),
+        ("ITER_WORKID".into(), item.id.clone()),
+        ("ITER_AGENT".into(), item.agent.clone()),
+        ("ITER_TOPDIR".into(), topdir.to_string()),
+        ("ITER_MAINFILE".into(), head.mainfile.to_string_lossy().into_owned()),
+        ("ITER_CONTEXT_FILES".into(), head.context_files.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(":")),
+        ("ITER_ITEM_CONTEXT_FILES".into(), context_files.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(":")),
+        ("ITER_TEST_DIR".into(), "tests".into()),
+        ("ITER_INTERFACE_DIR".into(), head.interface_dir.clone()),
+        ("ITER_USECASE_DIR".into(), head.usecase_dir.clone()),
+        ("ITER_DATA_URL".into(), api.base.clone()),
+        ("ITER_ENGINE_TOKEN".into(), api.token.clone()),
+        ("BASH_MAX_TIMEOUT_MS".into(), timeout.saturating_mul(1000).to_string()),
+    ];
+    if let Some(dir) = std::path::Path::new(&shim).parent() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        envs.push(("PATH".into(), format!("{}:{}", dir.display(), path)));
+    }
+    // V2 delegation for local-file verbs (runtests/validate/...): the V2 binary + its project root
+    if let Some((bin, root)) = v2_delegate(topdir) {
+        envs.push(("ITER_V2_BIN".into(), bin));
+        envs.push(("ITER_V2_PROJECT".into(), root));
     }
 
     let extra: Vec<String> = flags.split_whitespace().map(String::from).collect();
-    let raw = spawn_claude(project, topdir, account, &prompt, &model, &extra, agent_timeout(project, item))?;
-    Ok(parse_claude_json(&raw))
+    let mut session = Session { sid: String::new(), cwd: codepath.to_string_lossy().into_owned(), model, extra, envs, timeout, account: account.to_string() };
+    if !std::path::Path::new(&session.cwd).is_dir() {
+        session.cwd = topdir.to_string();
+    }
+    let mut last = RunOut::default();
+    let total = turns.len();
+    for (n, (label, prompt)) in turns.into_iter().enumerate() {
+        let text = if n == 0 { format!("{spin}\n\n# Step: {label}\n{prompt}") } else { format!("# Step: {label}\n{prompt}") };
+        println!("[engine] {} turn {}/{} {label}", short(&item.id), n + 1, total);
+        let out = session.turn(project, &text)?;
+        // a cut-off turn ends the run: the gate sees the subtype and holds the item
+        let cut = out.subtype != "success";
+        if label == "mainwork" || cut {
+            last = out;
+        }
+        if cut {
+            break;
+        }
+    }
+    Ok(last)
+}
+
+/// The `iter critreview` critic: a fresh session, no account routing beyond
+/// the ambient token, bounded by the persona's timeout.
+pub fn run_critic(cwd: &str, prompt: &str, model: &str, flags: &[String], timeout_sec: u64) -> Result<RunOut, String> {
+    let mut cmd = Command::new("claude");
+    cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
+    if !model.is_empty() {
+        cmd.arg("--model").arg(model);
+    }
+    for f in flags {
+        cmd.arg(f);
+    }
+    cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
+    cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    Ok(parse_claude_json(&wait_with_timeout(cmd, timeout_sec)?))
+}
+
+/// One headless claude session across several turns (`--resume`).
+struct Session {
+    sid: String,
+    cwd: String,
+    model: String,
+    extra: Vec<String>,
+    envs: Vec<(String, String)>,
+    timeout: u64,
+    account: String,
+}
+
+impl Session {
+    fn turn(&mut self, project: &Project, prompt: &str) -> Result<RunOut, String> {
+        let mut args: Vec<String> = Vec::new();
+        if !self.sid.is_empty() {
+            args.push("--resume".into());
+            args.push(self.sid.clone());
+        }
+        args.extend(self.extra.iter().cloned());
+        let raw = spawn_claude_env(project, &self.cwd, &self.account, prompt, &self.model, &args, self.timeout, &self.envs)?;
+        let (sid, out) = parse_claude_json_sid(&raw);
+        if !sid.is_empty() {
+            self.sid = sid;
+        }
+        Ok(out)
+    }
+}
+
+/// `{topdir}/.iter/bin/iter` -> this binary's `cli` subcommand, so agents run
+/// plain `iter add …` exactly as the shared rules say.
+fn write_iter_shim(topdir: &str) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = std::path::Path::new(topdir).join(".iter").join("bin");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let shim = dir.join("iter");
+    let body = format!("#!/bin/sh\nexec \"{}\" cli \"$@\"\n", exe.display());
+    if std::fs::read_to_string(&shim).ok().as_deref() != Some(body.as_str()) {
+        std::fs::write(&shim, body).map_err(|e| format!("write {}: {e}", shim.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(shim.to_string_lossy().into_owned())
+}
+
+/// The V2 binary + project root when the repo still carries them
+/// (`{topdir}/devops/iter` + `{topdir}/devops`), for the local-file verbs V3
+/// has not re-implemented (runtests, validate, markers, teststate, usecase…).
+fn v2_delegate(topdir: &str) -> Option<(String, String)> {
+    if let Ok(b) = std::env::var("ITER_V2_BIN") {
+        let root = std::env::var("ITER_V2_PROJECT").unwrap_or_else(|_| topdir.to_string());
+        return Some((b, root));
+    }
+    let cand = std::path::Path::new(topdir).join("devops").join("iter");
+    if cand.is_file() {
+        return Some((cand.to_string_lossy().into_owned(), cand.parent().unwrap().to_string_lossy().into_owned()));
+    }
+    None
+}
+
+/// Like `parse_claude_json` but also returns the session id for `--resume`.
+fn parse_claude_json_sid(raw: &str) -> (String, RunOut) {
+    let trimmed = raw.trim();
+    let candidate = trimmed.find('{').map(|i| &trimmed[i..]).unwrap_or("");
+    if let Ok(v) = serde_json::from_str::<Value>(candidate) {
+        let sid = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        return (sid, parse_claude_json(raw));
+    }
+    (String::new(), parse_claude_json(raw))
+}
+
+/// Spawn with an explicit environment (the multi-turn session path).
+fn spawn_claude_env(
+    project: &Project,
+    cwd: &str,
+    account: &str,
+    prompt: &str,
+    model: &str,
+    extra_args: &[String],
+    timeout_sec: u64,
+    envs: &[(String, String)],
+) -> Result<String, String> {
+    let mut cmd = Command::new("claude");
+    cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
+    cmd.arg("--settings").arg(crate::usage::statusline_settings(account));
+    if !model.is_empty() {
+        cmd.arg("--model").arg(model);
+    }
+    for f in extra_args {
+        cmd.arg(f);
+    }
+    let token = project
+        .accounts
+        .iter()
+        .filter(|a| account.is_empty() || a.name == account)
+        .chain(project.accounts.iter())
+        .find_map(|a| std::env::var(&a.token_envar).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()));
+    if let Some(tok) = token {
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", tok);
+    }
+    cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    wait_with_timeout(cmd, timeout_sec)
 }
 
 /// Spawn one headless claude session (json result output) billed to the
@@ -440,6 +700,21 @@ fn run_gate(api: &Api, project: &Project, item: &WorkItem, out: &RunOut, ctx: &G
             ev,
         ),
     }
+}
+
+/// Close-out when the agent itself moved the item (question via `iter ask`,
+/// parked via `iter reject`): record the response, keep the state, free locks.
+fn close_keep_state(api: &Api, project: &Project, item: WorkItem, result: Result<RunOut, String>, state: &str) {
+    let details_path = format!("/api/projects/{}/workitems/{}/details", project.name, item.id);
+    let (key, text) = match &result {
+        Ok(out) => ("response", out.text.clone()),
+        Err(e) => ("error", e.clone()),
+    };
+    let _ = api.post(&details_path, &json!({"key": key, "valuetype": "text", "value": text}));
+    for d in &item.lockdirs {
+        let _ = api.post(&format!("/api/projects/{}/locks/release", project.name), &json!({"path": d, "workid": item.id}));
+    }
+    println!("[engine] done {} '{}' -> {} (set by the agent)", short(&item.id), item.name, state);
 }
 
 fn close(api: &Api, _engine_name: &str, project: &Project, item: WorkItem, result: Result<RunOut, String>, ctx: Option<GateCtx>) {

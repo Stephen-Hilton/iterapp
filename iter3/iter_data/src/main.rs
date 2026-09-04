@@ -69,6 +69,9 @@ struct Args {
     /// count and report only; write nothing
     #[arg(long, default_value_t = false)]
     migrate_dry_run: bool,
+    /// comma-separated record families to import (items,agents,tooling,project,engine,user); default all
+    #[arg(long, default_value = "")]
+    migrate_scope: String,
 }
 
 /// The single-file webui, embedded so the Lambda deploy needs no filesystem.
@@ -194,6 +197,7 @@ async fn migrate_v2(store: &dyn storage::Storage, args: &Args) {
         mainfile: args.migrate_mainfile.clone(),
         overwrite: args.migrate_overwrite,
         dry_run: args.migrate_dry_run,
+        scope: args.migrate_scope.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
     };
     match migrate::run(store, &opts).await {
         Ok(rep) => {
@@ -209,6 +213,7 @@ async fn migrate_v2(store: &dyn storage::Storage, args: &Args) {
             }
             println!("  detail rows: {} (review rows from critiques: {})", rep.details_written, rep.reviews);
             println!("  agents written: {} (skipped existing: {})", rep.agents_written, rep.agents_skipped);
+            println!("  tooling rows written: {} (skipped existing: {})", rep.tooling_written, rep.tooling_skipped);
             println!("  project record written: {}; engine record written: {}", rep.project_written, rep.engine_written);
             match &rep.user_written {
                 Some(u) => println!("  operator user upserted from ITER_USERNAME/ITER_PASSWORD: {u}"),

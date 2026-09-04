@@ -4,9 +4,9 @@ Spec: `src/features/iter.v3.md`. Three components in one cargo workspace:
 
 | crate / dir | what it is |
 |---|---|
-| `iter_core` | shared types, widget schema + validation, path-overlap and account-ladder logic |
+| `iter_core` | shared types (incl. agent tooling), widget schema + validation, deep dependency gate, path-overlap and account-ladder logic |
 | `iter_data` | the central API server: axum + storage trait (`sqlite` \| `dynamodb`), JWT auth, seq change-signals, central locks, versioned workitem writes, closed-item immutability (append-only `doc` rows + `reopen`), provenance-stamped detail rows; serves the webui statics |
-| `iter_engine` | the local engine: seq-gated sync + full-refresh fallback, heartbeat, pick/lock/run/close, enforced git pre/postwork, close gate (deterministic checks + a haiku verifier before an item may close complete; bounces to queued, then question), helpers (`--adduser`, `--approve`, `--accounts`, `--question-widget`, `--doc`) |
+| `iter_engine` | the local engine (+ `iter_engine cli …`, the agent-facing `iter` verbs: add/ask/reject/doc/critreview/capability/status): seq-gated sync + full-refresh fallback, heartbeat, pick/lock/run/close, enforced git pre/postwork, close gate (deterministic checks + a haiku verifier before an item may close complete; bounces to queued, then question), helpers (`--adduser`, `--approve`, `--accounts`, `--question-widget`, `--doc`) |
 | `webui/` | thin static client (login, projects, engines readout, workitem tiles with dependency indent, detail view, dynamic question widgets) |
 
 ## Run it

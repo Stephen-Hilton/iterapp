@@ -36,6 +36,8 @@ pub struct Options {
     pub mainfile: String,
     pub overwrite: bool,
     pub dry_run: bool,
+    /// which record families to import: items agents tooling project engine user (empty = all)
+    pub scope: Vec<String>,
 }
 
 #[derive(Default, Debug)]
@@ -47,6 +49,8 @@ pub struct Report {
     pub reviews: usize,
     pub agents_written: usize,
     pub agents_skipped: usize,
+    pub tooling_written: usize,
+    pub tooling_skipped: usize,
     pub project_written: bool,
     pub engine_written: bool,
     pub user_written: Option<String>,
@@ -141,6 +145,8 @@ pub fn map_item(v2: &Value, project: &str, topdir_abs: &str) -> Value {
         "ts": {"receive": s(&times, "added"), "start": s(&times, "start"), "complete": s(&times, "closed")},
         "tags": tags,
         "source_schedule": s(v2, "source_schedule"),
+        "context": arr(v2, "context"),
+        "model": s(v2, "model"),
         "engine": "",
         "lasterror": s(v2, "lasterror"),
         "approval_code": "",
@@ -193,7 +199,7 @@ pub fn map_details(v2: &Value, critiques: &[Value], now: &str) -> Vec<Value> {
     // everything V3 has no field for, kept verbatim
     let mut leftovers = serde_json::Map::new();
     for k in [
-        "risk", "automation", "model", "context", "testfiles", "source_testgroup", "source_tests",
+        "risk", "automation", "testfiles", "source_testgroup", "source_tests",
         "codepath_ignore", "git_start_commit", "todo_reason", "depends_on_shallow", "prework",
         "postwork", "exec", "codepath", "codepaths", "source", "type", "state", "answer",
     ] {
@@ -236,13 +242,11 @@ pub fn parse_agent_md(text: &str) -> (BTreeMap<String, String>, String) {
     (fm, text.to_string())
 }
 
-fn agent_row(name: &str, fm: &BTreeMap<String, String>, body: &str, shared: &str) -> Value {
+fn agent_row(name: &str, fm: &BTreeMap<String, String>, body: &str) -> Value {
     let num = |k: &str| fm.get(k).and_then(|v| v.parse::<u64>().ok());
-    let mut promptbody = body.trim_end().to_string();
-    if !shared.trim().is_empty() {
-        promptbody.push_str("\n\n");
-        promptbody.push_str(shared.trim_end());
-    }
+    // _shared.md is NOT folded in: it lives in agent_tooling (kind shared) and
+    // the engine appends it at run time, exactly like V2 did
+    let promptbody = body.trim_end().to_string();
     json!({
         "name": name,
         "desc": fm.get("description").cloned().unwrap_or_default(),
@@ -290,11 +294,15 @@ pub async fn run(store: &dyn Storage, opts: &Options) -> Result<Report, String> 
         }
     }
 
+    let in_scope = |k: &str| opts.scope.is_empty() || opts.scope.iter().any(|x| x == k);
+
     // workitems
-    let bodies: Vec<String> = {
+    let bodies: Vec<String> = if in_scope("items") {
         let mut st = conn.prepare("SELECT body FROM workitems ORDER BY seq, rowid").map_err(|e| e.to_string())?;
         let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
         rows.flatten().collect()
+    } else {
+        Vec::new()
     };
     for b in &bodies {
         let v2: Value = match serde_json::from_str(b) {
@@ -333,9 +341,57 @@ pub async fn run(store: &dyn Storage, opts: &Options) -> Result<Report, String> 
         rep.items_written += 1;
     }
 
-    // agents: every non-underscore .md; _shared.md appended to each promptbody
-    if !opts.agents_dir.is_empty() {
-        let shared = std::fs::read_to_string(format!("{}/_shared.md", opts.agents_dir.trim_end_matches('/'))).unwrap_or_default();
+    // agent tooling: _shared.md (shared), _capability/*.md (capability),
+    // ../source/*.md (source), ../prepostwork/*.md minus the enforced git set
+    // (prepost), _critic.md (critic)
+    if !opts.agents_dir.is_empty() && in_scope("tooling") {
+        let adir = std::path::Path::new(opts.agents_dir.trim_end_matches('/'));
+        let iter_dir = adir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| adir.to_path_buf());
+        let mut rows: Vec<Value> = Vec::new();
+        let first_heading = |t: &str| -> String {
+            t.lines().find(|l| l.starts_with('#')).map(|l| l.trim_start_matches('#').trim().to_string()).unwrap_or_default()
+        };
+        if let Ok(t) = std::fs::read_to_string(adir.join("_shared.md")) {
+            rows.push(json!({"name": "_shared", "kind": "shared", "desc": "appended to every agent prompt", "body": t.trim_end()}));
+        }
+        if let Ok(t) = std::fs::read_to_string(adir.join("_critic.md")) {
+            let (fm, body) = parse_agent_md(&t);
+            rows.push(json!({"name": "_critic", "kind": "critic", "desc": fm.get("description").cloned().unwrap_or_default(),
+                "body": body.trim_end(), "model": fm.get("model").cloned().unwrap_or_default(),
+                "flags": fm.get("model_flags").cloned().unwrap_or_default(),
+                "timeoutsec": fm.get("max_work_timeout_sec").and_then(|v| v.parse::<u64>().ok())}));
+        }
+        let mut read_dir_md = |dir: std::path::PathBuf, kind: &str, skip: &[&str]| {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let mut es: Vec<_> = rd.flatten().collect();
+                es.sort_by_key(|e| e.file_name());
+                for e in es {
+                    let fname = e.file_name().to_string_lossy().to_string();
+                    let Some(stem) = fname.strip_suffix(".md") else { continue };
+                    if skip.contains(&stem) { continue; }
+                    let t = std::fs::read_to_string(e.path()).unwrap_or_default();
+                    rows.push(json!({"name": stem, "kind": kind, "desc": first_heading(&t), "body": t.trim_end()}));
+                }
+            }
+        };
+        read_dir_md(adir.join("_capability"), "capability", &[]);
+        read_dir_md(iter_dir.join("source"), "source", &[]);
+        read_dir_md(iter_dir.join("prepostwork"), "prepost", &["git-commit", "git-push", "git-pull", "git-pr"]);
+        for row in rows {
+            let name = s(&row, "name");
+            if !opts.overwrite && exists(store, "agent_tooling", &name, "-").await.map_err(|e| e.to_string())? {
+                rep.tooling_skipped += 1;
+                continue;
+            }
+            if !opts.dry_run {
+                store.put("agent_tooling", &name, "-", &row).await.map_err(|e| e.to_string())?;
+            }
+            rep.tooling_written += 1;
+        }
+    }
+
+    // agents: every non-underscore .md
+    if !opts.agents_dir.is_empty() && in_scope("agents") {
         let mut entries: Vec<_> = std::fs::read_dir(&opts.agents_dir)
             .map_err(|e| format!("agents dir {}: {e}", opts.agents_dir))?
             .flatten()
@@ -353,7 +409,7 @@ pub async fn run(store: &dyn Storage, opts: &Options) -> Result<Report, String> 
             }
             let text = std::fs::read_to_string(e.path()).unwrap_or_default();
             let (fm, body) = parse_agent_md(&text);
-            let row = agent_row(name, &fm, &body, &shared);
+            let row = agent_row(name, &fm, &body);
             if !opts.dry_run {
                 store.put("agent", name, "-", &row).await.map_err(|e| e.to_string())?;
             }
@@ -374,13 +430,14 @@ pub async fn run(store: &dyn Storage, opts: &Options) -> Result<Report, String> 
         }
     }
     let project_exists = exists(store, "project", &opts.project, "-").await.map_err(|e| e.to_string())?;
-    if opts.overwrite || !project_exists {
+    if in_scope("project") && (opts.overwrite || !project_exists) {
         let row = json!({
             "name": opts.project, "desc": desc, "state": "Stopped", "gitrepo": "",
             "maxagents": {">95%": 0, ">90%": 1, "else": 1},
             "maxdailycost": null, "agents": {},
             "failure": {"maxattempts": 1, "first_retry_second": 300, "retry_backoff_exponent": 2},
-            "engines": [opts.engine_name], "accounts": []
+            "engines": [opts.engine_name], "accounts": [],
+            "mainfile": "{topdir}/main.iter.md", "default_context": ["{marker}", "{ancestor_markers}"]
         });
         if !opts.dry_run {
             store.put("project", &opts.project, "-", &row).await.map_err(|e| e.to_string())?;
@@ -388,7 +445,7 @@ pub async fn run(store: &dyn Storage, opts: &Options) -> Result<Report, String> 
         rep.project_written = true;
     }
     // engine record: create, or merge this project's dirs into the existing one
-    {
+    if in_scope("engine") {
         let host = std::process::Command::new("hostname").output().ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         let mut row = store.get("engine", &opts.engine_name, "-").await.map_err(|e| e.to_string())?.unwrap_or(json!({
@@ -407,7 +464,7 @@ pub async fn run(store: &dyn Storage, opts: &Options) -> Result<Report, String> 
     }
 
     // operator user from ITER_USERNAME / ITER_PASSWORD (admin on this project)
-    if let (Ok(u), Ok(p)) = (std::env::var("ITER_USERNAME"), std::env::var("ITER_PASSWORD")) {
+    if let (true, Ok(u), Ok(p)) = (in_scope("user"), std::env::var("ITER_USERNAME"), std::env::var("ITER_PASSWORD")) {
         let (u, p) = (u.trim().to_string(), p.trim().to_string());
         if !u.is_empty() && !p.is_empty() {
             let mut row = store.get("webui_user", &u, "-").await.map_err(|e| e.to_string())?.unwrap_or(json!({
@@ -427,7 +484,7 @@ pub async fn run(store: &dyn Storage, opts: &Options) -> Result<Report, String> 
         for t in ["workitem", "workitem_detail"] {
             store.bump_seq(&opts.project, t).await.map_err(|e| e.to_string())?;
         }
-        for t in ["agent", "project", "engine", "webui_user"] {
+        for t in ["agent", "agent_tooling", "project", "engine", "webui_user"] {
             store.bump_seq(crate::api::GLOBAL, t).await.map_err(|e| e.to_string())?;
         }
     }
@@ -488,9 +545,9 @@ mod tests {
         let (fm, body) = parse_agent_md("---\ndescription: The coder\nmax_agent_count: 5\nmodel: opus\nmodel_flags: --x\n---\n\n# Agent\nbody");
         assert_eq!(fm["description"], "The coder");
         assert!(body.starts_with("# Agent"));
-        let row = agent_row("code", &fm, &body, "shared rules");
+        let row = agent_row("code", &fm, &body);
         assert_eq!(row["max"], 5);
         assert_eq!(row["flags"], "--x");
-        assert!(row["promptbody"].as_str().unwrap().ends_with("shared rules"));
+        assert!(row["promptbody"].as_str().unwrap().ends_with("body"));
     }
 }

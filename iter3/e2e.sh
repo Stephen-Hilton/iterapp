@@ -410,11 +410,19 @@ curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.state="Running"' \
 # text, so the gate's state machine runs end to end without spending tokens.
 FAKEBIN="$SCRATCH/fakebin"; mkdir -p "$FAKEBIN"
 export GATE_LOG="$SCRATCH/gate_log.txt"; : > "$GATE_LOG"
+export GATE_PROMPTS="$SCRATCH/prompts"; mkdir -p "$GATE_PROMPTS"
 cat > "$FAKEBIN/claude" <<'FAKE'
 #!/usr/bin/env bash
 # fake claude for e2e: -p <prompt> ... ; prints a Claude Code json result object
 prompt=""; while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift;; esac; shift; done
-name=$(grep -o -m1 'Workitem: gate-[a-z]*' <<<"$prompt" | sed 's/Workitem: //')
+name=$(grep -o -m1 -E '(Title|Workitem): gate-[a-z]*' <<<"$prompt" | sed -E 's/.*: //')
+if ! grep -q "# Step: mainwork" <<<"$prompt" && ! grep -q "iter close-gate verifier" <<<"$prompt"; then
+  # prework / selfcheck turns of the same session: record, acknowledge, move on
+  [ -n "$name" ] && [ -n "${ITER_WORKID:-}" ] && echo "$name" > "$GATE_PROMPTS/.name-$ITER_WORKID"
+  [ -z "$name" ] && [ -n "${ITER_WORKID:-}" ] && [ -f "$GATE_PROMPTS/.name-$ITER_WORKID" ] && name=$(cat "$GATE_PROMPTS/.name-$ITER_WORKID")
+  printf '%s\n' "$prompt" > "$GATE_PROMPTS/$(date +%s%N)-$name.txt" 2>/dev/null || true
+  printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"fake-sid","result":"all done"}\n'; exit 0
+fi
 emit() { printf '{"type":"result","subtype":"%s","is_error":false,"num_turns":3,"result":%s}\n' "$1" "$(jq -Rn --arg t "$2" '$t')"; }
 if grep -q "iter close-gate verifier" <<<"$prompt"; then
   echo "verifier $name" >> "$GATE_LOG"
@@ -422,8 +430,24 @@ if grep -q "iter close-gate verifier" <<<"$prompt"; then
   else emit success '{"verdict":"incomplete","open":["file the ten build items"],"reason":"the message says it is waiting on a review"}'; fi
   exit 0
 fi
+[ -n "$name" ] && [ -n "${ITER_WORKID:-}" ] && echo "$name" > "$GATE_PROMPTS/.name-$ITER_WORKID"
+[ -z "$name" ] && [ -n "${ITER_WORKID:-}" ] && [ -f "$GATE_PROMPTS/.name-$ITER_WORKID" ] && name=$(cat "$GATE_PROMPTS/.name-$ITER_WORKID")
 echo "worker $name" >> "$GATE_LOG"
+printf '%s\n' "$prompt" > "$GATE_PROMPTS/$(date +%s%N)-$name.txt" 2>/dev/null || true
 case "$name" in
+  gate-cli)
+    # an agent using the iter CLI from inside its run
+    "$ITER_BIN" capability > "$GATE_PROMPTS/capability-index.txt" 2>&1
+    "$ITER_BIN" capability _ask_the_human > "$GATE_PROMPTS/capability-doc.txt" 2>&1
+    "$ITER_BIN" add --type code --title "cli child" --mainwork "child work" --codepath "$ITER_TOPDIR/src" --depends-on "${GATE_DEP: -12}" --context "{topdir}/README.md" > "$GATE_PROMPTS/add.txt" 2>&1
+    "$ITER_BIN" add --type code --title "self dep" --mainwork "x" --depends-on "$ITER_WORKID" > "$GATE_PROMPTS/add-self.txt" 2>&1 || true
+    "$ITER_BIN" doc "note from the agent" > "$GATE_PROMPTS/doc.txt" 2>&1
+    "$ITER_BIN" status > "$GATE_PROMPTS/status.txt" 2>&1
+    "$ITER_BIN" ask --question "Which color?" > "$GATE_PROMPTS/ask.txt" 2>&1
+    emit success "asked; ending turn" ;;
+  gate-reject)
+    "$ITER_BIN" reject --reason "premise no longer holds" > "$GATE_PROMPTS/reject.txt" 2>&1
+    emit success "rejected" ;;
   gate-turncap)
     if grep -q "Close-gate feedback" <<<"$prompt"; then emit success "DONE-MARKER: finished after the cut-off"
     else emit error_max_turns "partial work, ran out of turns"; fi ;;
@@ -435,6 +459,19 @@ esac
 FAKE
 chmod +x "$FAKEBIN/claude"
 
+# agent tooling (central copies of V2's .iter text) + a project head with global context files
+curl -sf "${AUTH[@]}" -X PUT "$BASE/api/tooling/_shared" -d '{"kind":"shared","desc":"all agents","body":"SHARED-RULES-MARKER {critreview_max_rounds}"}' >/dev/null || fail "tooling put"
+curl -sf "${AUTH[@]}" -X PUT "$BASE/api/tooling/_ask_the_human" -d '{"kind":"capability","desc":"ask the human a question","body":"ASK-DOC-BODY"}' >/dev/null || fail "tooling put"
+curl -sf "${AUTH[@]}" -X PUT "$BASE/api/tooling/user" -d '{"kind":"source","desc":"","body":"SOURCE-USER-MARKER"}' >/dev/null || fail "tooling put"
+curl -sf "${AUTH[@]}" -X PUT "$BASE/api/tooling/premise-check" -d '{"kind":"prepost","desc":"","body":"PREMISE-STEP-MARKER"}' >/dev/null || fail "tooling put"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $ENGINE_TOKEN" -H content-type:application/json -X PUT "$BASE/api/tooling/rogue" -d '{"kind":"shared","body":"x"}')
+[ "$CODE" = 403 ] || fail "engine role could write tooling (HTTP $CODE)"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/tooling" | jq 'length')" = 4 ] || fail "tooling list"
+pass "agent tooling rows: admin writes, engine role read-only"
+mkdir -p "$SAMPLE/reqs" "$SAMPLE/src"
+printf -- '---\nprojectname: "SampleV3"\nglobalcontextfiles: ["{topdir}/reqs/*.md"]\n---\nhead\n' > "$SAMPLE/main.iter.md"
+echo "req" > "$SAMPLE/reqs/techreq.md"; echo "marker" > "$SAMPLE/src/src.code.iter.md"; echo "top" > "$SAMPLE/top.code.iter.md"
+
 curl -sf "${AUTH[@]}" -X PUT "$BASE/api/agents/gatetest" \
   -d '{"desc":"close-gate test agent","max":3,"timeoutsec":60,"model":"","promptbody":"You are the gate test agent.","closegate":{"verify":"haiku","max_bounces":1}}' >/dev/null || fail "gatetest agent put"
 curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.agents.gatetest={"max":3}' \
@@ -444,10 +481,15 @@ mk_gate_item() {
     -d "{\"name\":\"$1\",\"agent\":\"gatetest\",\"priority\":2}" | jq -r .id
 }
 GR=$(mk_gate_item gate-recovers); GS=$(mk_gate_item gate-stuck); GT=$(mk_gate_item gate-turncap)
-for W in "$GR" "$GS" "$GT"; do
+GC=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"gate-cli","agent":"gatetest","priority":1,"lockdirs":["{topdir}/src/"],"prework":["premise-check"],"requestedby":"user"}' | jq -r .id)
+GJ=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"gate-reject","agent":"gatetest","priority":1,"lockdirs":["{topdir}/reqs/"]}' | jq -r .id)
+for W in "$GR" "$GS" "$GT" "$GC" "$GJ"; do
   curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$W/details/0" \
     -d '{"key":"request","valuetype":"text","value":"write the plan AND file its build items as workitems"}' >/dev/null || fail "gate request detail"
 done
+export GATE_DEP="$GR"
 say "running engine with fake claude for the close gate"
 (cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" "$ENGINE_BIN" --config .iter/config.json --ticks 14 > "$SCRATCH/engine-gate.log" 2>&1) || true
 
@@ -471,6 +513,61 @@ pass "close gate: bounce budget exhausted -> question state with a gate widget"
 [ "$(st_of "$GT")" = complete ] || { cat "$SCRATCH/engine-gate.log"; fail "gate-turncap state=$(st_of "$GT") (expected complete)"; }
 [ "$(grep -c "verifier gate-turncap" "$GATE_LOG")" = 1 ] || fail "turn-cap run should skip the verifier (verifier calls=$(grep -c "verifier gate-turncap" "$GATE_LOG"), expected 1)"
 pass "close gate: error_max_turns held deterministically (no verifier spend), continuation completed"
+
+# ---- V2-parity prompt + agent CLI (2026-09-04) ----
+P1=$(ls "$GATE_PROMPTS"/*-gate-cli.txt | head -1)
+for m in "SHARED-RULES-MARKER 3" "# Capabilities" "_ask_the_human: ask the human a question" "# Project context" "reqs/techreq.md" "main.iter.md" "SOURCE-USER-MARKER" "# Work item" "Work item id: $GC" "# Context files" "src/src.code.iter.md" "top.code.iter.md" "# Step: prework:premise-check" "PREMISE-STEP-MARKER"; do
+  grep -qF -- "$m" "$P1" || { echo "--- first prompt:"; head -60 "$P1"; fail "spin-up prompt lacks: $m"; }
+done
+N=$(ls "$GATE_PROMPTS"/*-gate-cli.txt | wc -l | tr -d ' ')
+[ "$N" -ge 2 ] || fail "expected a multi-turn session for gate-cli (prework, mainwork, …), saw $N turn(s)"
+grep -q "# Step: mainwork" "$(ls "$GATE_PROMPTS"/*-gate-cli.txt | sed -n 2p)" || fail "second turn is not mainwork"
+pass "spin-up prompt: agent body + shared rules + capability index + project head + source + work item + context (marker chain) + prose prework as its own turn"
+grep -q "_ask_the_human: ask the human a question" "$GATE_PROMPTS/capability-index.txt" || fail "iter capability index"
+grep -q "ASK-DOC-BODY" "$GATE_PROMPTS/capability-doc.txt" || fail "iter capability <name>"
+grep -q "^added " "$GATE_PROMPTS/add.txt" || { cat "$GATE_PROMPTS/add.txt"; fail "iter add"; }
+CHILD=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems" | jq -r '.[]|select(.name=="cli child")|.id')
+[ -n "$CHILD" ] || fail "cli child not created"
+CJ=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$CHILD")
+[ "$(echo "$CJ" | jq -r .createdby)" = "$GC" ] || fail "child createdby"
+[ "$(echo "$CJ" | jq -r .requestedby)" = "agent:gatetest" ] || fail "child requestedby"
+[ "$(echo "$CJ" | jq -r '.blockedby[0]')" = "$GR" ] || fail "child blockedby (12-char suffix resolution)"
+grep -q "cannot depend on the item that creates it" "$GATE_PROMPTS/add-self.txt" || fail "self-dependency should be refused"
+[ "$(echo "$CJ" | jq -r '.lockdirs[0]')" = "{topdir}/src" ] || fail "child lockdir mapping: $(echo "$CJ" | jq -c .lockdirs)"
+[ "$(echo "$CJ" | jq -r '.context[0]')" = "{topdir}/README.md" ] || fail "child context"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$CHILD/details" | jq -r '.[0].value')" = "child work" ] || fail "child request row"
+grep -q "open work item" "$GATE_PROMPTS/status.txt" || fail "iter status"
+grep -q "appended" "$GATE_PROMPTS/doc.txt" || fail "iter doc"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC" | jq -r .state)" = question ] || fail "iter ask did not park the caller in question (got $(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC" | jq -r .state))"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC/details" | jq -e '[.[]|select(.key=="question" and .value.title=="Which color?")]|length==1' >/dev/null || fail "ask widget missing"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC/details" | jq -e '[.[]|select(.key=="response")]|length==1' >/dev/null || fail "response row not written for the asked item"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GJ" | jq -r .state)" = parked ] || fail "iter reject did not park the caller"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GJ" | jq -r .lasterror | grep -q "rejected: premise" || fail "reject reason not recorded"
+pass "agent CLI: capability index/doc, add (child of caller, deep dep, lockdir + context), doc, status, ask -> question kept at close, reject -> parked"
+# answered question flows back into the next run's mainwork
+QO=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC/details" | jq -r '[.[]|select(.key=="question")]|last|.order')
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC/details" | jq -c "[.[]|select(.key==\"question\")]|last|.value.fields[0].value=\"blue\"|{key:\"question\",valuetype:\"json\",value:.value}" \
+  | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$GC/details/$QO" -d @- >/dev/null || fail "answer widget"
+FRESH=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC")
+echo "$FRESH" | jq '.state="queued"|.name="gate-answered"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$GC?expect_version=$(echo "$FRESH" | jq -r .version)" -d @- >/dev/null
+(cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" "$ENGINE_BIN" --config .iter/config.json --ticks 4 > "$SCRATCH/engine-answered.log" 2>&1) || true
+PA=$(grep -l "# Step: mainwork" "$GATE_PROMPTS"/*-gate-answered.txt 2>/dev/null | head -1)
+[ -n "$PA" ] || { cat "$SCRATCH/engine-answered.log"; fail "no mainwork turn after the answer"; }
+grep -q "A question on this work item was answered" "$PA" && grep -q "Answer: blue" "$PA" || fail "answered question not surfaced in mainwork"
+pass "answered question surfaces at the top of the next mainwork turn"
+# agent delete (admin only) + engine self-register
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $ENGINE_TOKEN" -X DELETE "$BASE/api/agents/gatetest")
+[ "$CODE" = 403 ] || fail "engine role deleted an agent (HTTP $CODE)"
+curl -sf "${AUTH[@]}" -X PUT "$BASE/api/agents/throwaway" -d '{"desc":"x","promptbody":"y"}' >/dev/null
+curl -sf "${AUTH[@]}" -X DELETE "$BASE/api/agents/throwaway" | jq -e '.deleted==true' >/dev/null || fail "agent delete"
+pass "agent delete: admin only"
+cat > "$SAMPLE/.iter/config-new.json" <<EOF
+{"data_url":"$BASE","token_envar":"ITER_ENGINE_TOKEN","engine_name":"EngineNew","env_file":"$SAMPLE/.env"}
+EOF
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config-new.json --ticks 2 > "$SCRATCH/engine-selfreg.log" 2>&1) || true
+grep -q "registered 'EngineNew'" "$SCRATCH/engine-selfreg.log" || { cat "$SCRATCH/engine-selfreg.log"; fail "engine did not self-register"; }
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/engines/EngineNew" | jq -r .name)" = EngineNew ] || fail "self-registered engine record missing"
+pass "engine self-registers on first start"
 
 # connectivity test: webui POSTs /test, the engine nudges (fake claude) and reports back with usage
 curl -sf "${AUTH[@]}" -X POST "$BASE/api/engines/Engine01/test" -d '{}' >/dev/null || fail "engine test request"
