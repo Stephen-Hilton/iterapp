@@ -234,10 +234,21 @@ impl EngineRuntime {
         let wanted: Vec<WorkItem> = self
             .items
             .get(&project.name)
-            .map(|v| v.iter().filter(|i| !i.explain_requested.is_empty()).cloned().collect())
+            .map(|v| v.iter().filter(|i| !i.explain_requested.is_empty() && (i.explain_engine.is_empty() || i.explain_engine == self.name)).cloned().collect())
             .unwrap_or_default();
         for item in wanted {
             if self.explaining.iter().any(|(id, _)| id == &item.id) {
+                continue;
+            }
+            // one engine per ELI5: iter_data assigned one at random when the
+            // button was pressed; an unassigned one goes to whoever claims first
+            if let Err(e) = self.api.post(
+                &format!("/api/projects/{}/workitems/{}/explain/claim", project.name, item.id),
+                &json!({"engine": self.name}),
+            ) {
+                if e.status != 409 {
+                    eprintln!("[engine] ELI5 claim failed for {}: {e}", &item.id[..8.min(item.id.len())]);
+                }
                 continue;
             }
             let agent_def = self.agents.get("explain").cloned().unwrap_or(Value::Null);

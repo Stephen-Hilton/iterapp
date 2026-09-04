@@ -373,6 +373,11 @@ pub struct WorkItem {
     /// clears the flag. Allowed on closed items.
     #[serde(default)]
     pub explain_requested: String,
+    /// iter_data-owned: the one engine that runs this ELI5 — picked at random
+    /// among live engines serving the project when the button is pressed,
+    /// else claimed by the first engine to see the flag; cleared with it
+    #[serde(default)]
+    pub explain_engine: String,
 }
 fn default_queued() -> String { "queued".into() }
 fn default_priority() -> i64 { 5 }

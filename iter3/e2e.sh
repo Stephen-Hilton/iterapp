@@ -758,10 +758,24 @@ pass "close gate: human 'accept' closes the item complete without spending a run
 # ---- ELI5 / explain (2026-09-04): on a CLOSED item, at once, outside the cap ----
 curl -sf "${AUTH[@]}" -X PUT "$BASE/api/agents/explain" -d '{"model":"sonnet","max":1,"timeoutsec":300,"promptbody":"# Agent Definition: explain\n\nYou are the **explain** agent.\n"}' >/dev/null || fail "explain agent put"
 GRX=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR"); [ "$(echo "$GRX" | jq -r .state)" = complete ] || fail "gate-recovers is not closed"
+# Engine01 heartbeated seconds ago (previous run): age its record so no engine counts as live for this first request
+curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01" | jq '.last_seen="2000-01-01T00:00:00Z"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/engines/Engine01" -d @- >/dev/null
 R=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$GR/explain" -d '{}') || fail "explain request"
 [ -n "$(echo "$R" | jq -r .requested)" ] || fail "explain not stamped: $R"
 [ "$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$GR/explain" -d '{}' | jq -r .already)" = true ] || fail "second explain request should report already"
 [ -n "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR" | jq -r .explain_requested)" ] || fail "explain_requested not on the item"
+# no engine is heartbeating right now -> unassigned; a rival engine claims it, then Engine01 must be refused (409) and run nothing
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR" | jq -r .explain_engine)" = "" ] || fail "explain assigned with no live engine"
+curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$GR/explain/claim" -d '{"engine":"Rival"}' >/dev/null || fail "rival claim"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$GR/explain/claim" -d '{"engine":"Engine01"}')
+[ "$CODE" = 409 ] || fail "second engine's claim should be 409 (got $CODE)"
+(cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" "$ENGINE_BIN" --config .iter/config.json --ticks 2 > "$SCRATCH/engine-eli5-rival.log" 2>&1) || true
+grep -q "explained " "$SCRATCH/engine-eli5-rival.log" && fail "Engine01 ran an ELI5 assigned to another engine"
+# release it (rival never ran): clear + re-request; with Engine01 heartbeating from the last run it is the one live engine -> assigned to it
+curl -sf "${AUTH[@]}" -X DELETE "$BASE/api/projects/$PROJECT/workitems/$GR/explain" >/dev/null
+curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01" | jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_seen=$ts|.state="Running"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/engines/Engine01" -d @- >/dev/null
+R=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$GR/explain" -d '{}')
+[ "$(echo "$R" | jq -r .engine)" = Engine01 ] || fail "explain not assigned to the live engine: $R"
 # the project is Stopped-or-Running either way; cap 0 must not matter: set maxagents else=0 for this run
 curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.maxagents={"else":0}' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
 (cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" "$ENGINE_BIN" --config .iter/config.json --ticks 3 > "$SCRATCH/engine-eli5.log" 2>&1) || true
@@ -770,7 +784,7 @@ grep -q "ELI5 requested .* explaining now, outside the cap" "$SCRATCH/engine-eli
 grep -q "explained .* 'gate-recovers'" "$SCRATCH/engine-eli5.log" || { cat "$SCRATCH/engine-eli5.log"; fail "engine did not report the explanation"; }
 EX=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR/details" | jq -r '[.[]|select(.key=="explained")]|last|.value')
 grep -q "EXPLAINED-MARKER" <<<"$EX" || fail "no 'explained' detail row on the closed item: $(keys_of "$GR")"
-[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR" | jq -r .explain_requested)" = "" ] || fail "explain_requested not cleared"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR" | jq -r '.explain_requested+.explain_engine')" = "" ] || fail "explain_requested/explain_engine not cleared"
 [ "$(st_of "$GR")" = complete ] || fail "explain changed the item's state"
 grep -q -- "--allowedTools Read,Glob,Grep --disallowedTools Bash,Edit,Write" "$GATE_LOG" || { grep -A3 "explain tools" "$GATE_LOG" | tail -5; fail "explain session was not read-only"; }
 for m in "# Explain this work item simply (ELI5)" "READ-ONLY" "Title: gate-recovers" "### request" "### response" "main.iter.md" "reqs/techreq.md"; do
@@ -778,7 +792,7 @@ for m in "# Explain this work item simply (ELI5)" "READ-ONLY" "Title: gate-recov
 done
 grep -q "### spend" "$GATE_PROMPTS/eli5-prompt.txt" && fail "ELI5 prompt should not carry spend rows"
 [ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR/details" | jq '[.[]|select(.key=="spend" and .value.agent=="explain")]|length')" = 1 ] || fail "explain spend row missing"
-pass "ELI5: button flag -> engine explains a closed item at once with cap 0 (read-only tools), 'Explained Simply' row appended, flag cleared, spend recorded"
+pass "ELI5: one engine only (random live engine at request, claim 409s a rival) -> explains a closed item at once with cap 0 (read-only tools), 'Explained Simply' row appended, flags cleared, spend recorded"
 
 # webui served
 [ "$(curl -sf "$BASE/" | grep -c "ITER")" -ge 1 ] || fail "webui not served"

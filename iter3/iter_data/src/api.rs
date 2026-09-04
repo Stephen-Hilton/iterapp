@@ -2,6 +2,7 @@
 //! webui, engine, and the future MCP layer all call these same rules.
 //! Every write bumps the iter3_versions seq for its (project, table).
 
+use rand::seq::SliceRandom;
 use crate::auth::{self, Claims};
 use crate::storage::{Storage, StorageError, body_str, body_u64};
 use axum::extract::{FromRequestParts, Path, Query, State};
@@ -158,6 +159,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects/{name}/workitems/{id}/approve", post(workitem_approve))
         .route("/api/projects/{name}/workitems/{id}/reopen", post(workitem_reopen))
         .route("/api/projects/{name}/workitems/{id}/explain", post(workitem_explain).delete(workitem_explained))
+        .route("/api/projects/{name}/workitems/{id}/explain/claim", post(workitem_explain_claim))
         // locks
         .route("/api/projects/{name}/locks", get(locks_list))
         .route("/api/projects/{name}/locks/acquire", post(lock_acquire))
@@ -949,11 +951,75 @@ async fn workitem_explain(
     }
     let ts = now_utc();
     let expect = body_u64(&item, "version");
+    // one engine only (decided 2026-09-04): pick at random among the LIVE
+    // engines serving this project so a second engine never duplicates the
+    // run; none live = leave it open for the first engine to claim
+    let engine = live_engines_for(&st, &name).await?.choose(&mut rand::thread_rng()).cloned().unwrap_or_default();
     item["explain_requested"] = json!(ts);
+    item["explain_engine"] = json!(engine);
     item["version"] = json!(expect + 1);
     st.store.put_versioned("workitem", &name, &id, &item, expect).await?;
     st.store.bump_seq(&name, "workitem").await?;
-    Ok(Json(json!({"requested": ts})))
+    Ok(Json(json!({"requested": ts, "engine": engine})))
+}
+
+/// Engines whose record names this project and that have heartbeated within
+/// three ticks (the webui's own liveness rule).
+async fn live_engines_for(st: &Arc<AppState>, project: &str) -> Result<Vec<String>, ApiError> {
+    let now = chrono::Utc::now();
+    Ok(st
+        .store
+        .scan("engine")
+        .await?
+        .iter()
+        .filter(|e| e.get("projects").and_then(|p| p.get(project)).is_some())
+        .filter(|e| body_str(e, "state") == "Running")
+        .filter(|e| {
+            let tick = e.get("ticksec").and_then(|t| t.as_i64()).unwrap_or(5).max(1);
+            chrono::DateTime::parse_from_rfc3339(&body_str(e, "last_seen"))
+                .map(|seen| (now - seen.with_timezone(&chrono::Utc)).num_seconds() <= 3 * tick + 5)
+                .unwrap_or(false)
+        })
+        .map(|e| body_str(e, "name"))
+        .filter(|n| !n.is_empty())
+        .collect())
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ExplainClaimReq {
+    #[serde(default)]
+    engine: String,
+}
+
+/// engine -> iter_data: "I will run this ELI5". Succeeds when the item is
+/// assigned to this engine or to nobody (then it becomes this engine's);
+/// 409 when another engine holds it, so at most one engine ever runs it.
+async fn workitem_explain_claim(
+    user: AuthUser,
+    State(st): Ctx,
+    Path((name, id)): Path<(String, String)>,
+    Json(req): Json<ExplainClaimReq>,
+) -> Result<Json<Value>, ApiError> {
+    user.require_writer()?;
+    if req.engine.trim().is_empty() {
+        return Err(bad("engine is required"));
+    }
+    let mut item = st.store.get("workitem", &name, &id).await?.ok_or_else(notfound)?;
+    if body_str(&item, "explain_requested").is_empty() {
+        return Err(bad("no ELI5 is pending on this workitem"));
+    }
+    let holder = body_str(&item, "explain_engine");
+    if !holder.is_empty() && holder != req.engine {
+        return Err(ApiError::Status(StatusCode::CONFLICT, format!("ELI5 on this workitem is assigned to engine '{holder}'")));
+    }
+    if holder.is_empty() {
+        let expect = body_u64(&item, "version");
+        item["explain_engine"] = json!(req.engine);
+        item["version"] = json!(expect + 1);
+        st.store.put_versioned("workitem", &name, &id, &item, expect).await?;
+        st.store.bump_seq(&name, "workitem").await?;
+    }
+    Ok(Json(json!({"engine": req.engine})))
 }
 
 /// engine -> iter_data: the explanation landed (or could not be produced);
@@ -970,6 +1036,7 @@ async fn workitem_explained(
     }
     let expect = body_u64(&item, "version");
     item["explain_requested"] = json!("");
+    item["explain_engine"] = json!("");
     item["version"] = json!(expect + 1);
     st.store.put_versioned("workitem", &name, &id, &item, expect).await?;
     st.store.bump_seq(&name, "workitem").await?;

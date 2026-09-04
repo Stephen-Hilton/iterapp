@@ -151,7 +151,7 @@ fn run_all(
         if item.exec_shell.trim().is_empty() {
             return Err("exec item has empty exec_shell".into());
         }
-        RunOut::plain(run_shell(topdir, &item.exec_shell, agent_timeout(project, item))?)
+        RunOut::plain(run_shell(topdir, &item.exec_shell, agent_timeout(project, item, &Value::Null))?)
     } else {
         run_claude(api, project, topdir, item, account, details)?
     };
@@ -175,12 +175,16 @@ fn sanitize(s: &str) -> String {
     s.replace('\'', "").chars().take(120).collect()
 }
 
-fn agent_timeout(project: &Project, item: &WorkItem) -> u64 {
+/// Session timeout: the project's per-agent override, else the agent record's
+/// `timeoutsec` (the Settings field), else 3600.
+fn agent_timeout(project: &Project, item: &WorkItem, agent_def: &Value) -> u64 {
     project
         .agents
         .get(&item.agent)
         .and_then(|o| o.get("timeoutsec"))
         .and_then(|t| t.as_u64())
+        .or_else(|| agent_def.get("timeoutsec").and_then(|t| t.as_u64()))
+        .filter(|t| *t > 0)
         .unwrap_or(3600)
 }
 
@@ -239,7 +243,7 @@ fn run_claude(
     };
     let flags = overrides.get("flags").and_then(|f| f.as_str())
         .or_else(|| agent_def.get("flags").and_then(|f| f.as_str())).unwrap_or("").to_string();
-    let timeout = agent_timeout(project, item);
+    let timeout = agent_timeout(project, item, &agent_def);
 
     // central tooling: shared rules, capability index, source instructions, prose steps
     let tooling_rows = api.get("/api/tooling").ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
