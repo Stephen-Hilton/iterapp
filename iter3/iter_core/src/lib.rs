@@ -23,6 +23,7 @@ pub const TABLES: &[&str] = &[
     "lock",
     "project_structure",
     "agent_tooling",
+    "spend",
 ];
 
 /// Workitem states (glossary in iter.v3.md).
@@ -246,6 +247,23 @@ pub struct Engine {
     /// engine-owned: outcome of the last connectivity test
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_result: Option<serde_json::Value>,
+    /// idle usage probe: when the active account's snapshot is older than this
+    /// many minutes and nothing is running, nudge haiku once (0 = off)
+    #[serde(default = "default_probe_stale_min")]
+    pub probe_stale_min: u64,
+}
+fn default_probe_stale_min() -> u64 { 20 }
+
+/// Failure backoff (V2 retry_backoff_sec, now per project): seconds to wait
+/// before attempt `attempt + 1` = first_retry_second * exponent^(attempt-1).
+pub fn retry_delay_sec(policy: &FailurePolicy, attempt: u32) -> u64 {
+    let base = policy.first_retry_second.max(1);
+    let exp = policy.retry_backoff_exponent.max(1) as u64;
+    let mut d = base;
+    for _ in 1..attempt.max(1) {
+        d = d.saturating_mul(exp).min(24 * 3600);
+    }
+    d
 }
 fn default_stopped() -> String { "Stopped".into() }
 fn default_ticksec() -> u64 { 5 }
@@ -342,6 +360,13 @@ pub struct WorkItem {
     /// per-item model override (opus | sonnet | haiku | fable); "" = agent default
     #[serde(default)]
     pub model: String,
+    /// webui-owned: halt this item mid-run (workitem_stop.md); the engine kills
+    /// the session, parks the item with a note, and clears the flag
+    #[serde(default)]
+    pub stop_requested: bool,
+    /// engine-owned: not before this ISO ts (failure backoff); cleared on claim
+    #[serde(default)]
+    pub retry_after: String,
 }
 fn default_queued() -> String { "queued".into() }
 fn default_priority() -> i64 { 5 }
@@ -583,6 +608,14 @@ mod tests {
         assert_eq!(dependency_status(&failed[3], &by2, &kids2), DepStatus::Failed("child".into()));
         let ghost = wi("g", "queued", "", &["nope"]);
         assert_eq!(dependency_status(&ghost, &by_id, &kids), DepStatus::Satisfied);
+    }
+
+    #[test]
+    fn retry_backoff_grows() {
+        let p = FailurePolicy { maxattempts: 5, first_retry_second: 10, retry_backoff_exponent: 2 };
+        assert_eq!(retry_delay_sec(&p, 1), 10);
+        assert_eq!(retry_delay_sec(&p, 2), 20);
+        assert_eq!(retry_delay_sec(&p, 4), 80);
     }
 
     #[test]

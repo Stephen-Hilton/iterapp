@@ -424,11 +424,14 @@ async function renderProjectCtl(){
   if(proj.state==="Draining"){ // transitional: settle to Stopped as soon as nothing runs
     try{const r=await api(pp+"/settle",{method:"POST",body:"{}"});if(r.settled)proj=await api(pp);}catch(e){}
   }
-  const status=await api(pp+"/status").catch(()=>null);
+  const [status,spend]=await Promise.all([api(pp+"/status").catch(()=>null),api(pp+"/spend").catch(()=>[])]);
+  const today=new Date().toISOString().slice(0,10);
+  const todaySpend=(spend.find(r=>r.date===today)||{}).usd||0;
+  const capTxt=proj.maxdailycost==null?"":(proj.maxdailycost===0?" · <span style='color:var(--bad)'>budget $0 (spend nothing)</span>":` / $${Number(proj.maxdailycost).toFixed(2)} cap`);
   const live=status?status.engines.filter(e=>!e.stale).length:0;
   const total=status?status.engines.length:0;
   const running=status?(status.inprogress||0):0;
-  let note=`${live}/${total} engines online · ${running} running`;
+  let note=`${live}/${total} engines online · ${running} running · today $${todaySpend.toFixed(2)}${capTxt}`;
   if(status&&status.not_honoring&&status.not_honoring.length)note+=` · <span style="color:var(--bad)">not honoring: ${esc(status.not_honoring.join(", "))}</span>`;
   const st=proj.state;
   const seg=st==="Draining"
@@ -548,7 +551,7 @@ function comparator(mode,byId){
 /* depth = how far down the dependency/creation tree this item sits; 22px per level,
    no cap — a deep chain is supposed to look deep */
 function tileHtml(i,depth){
-  const att=(i.attempt>0?` <span class="att">(A${esc(i.attempt)})</span>`:"")+(i.run_now&&i.state==="queued"?` <span class="att" title="run-now override requested">▶ run now</span>`:"");
+  const att=(i.attempt>0?` <span class="att">(A${esc(i.attempt)})</span>`:"")+(i.run_now&&i.state==="queued"?` <span class="att" title="run-now override requested">▶ run now</span>`:"")+(i.stop_requested&&i.state==="in-progress"?` <span class="att" style="color:var(--bad)">■ stopping</span>`:"");
   return `
   <div class="tile" data-depth="${depth}" style="--d:${depth};margin-left:${depth*22}px" data-id="${esc(i.id)}">
     <div class="left">
@@ -638,7 +641,9 @@ function menuItems(i){
       b("delete","Delete from archive…","danger");
   }
   if(s==="in-progress"){
-    return b("clone","Clone")+`<div class="sep"></div>`+note("Agent is running. V3 has no mid-run stop yet; the engine will close it when the turn ends.");
+    return b("clone","Clone")+`<div class="sep"></div>`+
+      (i.stop_requested?note("Stop requested — the engine kills the session on its next tick and parks the item."):b("stopitem","Stop (halt mid-run)…","danger"))+
+      note("Agent is running. Stop kills its session and parks the item for review; changes it already committed stay in git.");
   }
   if(s==="scheduled"){
     return b("runnow","Run now")+b("pause","Pause schedule")+b("pauseedit","Pause &amp; edit")+
@@ -737,6 +742,9 @@ async function doAction(act,i){
       const req=await requestText(i.id);
       return openForm("followup",{...cloneBody(i,{name:"Follow-up: "+i.name,blockedby:[i.id],tags:[]}),
         _request:`Follow-up to workitem ${i.id} ("${i.name}").\n\nOriginal request:\n${req}\n\n---\nWhat to do now:\n`});}
+    case "stopitem":
+      if(!confirm(`Stop "${i.name.slice(0,60)}" mid-run?\nThe engine kills the agent session on its next tick and parks the item with a note. Work already committed stays in git (git log to review, git revert to undo).`))return;
+      await setState(i,"in-progress",f=>{f.stop_requested=true;});break;
     case "delete":
       if(!confirm(`Delete "${i.name.slice(0,60)}" (${i.id.slice(-8)})? This cannot be undone.`))return;
       await api(P(i.id),{method:"DELETE"});break;
@@ -805,7 +813,8 @@ const isAdmin=()=>myRole==="admin";
 
 /* field spec -> row html; values come from the record, JSON fields are pretty-printed */
 function fieldRow(f,rec){
-  const v=rec?rec[f.key]:undefined;
+  let v=rec?rec[f.key]:undefined;
+  if((v===undefined||v===null)&&f.default!==undefined)v=f.default; // records that predate a field
   const id=`sf-${f.key}`;
   let ctl="";
   if(f.type==="readonly")ctl=`<div class="ro">${esc(v==null||v===""?"—":(typeof v==="object"?JSON.stringify(v):v))}</div>`;
@@ -870,6 +879,7 @@ const ENGINE_FIELDS=[
   {key:"name",type:"readonly"},{key:"state",type:"readonly",help:"engine-reported (actual)"},{key:"last_seen",type:"readonly"},{key:"account",type:"readonly"},
   {key:"usage",type:"readonly",help:"active account's 5h / 7d usage, refreshed by every claude session and the test button"},{key:"test_result",type:"readonly"},
   {key:"host",type:"text"},{key:"ticksec",label:"tick (sec)",type:"number"},{key:"full_refresh_minutes",label:"full refresh (min)",type:"number",help:"unconditional reload cadence — the seq fallback"},
+  {key:"probe_stale_min",label:"usage probe (min)",type:"number",default:20,help:"when idle and the account's usage snapshot is older than this, nudge haiku once to refresh it; 0 = off"},
   {key:"queuelock",type:"json",rows:3},
   {key:"projects",label:"projects served",type:"json",rows:6,help:'machine-specific dirs per project: {"pdy-dev":{"dirs":{"topdir":"~/dev/pdy-dev/"}}} — remove a project here to stop this engine serving it'},
 ];

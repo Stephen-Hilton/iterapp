@@ -17,11 +17,23 @@ pub struct RunOut {
     pub text: String,
     pub subtype: String,
     pub num_turns: u64,
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Stop requests the engine tick has seen for items this engine is running;
+/// the wait loop kills the session the moment its workid appears.
+pub static STOP_REQUESTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+pub const STOPPED_BY_USER: &str = "STOPPED by user mid-run";
+thread_local! {
+    /// the workid the current worker thread is running (for the wait loop)
+    static CURRENT_WORKID: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 impl RunOut {
     fn plain(text: String) -> Self {
-        Self { text, subtype: "success".into(), num_turns: 0 }
+        Self { text, subtype: "success".into(), num_turns: 0, cost_usd: 0.0, input_tokens: 0, output_tokens: 0 }
     }
 }
 
@@ -36,6 +48,7 @@ struct GateCtx {
 }
 
 pub fn execute(api: &Api, engine_name: &str, project: &Project, topdir: &str, item: WorkItem, account: &str) {
+    CURRENT_WORKID.with(|w| *w.borrow_mut() = item.id.clone());
     let details = fetch_details(api, project, &item);
 
     // a human answered the close-gate widget "accept": close without running
@@ -341,11 +354,16 @@ fn run_claude(
         session.cwd = topdir.to_string();
     }
     let mut last = RunOut::default();
+    let (mut usd, mut tin, mut tout, mut nturns) = (0.0f64, 0u64, 0u64, 0u64);
     let total = turns.len();
     for (n, (label, prompt)) in turns.into_iter().enumerate() {
         let text = if n == 0 { format!("{spin}\n\n# Step: {label}\n{prompt}") } else { format!("# Step: {label}\n{prompt}") };
         println!("[engine] {} turn {}/{} {label}", short(&item.id), n + 1, total);
         let out = session.turn(project, &text)?;
+        usd += out.cost_usd;
+        tin += out.input_tokens;
+        tout += out.output_tokens;
+        nturns += out.num_turns.max(1);
         // a cut-off turn ends the run: the gate sees the subtype and holds the item
         let cut = out.subtype != "success";
         if label == "mainwork" || cut {
@@ -355,6 +373,10 @@ fn run_claude(
             break;
         }
     }
+    last.cost_usd = usd;
+    last.input_tokens = tin;
+    last.output_tokens = tout;
+    last.num_turns = nturns;
     Ok(last)
 }
 
@@ -563,6 +585,9 @@ fn parse_claude_json(raw: &str) -> RunOut {
                 text,
                 subtype: v.get("subtype").and_then(|s| s.as_str()).unwrap_or("success").to_string(),
                 num_turns: v.get("num_turns").and_then(|n| n.as_u64()).unwrap_or(0),
+                cost_usd: v.get("total_cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0),
+                input_tokens: v.get("usage").and_then(|u| u.get("input_tokens")).and_then(|n| n.as_u64()).unwrap_or(0),
+                output_tokens: v.get("usage").and_then(|u| u.get("output_tokens")).and_then(|n| n.as_u64()).unwrap_or(0),
             };
         }
     }
@@ -588,9 +613,25 @@ fn git_head(topdir: &str) -> String {
 }
 
 fn wait_with_timeout(mut cmd: Command, timeout_sec: u64) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0); // so a stop can take the whole tree down
+    }
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(timeout_sec.max(1));
+    let workid = CURRENT_WORKID.with(|w| w.borrow().clone());
     loop {
+        if !workid.is_empty() && STOP_REQUESTED.lock().map(|v| v.contains(&workid)).unwrap_or(false) {
+            let pid = child.id();
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill").args(["-TERM", "--", &format!("-{pid}")]).status();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(STOPPED_BY_USER.into());
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 let mut out = String::new();
@@ -732,6 +773,22 @@ fn close(api: &Api, _engine_name: &str, project: &Project, item: WorkItem, resul
     };
     put_detail(if ok { "response" } else { "error" }, "text", json!(text));
 
+    // cost accounting: a "spend" row on the item + the project's daily total
+    if let Ok(out) = &result {
+        if out.cost_usd > 0.0 || out.input_tokens > 0 {
+            put_detail("spend", "json", json!({"usd": out.cost_usd, "input_tokens": out.input_tokens, "output_tokens": out.output_tokens,
+                "turns": out.num_turns, "agent": item.agent, "attempt": item.attempt}));
+            let _ = api.post(&format!("/api/projects/{}/spend", project.name),
+                &json!({"usd": out.cost_usd, "input_tokens": out.input_tokens, "output_tokens": out.output_tokens, "workid": item.id}));
+        }
+    }
+    let stopped = matches!(&result, Err(e) if e == STOPPED_BY_USER);
+    if stopped {
+        if let Ok(mut v) = STOP_REQUESTED.lock() {
+            v.retain(|w| w != &item.id);
+        }
+    }
+
     // the close gate decides what "ok" closes to
     let mut gate_hold: Option<(String, bool)> = None; // (short reason, to_question)
     if let (Ok(out), Some(ctx)) = (&result, &ctx) {
@@ -765,7 +822,12 @@ fn close(api: &Api, _engine_name: &str, project: &Project, item: WorkItem, resul
         };
         let version = fresh.get("version").and_then(|v| v.as_u64()).unwrap_or(item.version);
         let mut updated = fresh.clone();
-        if let Some((reason, to_question)) = &gate_hold {
+        if stopped {
+            // workitem_stop.md: parked for human review, never retried
+            updated["state"] = json!("parked");
+            updated["stop_requested"] = json!(false);
+            updated["lasterror"] = json!(STOPPED_BY_USER);
+        } else if let Some((reason, to_question)) = &gate_hold {
             updated["state"] = json!(if *to_question { "question" } else { "queued" });
             updated["gate_bounces"] = json!(item.gate_bounces + 1);
             updated["lasterror"] = json!(format!("close gate: {reason}"));
@@ -780,7 +842,12 @@ fn close(api: &Api, _engine_name: &str, project: &Project, item: WorkItem, resul
                 updated["state"] = json!("failed");
                 updated["ts"]["complete"] = json!(now_utc());
             } else {
-                updated["state"] = json!("queued"); // retry
+                // retry after the project's backoff (V2 retry_backoff_sec)
+                let delay = iter_core::retry_delay_sec(&project.failure, item.attempt);
+                let until = chrono::Utc::now() + chrono::Duration::seconds(delay as i64);
+                updated["state"] = json!("queued");
+                updated["retry_after"] = json!(until.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                println!("[engine] {} '{}': attempt {} failed, retry after {}s", short(&item.id), item.name, item.attempt, delay);
             }
         }
         match api.put(
@@ -811,6 +878,7 @@ fn close(api: &Api, _engine_name: &str, project: &Project, item: WorkItem, resul
         short(&item.id),
         item.name,
         match (&gate_hold, ok) {
+            _ if stopped => "parked (stopped by user)",
             (Some((_, true)), _) => "question (close gate)",
             (Some((_, false)), _) => "queued (close gate bounce)",
             (None, true) => "complete",

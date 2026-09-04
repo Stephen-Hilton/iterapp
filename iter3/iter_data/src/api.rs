@@ -138,6 +138,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects/{name}/versions", get(versions_get))
         .route("/api/projects/{name}/status", get(project_status))
         .route("/api/projects/{name}/settle", post(project_settle))
+        .route("/api/projects/{name}/spend", get(spend_list).post(spend_add))
         .route("/api/projects/{name}/structure", get(structure_get).put(structure_put))
         .route("/api/projects/{name}/prepostwork", get(prepostwork_list))
         .route("/api/prepostwork/{projectname}/{name}", put(prepostwork_put))
@@ -496,6 +497,45 @@ async fn project_settle(user: AuthUser, State(st): Ctx, Path(name): Path<String>
     st.store.put("project", &name, NOSK, &proj).await?;
     st.store.bump_seq(&name, "project").await?;
     Ok(Json(json!({"state": "Stopped", "settled": true})))
+}
+
+// ---------- spend (per project per UTC day; engines add after each run) ----------
+
+async fn spend_list(_u: AuthUser, State(st): Ctx, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    let mut rows = st.store.query("spend", &name).await?;
+    rows.sort_by(|a, b| body_str(b, "date").cmp(&body_str(a, "date")));
+    rows.truncate(31);
+    Ok(Json(Value::Array(rows)))
+}
+
+#[derive(serde::Deserialize)]
+struct SpendReq {
+    #[serde(default)]
+    usd: f64,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    workid: String,
+}
+
+/// Add one run's cost to today's row (read-modify-write; a lost race under-
+/// counts by one run, which the daily cap tolerates).
+async fn spend_add(user: AuthUser, State(st): Ctx, Path(name): Path<String>, Json(req): Json<SpendReq>) -> Result<Json<Value>, ApiError> {
+    user.require_writer()?;
+    let date = now_utc()[..10].to_string();
+    let mut row = st.store.get("spend", &name, &date).await?.unwrap_or(json!({
+        "project": name, "date": date, "usd": 0.0, "input_tokens": 0, "output_tokens": 0, "runs": 0
+    }));
+    row["usd"] = json!(row.get("usd").and_then(|v| v.as_f64()).unwrap_or(0.0) + req.usd);
+    row["input_tokens"] = json!(body_u64(&row, "input_tokens") + req.input_tokens);
+    row["output_tokens"] = json!(body_u64(&row, "output_tokens") + req.output_tokens);
+    row["runs"] = json!(body_u64(&row, "runs") + 1);
+    row["last_workid"] = json!(req.workid);
+    row["updated"] = json!(now_utc());
+    st.store.put("spend", &name, &date, &row).await?;
+    Ok(Json(row))
 }
 
 // ---------- structure ----------

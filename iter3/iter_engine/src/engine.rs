@@ -27,6 +27,9 @@ pub struct EngineRuntime {
     pub max_ticks: Option<u64>,
     /// test_requested value already answered (never run the same nudge twice)
     last_test_handled: String,
+    last_probe: Option<Instant>,
+    /// project -> date the daily-budget hold was announced
+    budget_hold: HashMap<String, String>,
 }
 
 use crate::usage;
@@ -73,6 +76,8 @@ impl EngineRuntime {
             running_count: Arc::new(AtomicUsize::new(0)),
             max_ticks: None,
             last_test_handled: String::new(),
+            last_probe: None,
+            budget_hold: HashMap::new(),
         }
     }
 
@@ -216,6 +221,28 @@ impl EngineRuntime {
         if !engine.test_requested.is_empty() && engine.test_requested != self.last_test_handled {
             self.last_test_handled = engine.test_requested.clone();
             self.run_test(engine, &chosen_account);
+        }
+        // idle usage probe (V2 limits.probe): a stale snapshot with nothing running
+        // gets one cheap nudge so the ladder and the chip see real numbers
+        if engine.probe_stale_min > 0 && self.running.is_empty() && !self.projects.is_empty() {
+            let age = usage::read_usage(&chosen_account).and_then(|u| u.age_sec(now)).unwrap_or(i64::MAX);
+            let since_probe = self.last_probe.map(|t| t.elapsed().as_secs()).unwrap_or(u64::MAX);
+            if age > (engine.probe_stale_min * 60) as i64 && since_probe > engine.probe_stale_min * 60 {
+                self.last_probe = Some(Instant::now());
+                println!("[engine] usage snapshot is {} old — probing", if age == i64::MAX { "missing".to_string() } else { format!("{age}s") });
+                self.run_test(engine, &chosen_account);
+            }
+        }
+        // stop requests for items THIS engine is running (workitem_stop.md)
+        for items in self.items.values() {
+            for i in items.iter().filter(|i| i.stop_requested && i.state == "in-progress" && i.engine == self.name) {
+                if let Ok(mut v) = crate::work::STOP_REQUESTED.lock() {
+                    if !v.contains(&i.id) {
+                        println!("[engine] stop requested for {} '{}' — killing its session", &i.id[..8], i.name);
+                        v.push(i.id.clone());
+                    }
+                }
+            }
         }
 
         // metadata + queue sync, seq-gated with the periodic full-refresh fallback
@@ -400,6 +427,29 @@ impl EngineRuntime {
         let cap = max_agents(&project.maxagents, usage_pct) as usize;
         let account_name = account.as_ref().map(|a| a.name.clone()).unwrap_or_default();
 
+        // maxdailycost (spec): null = unlimited, 0 = spend nothing, >0 = $/day cap
+        if let Some(capusd) = project.maxdailycost {
+            let today = now_utc()[..10].to_string();
+            let spent = self
+                .api
+                .get(&format!("/api/projects/{project_name}/spend"))
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .find(|r| r.get("date").and_then(|d| d.as_str()) == Some(today.as_str()))
+                .and_then(|r| r.get("usd").and_then(|u| u.as_f64()))
+                .unwrap_or(0.0);
+            if capusd <= 0.0 || spent >= capusd {
+                if self.budget_hold.get(&project_name) != Some(&today) {
+                    println!("[engine] {project_name}: daily budget {} (${spent:.2} of ${capusd:.2}) — picking nothing today", if capusd <= 0.0 { "is zero" } else { "reached" });
+                    self.budget_hold.insert(project_name.clone(), today);
+                }
+                return;
+            }
+        }
+        let now_iso = now_utc();
+
         // current central lock rows (locks + reservations)
         let lock_rows: Vec<Value> = self
             .api
@@ -460,6 +510,7 @@ impl EngineRuntime {
         let mut queued: Vec<&WorkItem> = items
             .iter()
             .filter(|i| i.state == "queued" && !i.needs_approval && !started_now.contains(&i.id))
+            .filter(|i| i.retry_after.is_empty() || i.retry_after <= now_iso) // failure backoff
             .filter(|i| {
                 self.deferred
                     .get(&i.id)
@@ -542,6 +593,7 @@ impl EngineRuntime {
         let mut claimed = serde_json::to_value(item).unwrap();
         claimed["state"] = json!("in-progress");
         claimed["run_now"] = json!(false); // the override is consumed by this start
+        claimed["retry_after"] = json!("");
         claimed["engine"] = json!(self.name);
         claimed["attempt"] = json!(item.attempt + 1);
         claimed["ts"]["start"] = json!(now_utc());
