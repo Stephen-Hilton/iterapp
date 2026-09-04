@@ -183,6 +183,8 @@ async function load(){
   $("#login").style.display="none";$("#layout").style.display="flex";$("#top").style.display="";
   $("#who").textContent=me||"";
   const[projects,engines]=await Promise.all([api("/api/projects"),api("/api/engines")]);
+  projects.sort((a,b)=>a.name.localeCompare(b.name,undefined,{sensitivity:"base"}));
+  try{const lp=localStorage.getItem("iter_project");if(lp&&!project&&projects.some(p=>p.name===lp))project=lp;}catch(e){}
   $("#projects").innerHTML=projects.map(p=>
     `<button class="proj ${p.name===project?"sel":""}" data-p="${esc(p.name)}">${esc(p.name)}
      <span class="kv">${esc(p.state)}</span></button>`).join("")||"<span class='kv'>none yet</span>";
@@ -196,11 +198,13 @@ async function load(){
       <br>acct: ${esc(e.account||"—")} · ${esc(e.host||"?")}
       <br>seen: ${esc(fmtTs(e.last_seen)||"never")}</div>`;
   }).join("")||"<div class='eng kv'>no engines registered</div>";
-  if(projects.length&&!project)await loadItems(projects[0].name);else renderCounts();
+  if(projects.length&&!project)project=projects[0].name;
+  if(project)await loadItems(project);else renderCounts();
 }
 
 async function loadItems(p){
   project=p;$("#wi-proj").textContent="— "+p;
+  try{localStorage.setItem("iter_project",p);}catch(e){}
   document.querySelectorAll("#projects .proj").forEach(b=>b.classList.toggle("sel",b.dataset.p===p));
   itemsCache=await api("/api/projects/"+encodeURIComponent(p)+"/workitems");
   renderCounts();renderItems();

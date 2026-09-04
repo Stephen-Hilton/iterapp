@@ -5,6 +5,7 @@
 mod api;
 mod auth;
 mod ddb;
+mod migrate;
 mod sqlite;
 mod storage;
 
@@ -40,6 +41,49 @@ struct Args {
     /// .env file to load (KEY=VALUE lines; malformed lines skipped)
     #[arg(long, default_value = "./.env")]
     env_file: String,
+
+    /// one-shot V2 import: path to a V2 .iter/.engine/iter.db (then exit)
+    #[arg(long, default_value = "")]
+    migrate_v2: String,
+    /// V3 project name for --migrate-v2
+    #[arg(long, default_value = "")]
+    migrate_project: String,
+    /// absolute V2 topdir (rewritten to "{topdir}" in lockdirs)
+    #[arg(long, default_value = "")]
+    migrate_topdir: String,
+    /// engine-side topdir written into the engine record (default: the same path)
+    #[arg(long, default_value = "")]
+    migrate_engine_topdir: String,
+    /// engine record name for --migrate-v2
+    #[arg(long, default_value = "Engine01")]
+    migrate_engine: String,
+    /// V2 .iter/agents directory (agent defs; _shared.md appended to each)
+    #[arg(long, default_value = "")]
+    migrate_agents_dir: String,
+    /// V2 main.iter.md (project name/description)
+    #[arg(long, default_value = "")]
+    migrate_mainfile: String,
+    /// replace rows that already exist (default: skip them)
+    #[arg(long, default_value_t = false)]
+    migrate_overwrite: bool,
+    /// count and report only; write nothing
+    #[arg(long, default_value_t = false)]
+    migrate_dry_run: bool,
+}
+
+/// The single-file webui, embedded so the Lambda deploy needs no filesystem.
+const WEBUI_INDEX: &str = include_str!("../../webui/index.html");
+
+async fn embedded_index(uri: axum::http::Uri) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match uri.path() {
+        "/" | "/index.html" => axum::response::Html(WEBUI_INDEX).into_response(),
+        _ => (axum::http::StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+fn in_lambda() -> bool {
+    std::env::var("AWS_LAMBDA_RUNTIME_API").is_ok()
 }
 
 /// Minimal .env loader: KEY=VALUE lines only, no shell semantics — the user's
@@ -63,8 +107,18 @@ fn load_env_file(path: &str) {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
     load_env_file(&args.env_file);
+    // Lambda: the runtime starts the bootstrap with no arguments, so the
+    // backend is DynamoDB by definition and the prefix comes from ITER_PREFIX
+    if in_lambda() {
+        args.backend = "dynamodb".into();
+        if let Ok(p) = std::env::var("ITER_PREFIX") {
+            if !p.trim().is_empty() {
+                args.prefix = p.trim().to_string();
+            }
+        }
+    }
 
     let store: Arc<dyn storage::Storage> = match args.backend.as_str() {
         "sqlite" => Arc::new(sqlite::SqliteBackend::open(&args.db).expect("open sqlite")),
@@ -87,6 +141,10 @@ async fn main() {
         }
     };
 
+    if !args.migrate_v2.is_empty() {
+        return migrate_v2(store.as_ref(), &args).await;
+    }
+
     bootstrap_admin(store.as_ref()).await;
 
     let secret = auth::load_secret(&args.secret_file);
@@ -100,11 +158,71 @@ async fn main() {
     );
     if !args.webui_dir.is_empty() {
         app = app.fallback_service(tower_http::services::ServeDir::new(&args.webui_dir));
+    } else {
+        app = app.fallback(embedded_index);
     }
 
+    if in_lambda() {
+        // function-URL / API Gateway events -> the same axum router
+        if let Err(e) = lambda_http::run(app).await {
+            eprintln!("[iter_data] lambda runtime error: {e}");
+        }
+        return;
+    }
     let listener = tokio::net::TcpListener::bind(&args.listen).await.expect("bind");
     println!("[iter_data] listening on {} (backend: {})", args.listen, args.backend);
     axum::serve(listener, app).await.expect("serve");
+}
+
+/// `--migrate-v2`: import a V2 project into this backend, print a report, exit.
+async fn migrate_v2(store: &dyn storage::Storage, args: &Args) {
+    if args.migrate_project.trim().is_empty() || args.migrate_topdir.trim().is_empty() {
+        eprintln!("--migrate-v2 needs --migrate-project <name> and --migrate-topdir </abs/path>");
+        std::process::exit(2);
+    }
+    let opts = migrate::Options {
+        db_path: args.migrate_v2.clone(),
+        project: args.migrate_project.trim().to_string(),
+        topdir_abs: args.migrate_topdir.trim().to_string(),
+        engine_topdir: if args.migrate_engine_topdir.trim().is_empty() {
+            args.migrate_topdir.trim().to_string()
+        } else {
+            args.migrate_engine_topdir.trim().to_string()
+        },
+        engine_name: args.migrate_engine.clone(),
+        agents_dir: args.migrate_agents_dir.clone(),
+        mainfile: args.migrate_mainfile.clone(),
+        overwrite: args.migrate_overwrite,
+        dry_run: args.migrate_dry_run,
+    };
+    match migrate::run(store, &opts).await {
+        Ok(rep) => {
+            println!(
+                "[migrate-v2] {}project '{}' <- {}",
+                if opts.dry_run { "DRY RUN: " } else { "" },
+                opts.project,
+                opts.db_path
+            );
+            println!("  workitems written: {} (skipped existing: {})", rep.items_written, rep.items_skipped);
+            for (st, n) in &rep.items_by_state {
+                println!("    {st}: {n}");
+            }
+            println!("  detail rows: {} (review rows from critiques: {})", rep.details_written, rep.reviews);
+            println!("  agents written: {} (skipped existing: {})", rep.agents_written, rep.agents_skipped);
+            println!("  project record written: {}; engine record written: {}", rep.project_written, rep.engine_written);
+            match &rep.user_written {
+                Some(u) => println!("  operator user upserted from ITER_USERNAME/ITER_PASSWORD: {u}"),
+                None => println!("  operator user: ITER_USERNAME/ITER_PASSWORD not set, none written"),
+            }
+            for w in &rep.warnings {
+                println!("  warning: {w}");
+            }
+        }
+        Err(e) => {
+            eprintln!("[migrate-v2] FAILED: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// First-run bootstrap: if no users exist, create "admin".

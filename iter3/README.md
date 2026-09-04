@@ -22,6 +22,26 @@ iter3/deploy.sh            # defaults to dynamodb, prefix iter3_
 Then open http://127.0.0.1:8300/ and sign in (`admin` / `ITER_ADMIN_PASSWORD` from `.env`).
 Runtime state (binaries, pid, logs, live sample project) lives under `iter3/bin/` and `iter3/run/` (gitignored).
 
+## Lambda (production)
+
+```bash
+pip3 install cargo-lambda          # once
+iter3/deploy_lambda.sh             # build arm64 bootstrap, ensure role, create/update iter3_data, print the function URL
+```
+
+The function URL serves the embedded webui at `/` and the same API; `ITER_JWT_SECRET` in `.env` is shared with any local iter_data so tokens work on both.
+
+## Migrating a V2 project
+
+```bash
+iter_data --backend dynamodb --prefix iter3_ --env-file .env \
+  --migrate-v2 <project>/.iter/.engine/iter.db --migrate-project <name> \
+  --migrate-topdir /abs/path/to/project --migrate-engine-topdir '~/dev/project/' \
+  --migrate-agents-dir <project>/.iter/agents --migrate-mainfile <project>/main.iter.md [--migrate-dry-run] [--migrate-overwrite]
+```
+
+Add `ITER_USERNAME` / `ITER_PASSWORD` to `.env` to create (or re-password) the operator user as project admin in the same run.
+
 ## Engine setup
 
 1. Admin creates the engine record (`PUT /api/engines/{name}`) with per-project `dirs`.
