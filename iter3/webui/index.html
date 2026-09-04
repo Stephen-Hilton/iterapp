@@ -79,6 +79,23 @@ input,select,textarea{background:var(--bg);color:var(--text);border:1px solid va
 @keyframes flashbg{0%{background:#2b4a72;border-color:var(--accent)}100%{background:transparent;border-color:var(--line)}}
 .flash{animation:flashbg 1.8s ease-out}
 
+/* ---- project state control (aspirational; engines follow it) ---- */
+.segwrap{margin-left:auto;display:flex;align-items:center;gap:8px}
+.segwrap .kv b{font-weight:600}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{background:transparent;color:var(--dim);border:0;border-radius:0;padding:4px 11px;font-size:12px;font-weight:600}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button.on.Running{background:#274733;color:#7de0ae}
+.seg button.on.Draining{background:#4a3f1e;color:#f0c75e}
+.seg button.on.Stopped{background:#4b2626;color:#ff9b9b}
+.seg button:disabled{cursor:default}
+#brandrow .who{margin-left:0}
+@media (max-width:760px){
+  .segwrap{margin-left:0;width:100%;order:9;justify-content:space-between}
+  #brandrow{flex-wrap:wrap;row-gap:6px}
+  #brandrow .who{margin-left:auto}
+}
+
 /* ---- actions menu ---- */
 .actmenu{position:fixed;z-index:200;background:var(--panel);border:1px solid var(--line);border-radius:8px;
   padding:6px;min-width:250px;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:2px}
@@ -163,6 +180,7 @@ a{color:var(--accent)}
   <div id="brandrow">
     <h1>ITER</h1>
     <span class="kv" id="backend"></span>
+    <span id="projctl" class="segwrap"></span>
     <span class="who" id="who"></span>
     <button class="ghost" id="logout">logout</button>
   </div>
@@ -312,8 +330,40 @@ async function loadItems(p){
   project=p;$("#wi-proj").textContent="— "+p;
   try{localStorage.setItem("iter_project",p);}catch(e){}
   document.querySelectorAll("#projects .proj").forEach(b=>b.classList.toggle("sel",b.dataset.p===p));
-  itemsCache=await api(P());
+  const [items]=await Promise.all([api(P()),renderProjectCtl().catch(()=>{})]);
+  itemsCache=items;
   renderCounts();renderItems();
+}
+
+/* Running | Draining | Stopped for the selected project: the COMMANDED state.
+   Engines read it every tick and report their own actual state (left pane);
+   the status endpoint says whether every engine has honored a drain. */
+async function renderProjectCtl(){
+  if(!project){$("#projctl").innerHTML="";return;}
+  const [proj,status]=await Promise.all([api("/api/projects/"+encodeURIComponent(project)),
+    api("/api/projects/"+encodeURIComponent(project)+"/status").catch(()=>null)]);
+  const live=status?status.engines.filter(e=>!e.stale).length:0;
+  const total=status?status.engines.length:0;
+  const running=status?(status.inprogress||0):0;
+  let note=`${live}/${total} engines online`;
+  if(proj.state==="Draining")note+=status&&status.all_drained?" · drained":` · ${running} still running`;
+  else if(proj.state==="Running")note+=` · ${running} running`;
+  if(status&&status.not_honoring&&status.not_honoring.length)note+=` · <span style="color:var(--bad)">not honoring: ${esc(status.not_honoring.join(", "))}</span>`;
+  $("#projctl").innerHTML=`<span class="kv"><b>${esc(project)}</b> ${note}</span>
+    <span class="seg">${["Running","Draining","Stopped"].map(st=>`<button class="${st} ${proj.state===st?"on":""}" data-st="${st}" ${proj.state===st?"disabled":""}>${st}</button>`).join("")}</span>`;
+  $("#projctl").querySelectorAll("button[data-st]").forEach(b=>b.onclick=async()=>{
+    const st=b.dataset.st;
+    const warn={Running:"Engines will start picking queued work for this project.",
+      Draining:"Engines finish what is running and start nothing new.",
+      Stopped:"Engines stop picking work; anything mid-run finishes its turn."}[st];
+    if(!confirm(`Set ${project} to ${st}?\n${warn}`))return;
+    try{
+      const fresh=await api("/api/projects/"+encodeURIComponent(project));
+      fresh.state=st;
+      await api("/api/projects/"+encodeURIComponent(project),{method:"PUT",body:JSON.stringify(fresh)});
+      await load();
+    }catch(e){alert("could not change state: "+e.message);}
+  });
 }
 
 /* ---- pinned counts bar: total + per-state; clicks are ADDITIVE (V2 behaviour) ---- */
