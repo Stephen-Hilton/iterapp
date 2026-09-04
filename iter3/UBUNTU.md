@@ -17,9 +17,9 @@ Build it there or cross-build here:
 
 Runtime needs on the server:
 
-- `claude` (Claude Code CLI, `npm i -g @anthropic-ai/claude-code`) on PATH,
-  plus `python3` (the statusline usage collector is a Python script the
-  engine writes to `$ITER_USAGE_DIR`, default `~/.claude`).
+- `claude` (Claude Code CLI, `npm i -g @anthropic-ai/claude-code`) on PATH.
+  (No python3 any more: the statusline collector is gone as of 2026-09-04 —
+  usage% comes from the session's stream-json event and a direct probe.)
 - `git` with push credentials for the pdy-dev remote (the engine pulls,
   commits and pushes every run) and `bash`.
 - Long-lived Claude tokens: run `claude setup-token` once per account (on any
