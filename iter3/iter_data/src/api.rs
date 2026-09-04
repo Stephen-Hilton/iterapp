@@ -224,8 +224,19 @@ async fn user_put(
     Path(name): Path<String>,
     Json(mut body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    user.require_admin()?;
+    // admins edit anyone; a user may edit their OWN row, but role / authz /
+    // tokenver / pubkey stay whatever they were (self-service = profile + password)
+    let self_edit = user.role != "admin";
+    if self_edit && user.sub != name {
+        return Err(forbidden());
+    }
     let existing = st.store.get("webui_user", &name, NOSK).await?;
+    if self_edit {
+        let Some(ex) = &existing else { return Err(forbidden()) };
+        for k in ["role", "authz", "tokenver", "pubkey"] {
+            body[k] = ex.get(k).cloned().unwrap_or(Value::Null);
+        }
+    }
     body["user"] = json!(name);
     // password (plaintext, TLS-transported) -> pwhash; else preserve existing
     if let Some(pw) = body.get("password").and_then(|v| v.as_str()).map(String::from) {

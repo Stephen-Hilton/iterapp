@@ -96,6 +96,20 @@ input,select,textarea{background:var(--bg);color:var(--text);border:1px solid va
   #brandrow .who{margin-left:auto}
 }
 
+/* ---- settings gears + forms ---- */
+.gear{background:transparent;color:var(--dim);border:1px solid transparent;border-radius:6px;padding:2px 6px;font-size:14px;line-height:1;cursor:pointer}
+.gear:hover{color:var(--accent);border-color:var(--line)}
+.projrow{display:flex;align-items:center;gap:4px}
+.projrow .proj{flex:1}
+.eng .gear{float:right}
+.sf .frow textarea{font-family:ui-monospace,monospace;font-size:12px}
+.sf .help{color:var(--dim);font-size:11px;margin-top:2px}
+.sf .ro{color:var(--dim);padding-top:7px;font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
+.sf h3{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:18px 0 6px;border-top:1px solid var(--line);padding-top:12px}
+.sf .list button{margin:2px 4px 2px 0}
+.sf .fieldbad{border-color:var(--bad) !important}
+@media (max-width:760px){.projrow .gear{padding:4px 8px}}
+
 /* ---- actions menu ---- */
 .actmenu{position:fixed;z-index:200;background:var(--panel);border:1px solid var(--line);border-radius:8px;
   padding:6px;min-width:250px;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:2px}
@@ -182,6 +196,7 @@ a{color:var(--accent)}
     <span class="kv" id="backend"></span>
     <span id="projctl" class="segwrap"></span>
     <span class="who" id="who"></span>
+    <button class="gear" id="user-gear" title="my settings">⚙</button>
     <button class="ghost" id="logout">logout</button>
   </div>
   <div id="counts">
@@ -235,11 +250,12 @@ a{color:var(--accent)}
 
 <dialog id="detail"></dialog>
 <dialog id="form"></dialog>
+<dialog id="settings"></dialog>
 <div id="actmenu" class="actmenu" hidden></div>
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
-let token=null,me=null,project=null,itemsCache=[],agentsCache=[],dlgDirty=false;
+let token=null,me=null,myRole="",project=null,itemsCache=[],agentsCache=[],dlgDirty=false;
 const filters=new Set();   // additive state filters from the pinned counts bar
 const STATES=["in-progress","queued","question","parked","paused","failed","complete","scheduled"];
 const CLOSED=new Set(["complete","failed"]); // immutable except appended "doc" rows + reopen
@@ -283,7 +299,7 @@ function tagsHtml(i){
 
 async function boot(){
   try{const h=await fetch("/health").then(r=>r.json());$("#backend").textContent="data: "+h.backend;}catch(e){}
-  try{token=localStorage.getItem("iter_token");me=localStorage.getItem("iter_user");
+  try{token=localStorage.getItem("iter_token");me=localStorage.getItem("iter_user");myRole=localStorage.getItem("iter_role")||"";
       const s=localStorage.getItem("iter_sort");if(s)$("#sort").value=s;}catch(e){}
   if(token){try{await load();return;}catch(e){token=null;}}
   $("#login").style.display="";$("#layout").style.display="none";$("#top").style.display="none";
@@ -291,8 +307,8 @@ async function boot(){
 $("#li-go").onclick=async()=>{
   try{
     const r=await api("/auth/login",{method:"POST",body:JSON.stringify({user:$("#li-user").value,password:$("#li-pass").value})});
-    token=r.token;me=r.user;
-    try{localStorage.setItem("iter_token",token);localStorage.setItem("iter_user",me);}catch(e){}
+    token=r.token;me=r.user;myRole=r.role||"";
+    try{localStorage.setItem("iter_token",token);localStorage.setItem("iter_user",me);localStorage.setItem("iter_role",myRole);}catch(e){}
     await load();
   }catch(e){$("#li-err").textContent="login failed";}
 };
@@ -301,6 +317,7 @@ $("#logout").onclick=()=>{token=null;try{localStorage.removeItem("iter_token");}
 $("#refresh").onclick=()=>project&&loadItems(project);
 $("#sort").onchange=()=>{try{localStorage.setItem("iter_sort",$("#sort").value);}catch(e){};renderItems();};
 $("#newitem").onclick=()=>openForm("create",null);
+$("#user-gear").onclick=()=>openSettings("user",me);
 
 async function load(){
   $("#login").style.display="none";$("#layout").style.display="flex";$("#top").style.display="";
@@ -310,18 +327,20 @@ async function load(){
   projects.sort((a,b)=>a.name.localeCompare(b.name,undefined,{sensitivity:"base"}));
   try{const lp=localStorage.getItem("iter_project");if(lp&&!project&&projects.some(p=>p.name===lp))project=lp;}catch(e){}
   $("#projects").innerHTML=projects.map(p=>
-    `<button class="proj ${p.name===project?"sel":""}" data-p="${esc(p.name)}">${esc(p.name)}
-     <span class="kv">${esc(p.state)}</span></button>`).join("")||"<span class='kv'>none yet</span>";
+    `<div class="projrow"><button class="proj ${p.name===project?"sel":""}" data-p="${esc(p.name)}">${esc(p.name)}
+     <span class="kv">${esc(p.state)}</span></button><button class="gear" data-gear="project" data-name="${esc(p.name)}" title="project settings">⚙</button></div>`).join("")||"<span class='kv'>none yet</span>";
   document.querySelectorAll("#projects .proj").forEach(b=>b.onclick=()=>loadItems(b.dataset.p));
-  $("#dataserver").innerHTML=`<span class="dot on"></span><b>iter_data</b> ${esc(location.host)}`;
+  $("#dataserver").innerHTML=`<span class="dot on"></span><b>iter_data</b> ${esc(location.host)} <button class="gear" data-gear="data" title="iter_data settings">⚙</button>`;
   const now=Date.now();
   $("#engines").innerHTML=engines.map(e=>{
     const seen=e.last_seen?Date.parse(e.last_seen):0;
     const alive=seen&&(now-seen)<3*(e.ticksec||5)*1000+5000;
-    return `<div class="eng"><span class="dot ${alive?"on":"off"}"></span><b>${esc(e.name)}</b> ${esc(e.state)}${alive?"":" (offline)"}
+    return `<div class="eng"><button class="gear" data-gear="engine" data-name="${esc(e.name)}" title="engine settings">⚙</button><span class="dot ${alive?"on":"off"}"></span><b>${esc(e.name)}</b> ${esc(e.state)}${alive?"":" (offline)"}
       <br>acct: ${esc(e.account||"—")} · ${esc(e.host||"?")}
-      <br>seen: ${esc(fmtTs(e.last_seen)||"never")}</div>`;
+      <br>seen: ${esc(fmtTs(e.last_seen)||"never")}
+      <br>serves: ${esc(Object.keys(e.projects||{}).join(", ")||"—")}</div>`;
   }).join("")||"<div class='eng kv'>no engines registered</div>";
+  document.querySelectorAll("[data-gear]").forEach(g=>g.onclick=ev=>{ev.stopPropagation();openSettings(g.dataset.gear,g.dataset.name);});
   if(projects.length&&!project)project=projects[0].name;
   if(project)await loadItems(project);else renderCounts();
 }
@@ -664,6 +683,173 @@ function openForm(mode,src){
   form.showModal();
 }
 
+/* ================= settings (gear) lightboxes ================= */
+const sdlg=$("#settings");
+sdlg.addEventListener("click",e=>{if(e.target===sdlg)sdlg.close();});
+const isAdmin=()=>myRole==="admin";
+
+/* field spec -> row html; values come from the record, JSON fields are pretty-printed */
+function fieldRow(f,rec){
+  const v=rec?rec[f.key]:undefined;
+  const id=`sf-${f.key}`;
+  let ctl="";
+  if(f.type==="readonly")ctl=`<div class="ro">${esc(v==null||v===""?"—":(typeof v==="object"?JSON.stringify(v):v))}</div>`;
+  else if(f.type==="textarea")ctl=`<textarea id="${id}" rows="${f.rows||4}" style="font-family:inherit">${esc(v??"")}</textarea>`;
+  else if(f.type==="json")ctl=`<textarea id="${id}" rows="${f.rows||4}">${esc(v==null?(f.empty??""):JSON.stringify(v,null,2))}</textarea>`;
+  else if(f.type==="select")ctl=`<select id="${id}">${f.options.map(o=>`<option ${o===v?"selected":""}>${esc(o)}</option>`).join("")}</select>`;
+  else if(f.type==="number")ctl=`<input id="${id}" type="number" step="any" value="${esc(v??"")}" style="width:160px">`;
+  else if(f.type==="password")ctl=`<input id="${id}" type="password" autocomplete="new-password" placeholder="leave blank to keep">`;
+  else ctl=`<input id="${id}" value="${esc(v??"")}">`;
+  return `<div class="frow"><label>${esc(f.label||f.key)}</label><div>${ctl}${f.help?`<div class="help">${f.help}</div>`:""}</div></div>`;
+}
+/* read every editable field back into `out`; throws with the field name on bad JSON/number */
+function readFields(fields,out){
+  for(const f of fields){
+    if(f.type==="readonly")continue;
+    const el=sdlg.querySelector(`#sf-${f.key}`);if(!el)continue;
+    el.classList.remove("fieldbad");
+    const raw=el.value;
+    try{
+      if(f.type==="json"){ if(raw.trim()==="")out[f.key]=(f.emptyValue!==undefined?f.emptyValue:null); else out[f.key]=JSON.parse(raw); }
+      else if(f.type==="number"){ if(raw.trim()==="")out[f.key]=(f.nullable?null:0); else{const n=Number(raw);if(Number.isNaN(n))throw new Error("not a number");out[f.key]=n;} }
+      else if(f.type==="password"){ if(raw)out[f.key]=raw; }
+      else out[f.key]=raw;
+    }catch(e){el.classList.add("fieldbad");throw new Error(`${f.label||f.key}: ${e.message}`);}
+  }
+  return out;
+}
+/* one lightbox shape for every settings record */
+function settingsBox(title,fields,rec,onSave,{extra="",canSave=true,note=""}={}){
+  sdlg.innerHTML=`<div class="sf" style="padding:16px">
+    <div class="dlghead"><h2>${esc(title)}</h2><button class="ghost sm" id="sf-close">close</button></div>
+    ${note?`<div class="kv" style="margin:6px 0 10px">${note}</div>`:""}
+    ${fields.map(f=>fieldRow(f,rec)).join("")}
+    <div style="text-align:right;margin-top:10px"><span class="err" id="sf-err" style="margin-right:12px"></span>
+      ${canSave?`<button id="sf-save">Save</button>`:`<span class="kv">read only (admin can edit)</span>`}</div>
+    ${extra}
+  </div>`;
+  sdlg.querySelector("#sf-close").onclick=()=>sdlg.close();
+  const save=sdlg.querySelector("#sf-save");
+  if(save)save.onclick=async()=>{
+    const err=sdlg.querySelector("#sf-err");err.textContent="";
+    try{await onSave(readFields(fields,{}));}catch(e){err.textContent=e.message;}
+  };
+  sdlg.showModal();
+}
+
+const PROJECT_FIELDS=[
+  {key:"name",type:"readonly"},
+  {key:"desc",label:"description",type:"textarea",rows:5,help:"sent to every agent as project context, on every run"},
+  {key:"state",type:"select",options:["Running","Draining","Stopped"],help:"the COMMANDED state; every engine serving this project follows it"},
+  {key:"gitrepo",label:"git repo",type:"text"},
+  {key:"maxagents",label:"max agents",type:"json",rows:4,help:'usage%-gated cap, evaluated against the higher of 5h/7d usage: {"&gt;95%":0,"&gt;90%":1,"else":4}'},
+  {key:"maxdailycost",label:"max daily cost ($)",type:"number",nullable:true,help:"blank = unlimited · 0 = spend nothing (kill switch)"},
+  {key:"agents",label:"agent overrides",type:"json",rows:6,help:'per-agent overrides keyed by agent name: {"code":{"max":2,"model":"opus","timeoutsec":3600,"closegate":{"verify":"haiku","requires_commit":true}}}'},
+  {key:"failure",label:"failure policy",type:"json",rows:4,help:"maxattempts · first_retry_second · retry_backoff_exponent"},
+  {key:"engines",type:"json",rows:2,help:'engine names serving this project, e.g. ["Engine01"]'},
+  {key:"accounts",type:"json",rows:5,help:'Claude accounts by env-var NAME (never the token): [{"name":"Dev1","token_envar":"DEV1_TOKEN","order":1,"switch":80,"stop":99}]'},
+];
+const ENGINE_FIELDS=[
+  {key:"name",type:"readonly"},{key:"state",type:"readonly",help:"engine-reported (actual)"},{key:"last_seen",type:"readonly"},{key:"account",type:"readonly"},
+  {key:"host",type:"text"},{key:"ticksec",label:"tick (sec)",type:"number"},{key:"full_refresh_minutes",label:"full refresh (min)",type:"number",help:"unconditional reload cadence — the seq fallback"},
+  {key:"queuelock",type:"json",rows:3},
+  {key:"projects",label:"projects served",type:"json",rows:6,help:'machine-specific dirs per project: {"pdy-dev":{"dirs":{"topdir":"~/dev/pdy-dev/"}}} — remove a project here to stop this engine serving it'},
+];
+const AGENT_FIELDS=[
+  {key:"name",type:"readonly"},{key:"desc",label:"description",type:"text"},
+  {key:"max",type:"number",help:"default concurrent cap (project override wins)"},{key:"timeoutsec",label:"timeout (sec)",type:"number"},
+  {key:"model",type:"text",help:"claude model alias: opus · sonnet · haiku · fable"},{key:"flags",type:"text",help:"extra claude CLI flags"},
+  {key:"childstate",label:"child state",type:"text",help:"state for workitems this agent creates (default queued)"},
+  {key:"closegate",label:"close gate",type:"json",rows:5,help:'{"verify":"haiku","requires_children":false,"requires_commit":false,"max_bounces":1,"verify_max_turns":8} — verify "" disables the verifier'},
+  {key:"promptbody",label:"prompt body",type:"textarea",rows:18,help:"the agent's full role prompt; project description + workitem request are appended at run time"},
+];
+const userFields=(self)=>[
+  {key:"user",type:"readonly"},
+  self?{key:"role",type:"readonly"}:{key:"role",type:"select",options:["user","engine","admin"]},
+  {key:"email",type:"text"},
+  {key:"password",type:"password",help:"set a new password; blank keeps the current one"},
+  {key:"css",label:"custom css url",type:"text"},
+  {key:"settings",type:"json",rows:3,emptyValue:{}},
+  self?{key:"authz",type:"readonly",help:"per-project access (admin sets this)"}:{key:"authz",type:"json",rows:3,emptyValue:{},help:'{"pdy-dev":"admin","other":"readonly"}'},
+  ...(self?[]:[{key:"tokenver",label:"token version",type:"number",help:"bump to revoke every outstanding token for this user"},{key:"pubkey",label:"approval pubkey",type:"text"}]),
+];
+
+async function openSettings(kind,name){
+  try{
+    if(kind==="project")return await projectSettings(name);
+    if(kind==="engine")return await engineSettings(name);
+    if(kind==="agent")return await agentSettings(name);
+    if(kind==="user")return await userSettings(name);
+    if(kind==="data")return dataSettings();
+  }catch(e){alert("could not open settings: "+e.message);}
+}
+async function projectSettings(name){
+  const [rec,agents]=await Promise.all([api("/api/projects/"+encodeURIComponent(name)),api("/api/agents").catch(()=>[])]);
+  const extra=`<h3>Agents (global definitions; override per project above)</h3>
+    <div class="list">${agents.map(a=>`<button class="ghost sm" data-agent="${esc(a.name)}">⚙ ${esc(a.name)}</button>`).join("")||"<span class='kv'>none</span>"}</div>
+    <div class="kv" style="margin-top:6px">promptbody, model, caps and the close gate live on the agent; the project's "agent overrides" field wins where set.</div>`;
+  settingsBox(`Project settings — ${name}`,PROJECT_FIELDS,rec,async(vals)=>{
+    const fresh=await api("/api/projects/"+encodeURIComponent(name));
+    Object.assign(fresh,vals);
+    await api("/api/projects/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify(fresh)});
+    sdlg.close();await load();
+  },{extra,canSave:isAdmin()});
+  sdlg.querySelectorAll("[data-agent]").forEach(b=>b.onclick=()=>openSettings("agent",b.dataset.agent));
+}
+async function agentSettings(name){
+  const rec=await api("/api/agents/"+encodeURIComponent(name));
+  settingsBox(`Agent — ${name}`,AGENT_FIELDS,rec,async(vals)=>{
+    const fresh=await api("/api/agents/"+encodeURIComponent(name));
+    Object.assign(fresh,vals);
+    await api("/api/agents/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify(fresh)});
+    sdlg.close();agentsCache=await api("/api/agents").catch(()=>agentsCache);
+  },{canSave:isAdmin()});
+}
+async function engineSettings(name){
+  const rec=await api("/api/engines/"+encodeURIComponent(name));
+  settingsBox(`Engine — ${name}`,ENGINE_FIELDS,rec,async(vals)=>{
+    const fresh=await api("/api/engines/"+encodeURIComponent(name));
+    Object.assign(fresh,vals);
+    await api("/api/engines/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify(fresh)});
+    sdlg.close();await load();
+  },{note:"state, last seen and account are written by the engine itself every tick; everything else is yours to set."});
+}
+async function userSettings(name){
+  const self=name===me;
+  const rec=await api("/api/users/"+encodeURIComponent(name));
+  let extra="";
+  if(isAdmin()){
+    const users=await api("/api/users").catch(()=>[]);
+    extra=`<h3>All users (admin)</h3><div class="list">${users.map(u=>`<button class="ghost sm" data-user="${esc(u.user)}">⚙ ${esc(u.user)} <span class="kv">${esc(u.role)}</span></button>`).join("")}</div>
+      <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center"><input id="nu-name" placeholder="new user name" style="width:150px"><input id="nu-pass" type="password" placeholder="password" style="width:150px">
+      <select id="nu-role"><option>user</option><option>engine</option><option>admin</option></select><button class="sm" id="nu-add">add user</button></div>`;
+  }
+  settingsBox(self?`My settings — ${name}`:`User — ${name}`,userFields(self&&!isAdmin()),rec,async(vals)=>{
+    const fresh=await api("/api/users/"+encodeURIComponent(name));
+    Object.assign(fresh,vals);
+    await api("/api/users/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify(fresh)});
+    sdlg.close();
+  },{extra,note:self?"your profile and password; role and project access are set by an admin":""});
+  sdlg.querySelectorAll("[data-user]").forEach(b=>b.onclick=()=>openSettings("user",b.dataset.user));
+  const add=sdlg.querySelector("#nu-add");
+  if(add)add.onclick=async()=>{
+    const n=sdlg.querySelector("#nu-name").value.trim(),p=sdlg.querySelector("#nu-pass").value,r=sdlg.querySelector("#nu-role").value;
+    if(!n||!p){sdlg.querySelector("#sf-err").textContent="new user needs a name and a password";return;}
+    try{await api("/api/users/"+encodeURIComponent(n),{method:"PUT",body:JSON.stringify({role:r,password:p,email:"",settings:{},authz:{}})});openSettings("user",n);}
+    catch(e){sdlg.querySelector("#sf-err").textContent="add failed: "+e.message;}
+  };
+}
+async function dataSettings(){
+  const h=await fetch("/health").then(r=>r.json()).catch(()=>({}));
+  const fields=[
+    {key:"host",type:"readonly"},{key:"backend",type:"readonly"},{key:"ts",label:"server time (UTC)",type:"readonly"},
+    {key:"env",label:"deploy settings",type:"readonly"},
+  ];
+  settingsBox("iter_data",fields,{host:location.host,backend:h.backend,ts:h.ts,
+    env:"ITER_PREFIX (table prefix) · ITER_JWT_SECRET (shared with local iter_data) · ITER_ADMIN_PASSWORD (first-run admin) — set in the Lambda environment by iter3/deploy_lambda.sh, or in .env for a local server"},
+    async()=>{},{canSave:false,note:"iter_data has no runtime-editable settings; the values below come from its environment. Projects, engines, agents and users are the records you edit via their own gears."});
+}
+
 /* ================= detail lightbox ================= */
 const dlg=$("#detail");
 function tryCloseDlg(){
@@ -787,9 +973,9 @@ function widgetForm(item,d){
 
 boot();
 setInterval(()=>{
-  if(!token||$("#layout").style.display==="none")return;
+  if(!token||$("#layout").style.display==="none"||sdlg.open)return;
   load().catch(()=>{});
-  if(project&&!dlg.open&&!form.open&&menu.hidden)loadItems(project).catch(()=>{});
+  if(project&&!dlg.open&&!form.open&&!sdlg.open&&menu.hidden)loadItems(project).catch(()=>{});
 },10000);
 </script>
 </body>
