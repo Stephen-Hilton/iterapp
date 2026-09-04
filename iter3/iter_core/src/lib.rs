@@ -398,7 +398,8 @@ pub enum DepStatus {
     Satisfied,
     /// still waiting on this item (the blocker itself, or one of its descendants)
     Waiting(String),
-    /// this blocker (or a descendant) closed failed: never release, park for review
+    /// this blocker (or a descendant) closed failed: the dependent stays queued
+    /// underneath it until the failed item is reopened and completes
     Failed(String),
 }
 

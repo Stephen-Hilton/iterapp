@@ -408,24 +408,8 @@ impl EngineRuntime {
 
         // dependency gate: DEEP (workitem_dependency.md) — a blocker counts only
         // when it and everything it created closed complete; a failed blocker
-        // parks the dependent for human review instead of ever releasing it
+        // simply keeps its dependents waiting (reopen + complete releases them)
         let kids = children_index(&items);
-        let mut park: Vec<(WorkItem, String)> = Vec::new();
-        for i in items.iter().filter(|i| i.state == "queued") {
-            if let DepStatus::Failed(f) = dependency_status(i, &by_id, &kids) {
-                park.push((i.clone(), f));
-            }
-        }
-        for (i, failed_dep) in park {
-            let mut body = serde_json::to_value(&i).unwrap();
-            body["state"] = json!("parked");
-            body["lasterror"] = json!(format!("dependency {} closed failed — parked for review", &failed_dep[..8.min(failed_dep.len())]));
-            println!("[engine] {} '{}': dependency {} failed -> parked", &i.id[..8], i.name, &failed_dep[..8.min(failed_dep.len())]);
-            let _ = self.api.put(
-                &format!("/api/projects/{}/workitems/{}?expect_version={}", project.name, i.id, i.version),
-                &body,
-            );
-        }
         let deps_satisfied = |item: &WorkItem| -> bool {
             dependency_status(item, &by_id, &kids) == DepStatus::Satisfied
         };

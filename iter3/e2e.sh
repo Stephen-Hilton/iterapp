@@ -218,9 +218,16 @@ DG=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
 [ ! -f "$SAMPLE/out_ddep.txt" ] || fail "deep dependent ran while the blocker's child was still open"
 [ -f "$SAMPLE/out_dshallow.txt" ] || { cat "$SCRATCH/engine-deep.log"; fail "shallow dependent did not run"; }
 [ ! -f "$SAMPLE/out_dnever.txt" ] || fail "item depending on a FAILED blocker ran"
-[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$DG" | jq -r .state)" = parked ] || fail "failed-blocker dependent not parked"
-curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$DG" | jq -r .lasterror | grep -q "closed failed" || fail "parked dependent lacks the failed-dependency note"
-pass "dependencies are deep: waited on the blocker's child; shallow opt-out ran; failed blocker parked its dependent"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$DG" | jq -r .state)" = queued ] || fail "failed-blocker dependent should stay queued (blocked)"
+pass "dependencies are deep: waited on the blocker's child; shallow opt-out ran; failed blocker holds its dependent in place"
+# reopen the failed blocker (it now succeeds) -> its dependent flows naturally
+FRESH=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$DF")
+curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$DF/reopen" -d '{"reason":"retry"}' >/dev/null || fail "reopen failed blocker"
+FRESH=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$DF")
+echo "$FRESH" | jq '.exec_shell="true"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$DF?expect_version=$(echo "$FRESH" | jq -r .version)" -d @- >/dev/null
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config.json --ticks 8 > "$SCRATCH/engine-deep3.log" 2>&1) || true
+[ -f "$SAMPLE/out_dnever.txt" ] || { cat "$SCRATCH/engine-deep3.log"; fail "dependent did not flow after the failed blocker was retried"; }
+pass "retrying the failed blocker released its dependent without any manual requeue"
 # release the child -> dependent runs on the next pass
 ITEM=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$DC")
 echo "$ITEM" | jq '.state="queued"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$DC?expect_version=$(echo "$ITEM" | jq -r .version)" -d @- >/dev/null

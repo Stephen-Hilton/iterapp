@@ -75,7 +75,8 @@ input,select,textarea{background:var(--bg);color:var(--text);border:1px solid va
 .state.scheduled{background:#2c3a44;color:#9fd3e8}
 .prio{font-weight:700;font-size:12px;color:var(--dim);flex:none;font-variant-numeric:tabular-nums}
 .agent{font-size:12px;color:var(--dim);flex:none}
-.indent{margin-left:34px;border-left:2px solid var(--line)}
+.tile[data-depth]{border-left:2px solid var(--line)}
+.tile[data-depth="0"]{border-left:1px solid var(--line)}
 @keyframes flashbg{0%{background:#2b4a72;border-color:var(--accent)}100%{background:transparent;border-color:var(--line)}}
 .flash{animation:flashbg 1.8s ease-out}
 
@@ -171,7 +172,7 @@ a{color:var(--accent)}
   .tile .right{flex:1 1 100%;justify-content:flex-start;flex-wrap:wrap;gap:6px 10px}
   .tile .right .actbtn{margin-left:auto}
   .tags{flex-wrap:wrap}
-  .indent{margin-left:14px}
+  .tile[data-depth]{margin-left:calc(var(--d,0) * 10px) !important}
   /* dialogs: full screen sheets */
   dialog{width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;margin:0;border:0;border-radius:0;overflow-y:auto}
   dialog>div{padding:12px !important}
@@ -470,11 +471,20 @@ function runGroup(i,byId){
   if(i.state==="failed")return 7;
   return 8;                                                  // complete
 }
-/* items that are runnable, or have a runnable descendant (via blockedby edges) */
+/* tree parent: the first blocker present in the set, else the creator (deep dependency) */
+function parentOf(i,ids){
+  const dep=(i.blockedby||[]).find(d=>ids.has(d));
+  if(dep)return dep;
+  return (i.createdby&&ids.has(i.createdby)&&i.createdby!==i.id)?i.createdby:null;
+}
+/* items that are runnable, or have a runnable descendant (blockedby OR createdby edges) */
 function runView(items){
   const byId={},kids={};
   items.forEach(i=>{byId[i.id]=i;});
-  items.forEach(i=>(i.blockedby||[]).forEach(d=>{if(byId[d])(kids[d]=kids[d]||[]).push(i.id);}));
+  items.forEach(i=>{
+    (i.blockedby||[]).forEach(d=>{if(byId[d])(kids[d]=kids[d]||[]).push(i.id);});
+    if(i.createdby&&byId[i.createdby]&&i.createdby!==i.id)(kids[i.createdby]=kids[i.createdby]||[]).push(i.id);
+  });
   const memo={};
   const has=(id,seen=new Set())=>{
     if(memo[id]!==undefined)return memo[id];
@@ -498,10 +508,12 @@ function comparator(mode,byId){
   }
 }
 
+/* depth = how far down the dependency/creation tree this item sits; 22px per level,
+   no cap — a deep chain is supposed to look deep */
 function tileHtml(i,depth){
   const att=(i.attempt>0?` <span class="att">(A${esc(i.attempt)})</span>`:"")+(i.run_now&&i.state==="queued"?` <span class="att" title="run-now override requested">▶ run now</span>`:"");
   return `
-  <div class="tile ${depth?"indent":""}" data-id="${esc(i.id)}">
+  <div class="tile" data-depth="${depth}" style="--d:${depth};margin-left:${depth*22}px" data-id="${esc(i.id)}">
     <div class="left">
       <span class="state ${esc(i.state)}">${esc(i.state)}</span>
       <span class="prio">P${esc(i.priority??5)}</span>
@@ -523,22 +535,22 @@ function renderItems(){
   const cmp=comparator(mode,byId);
   let shown,html="";
   if(mode==="runorder"&&filters.size===0){
-    /* runnable-only view, nested under the first blocker that is itself shown */
     shown=runView(itemsCache);
-    const ids=new Set(shown.map(i=>i.id));
-    const children={},roots=[];
-    shown.forEach(i=>{
-      const dep=(i.blockedby||[]).find(d=>ids.has(d));
-      if(dep){(children[dep]=children[dep]||[]).push(i);}else roots.push(i);
-    });
-    roots.sort(cmp);
-    const emit=(i,depth)=>tileHtml(i,depth)+((children[i.id]||[]).sort(cmp).map(c=>emit(c,depth+1)).join(""));
-    html=roots.map(r=>emit(r,0)).join("");
     $("#viewnote").textContent=`run order: ${shown.length} of ${itemsCache.length} — runnable items and what they are stuck behind`;
   }else{
     shown=itemsCache.filter(i=>filters.size===0||filters.has(i.state));
-    html=[...shown].sort(cmp).map(i=>tileHtml(i,0)).join("");
     $("#viewnote").textContent=filters.size?`${shown.length} shown (${[...filters].join(" + ")})`:"";
+  }
+  /* every view nests: an item sits under its blocker (or its creator), as deep as the chain goes */
+  {
+    const ids=new Set(shown.map(i=>i.id));
+    const children={},roots=[];
+    shown.forEach(i=>{const p=parentOf(i,ids);if(p){(children[p]=children[p]||[]).push(i);}else roots.push(i);});
+    roots.sort(cmp);
+    const seen=new Set();
+    const emit=(i,depth)=>{if(seen.has(i.id))return "";seen.add(i.id);return tileHtml(i,depth)+((children[i.id]||[]).sort(cmp).map(c=>emit(c,depth+1)).join(""));};
+    html=roots.map(r=>emit(r,0)).join("");
+    shown.forEach(i=>{if(!seen.has(i.id))html+=emit(i,0);}); // cycles: never drop an item
   }
   $("#items").innerHTML=html||"<span class='kv'>no workitems</span>";
   document.querySelectorAll("#items .tile").forEach(t=>{
@@ -653,7 +665,7 @@ async function doAction(act,i){
     case "runnow_item":{
       const byId={};itemsCache.forEach(x=>{byId[x.id]=x;});
       const ds=depStatus(i,byId);
-      if(ds.failed){alert(`Cannot run now: dependency ${ds.failed.slice(-8)} closed failed.`);return;}
+      if(ds.failed){alert(`Cannot run now: dependency ${ds.failed.slice(-8)} closed failed — retry (reopen) that item and this one flows after it.`);return;}
       if(ds.waiting){alert(`Cannot run now: still waiting on ${ds.waiting.slice(-8)}${ds.via?" (created by blocker "+ds.via.slice(-8)+"; dependencies are deep)":""}`);return;}
       if(i.needs_approval){alert("Cannot run now: this item still needs a signed approval.");return;}
       if(!confirm(`Run "${i.name.slice(0,60)}" now?\nThe engine starts it on its next tick even if the agent cap is full (no other work starts until the count drops back under the cap). It still waits for any overlapping lock to clear.`))return;
@@ -942,7 +954,7 @@ async function openDetail(id){
       <div class="kv">received ${esc(fmtTs(i.ts&&i.ts.receive)||"—")} · started ${esc(fmtTs(i.ts&&i.ts.start)||"—")}
         · completed ${esc(fmtTs(i.ts&&i.ts.complete)||"—")} · attempt ${esc(i.attempt)} · engine ${esc(i.engine||"—")}</div>
       ${(()=>{const byId={};itemsCache.forEach(x=>{byId[x.id]=x;});const ds=depStatus(i,byId);
-        return ds.ok?"":`<div class="kv" style="color:var(--warn)">gate: ${ds.failed?"dependency "+esc(ds.failed.slice(-8))+" FAILED":"waiting on "+esc(ds.waiting.slice(-8))+(ds.via?" (created by blocker "+esc(ds.via.slice(-8))+"; deep dependency)":"")}</div>`;})()}
+        return ds.ok?"":`<div class="kv" style="color:var(--warn)">gate: ${ds.failed?"dependency "+esc(ds.failed.slice(-8))+" closed FAILED — retry it and this item flows after it":"waiting on "+esc(ds.waiting.slice(-8))+(ds.via?" (created by blocker "+esc(ds.via.slice(-8))+"; deep dependency)":"")}</div>`;})()}
       <div class="kv">lockdirs: ${esc((i.lockdirs||[]).join(", ")||"—")}
         ${i.lasterror?" · <span style='color:var(--bad)'>"+esc(i.lasterror.slice(0,200))+"</span>":""}</div>
       <div id="dl"></div>
