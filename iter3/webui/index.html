@@ -254,8 +254,11 @@ function tagFg(hex){
   const r=parseInt(n.slice(0,2),16),g=parseInt(n.slice(2,4),16),b=parseInt(n.slice(4,6),16);
   return (r*299+g*587+b*114)/1000>150?"#0b0d11":"#f3f5f8";
 }
+/* a lockdir at the repo root drains every other agent before this item can start */
+function fullTreeLock(i){return (i.lockdirs||[]).some(d=>String(d).replace(/\/+$/,"")==="{topdir}");}
 function tagsHtml(i){
   const tags=(i.tags||[]).filter(t=>t&&t.text);
+  if(fullTreeLock(i)&&!CLOSED.has(i.state))tags.unshift({text:"full tree lock",color:"#e05252"});
   if(!tags.length)return "";
   return `<span class="tags">${tags.map(t=>{const c=tagColor(t);return `<span class="tag" style="background:${esc(c)};color:${tagFg(c)}">${esc(t.text)}</span>`;}).join("")}</span>`;
 }
