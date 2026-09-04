@@ -1,13 +1,14 @@
 //! `iter <verb>` for agents (decided 2026-09-04): the same logical verbs V2
 //! gave agents (add, ask, reject, critreview, status, plus `doc` and
-//! `capability`), backed by iter_data.  Agents ask for the logical thing; this
-//! does the deterministic data work.  Verbs that operate on local files
-//! (runtests, validate, markers, teststate, usecase, resolve, orphans) are
-//! delegated to the V2 binary when the repo still carries it — see
-//! `work::v2_delegate` — until V3 re-implements them.
+//! `capability`), backed by iter_data, PLUS the local-file verbs (runtests,
+//! validate, markers, teststate, usecase) served natively by `iter_local`
+//! since 2026-09-04 — nothing here calls or needs the V2 binary.  Agents ask
+//! for the logical thing; this does the deterministic work.
 //!
 //! Environment (set by the engine for every agent session): ITER_DATA_URL,
-//! ITER_ENGINE_TOKEN, ITER_PROJECT (name), ITER_WORKID, ITER_AGENT, ITER_TOPDIR.
+//! ITER_ENGINE_TOKEN, ITER_PROJECT (name), ITER_WORKID, ITER_AGENT, ITER_TOPDIR,
+//! ITER_MAINFILE.  The local-file verbs also work from a plain shell inside the
+//! checkout (no engine, no server): --project may then be a path.
 
 use crate::client::Api;
 use clap::{Args, Subcommand};
@@ -122,7 +123,64 @@ enum Verb {
     },
     /// Open work for this project, run-order first.
     Status,
-    /// Local-file verbs delegated to the V2 binary (runtests, validate, markers, teststate, usecase, resolve, orphans, …).
+    /// Run a testgroup's scripts (the deterministic TDD runner). Neutral by
+    /// default; --broken / --fixed make a claim the engine records and gates on.
+    Runtests {
+        /// testgroup label (as in the file's `iterapp:testgroups` block)
+        #[arg(long)]
+        group: String,
+        /// narrow a NEUTRAL run to one test id/script (claims always run the whole group)
+        #[arg(long)]
+        test: Option<String>,
+        /// claim "the defect is still present": a fully green group means the calling item is stale (parked)
+        #[arg(long)]
+        broken: bool,
+        /// claim "the defect is resolved" (completion gate): any red or error means the item cannot close
+        #[arg(long)]
+        fixed: bool,
+        /// wall-clock budget (minutes) for the group's scripts; overrun = killed → error
+        #[arg(long = "timeout-min", default_value_t = iter_local::runtests::DEFAULT_GROUP_TIMEOUT_MIN)]
+        timeout_min: u64,
+    },
+    /// Validate *.iter.md files (every one under the scan roots, or --file one).
+    Validate {
+        #[arg(long)]
+        file: Option<String>,
+        /// apply the safe corrections in place
+        #[arg(long)]
+        fix: bool,
+        /// with --file: print the authoritative empty template for that file's role instead
+        #[arg(long)]
+        template: bool,
+    },
+    /// The structureV2 scan (nodes, use-cases, interfaces, testgroups) as JSON.
+    Markers,
+    /// The Test Loop gate: park / re-enter objects, or --list every object with its effective state.
+    Teststate {
+        #[arg(long)]
+        omit: Vec<String>,
+        #[arg(long)]
+        include: Vec<String>,
+        #[arg(long)]
+        block: Vec<String>,
+        #[arg(long)]
+        clear: Vec<String>,
+        #[arg(long)]
+        list: bool,
+    },
+    /// Edit a use-case file's code node links (children.codenodes).
+    Usecase {
+        /// the *.usecase.iter.md file
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        add: Vec<String>,
+        #[arg(long)]
+        remove: Vec<String>,
+        #[arg(long)]
+        list: bool,
+    },
+    /// Anything else: named so the message says what happened to the V2-only verbs.
     #[command(external_subcommand)]
     Other(Vec<String>),
 }
@@ -242,7 +300,17 @@ pub fn run(args: CliArgs) {
     match args.verb {
         Verb::Capability { ref name } => capability(&env(&args), name.clone()),
         Verb::Status => status(&env(&args)),
-        Verb::Other(ref rest) => delegate(rest.clone()),
+        Verb::Other(ref rest) => retired(rest),
+        // local-file verbs: no server needed (claims are recorded when inside a run)
+        Verb::Runtests { ref group, ref test, broken, fixed, timeout_min } => {
+            std::process::exit(local::runtests(&topdir_of(&args), group, test.as_deref(), broken, fixed, timeout_min))
+        }
+        Verb::Validate { ref file, fix, template } => std::process::exit(local::validate(&topdir_of(&args), file.as_deref(), fix, template)),
+        Verb::Markers => std::process::exit(local::markers(&topdir_of(&args))),
+        Verb::Teststate { ref omit, ref include, ref block, ref clear, list } => {
+            std::process::exit(local::teststate(&topdir_of(&args), omit, include, block, clear, list))
+        }
+        Verb::Usecase { ref file, ref add, ref remove, list } => std::process::exit(local::usecase(&topdir_of(&args), file, add, remove, list)),
         _ => {}
     }
     let e = env(&args);
@@ -254,7 +322,337 @@ pub fn run(args: CliArgs) {
         Verb::Reject { reason } => reject(&e, &reason),
         Verb::Doc { text, file, id } => doc(&e, read_arg_or_file(text, file), id),
         Verb::Critreview { file, context, max_retry, disposition, round } => critreview(&e, file, context, max_retry, disposition, round),
-        Verb::Capability { .. } | Verb::Status | Verb::Other(_) => {}
+        Verb::Capability { .. } | Verb::Status | Verb::Other(_) | Verb::Runtests { .. } | Verb::Validate { .. }
+        | Verb::Markers | Verb::Teststate { .. } | Verb::Usecase { .. } => {}
+    }
+}
+
+/// The checkout the local-file verbs work on: $ITER_TOPDIR inside a run; a
+/// path given as --project; else the git root of the current directory (or
+/// the current directory itself).
+fn topdir_of(args: &CliArgs) -> std::path::PathBuf {
+    if let Ok(t) = std::env::var("ITER_TOPDIR") {
+        if !t.trim().is_empty() {
+            return std::path::PathBuf::from(t.trim());
+        }
+    }
+    if let Some(p) = &args.project {
+        if p.contains('/') || p == "." {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .unwrap_or(cwd)
+}
+
+/// The V2-only verbs (testsweep, orphans, resolve, …) are gone with the V2
+/// binary; say so instead of "unknown subcommand".
+fn retired(rest: &[String]) -> ! {
+    let verb = rest.first().cloned().unwrap_or_default();
+    die(format!(
+        "`iter {verb}` is not a V3 verb. V3 serves runtests, validate, markers, teststate and usecase itself; \
+         the V2-only verbs (testsweep, orphans, resolve) were retired with the V2 binary on 2026-09-04."
+    ))
+}
+
+/// The local-file verbs, ported from V2's main.rs; the API is touched only to
+/// record a claim on the calling work item.
+mod local {
+    use super::{Api, die};
+    use iter_local::{markers, project, runtests as rt, testgroups, validate as val};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    /// Record a claim row on the calling item when inside a run (no-op from a shell).
+    /// A false --broken claim also parks the item (stale), like `iter reject`.
+    fn record_claim(claim: &str, group: &str, run: &rt::GroupRunResult, upheld: bool, park_reason: Option<&str>) {
+        let (Ok(url), Ok(token), Ok(project), Ok(workid)) = (
+            std::env::var("ITER_DATA_URL"),
+            std::env::var("ITER_ENGINE_TOKEN"),
+            std::env::var("ITER_PROJECT"),
+            std::env::var("ITER_WORKID"),
+        ) else {
+            return;
+        };
+        if url.is_empty() || token.is_empty() || project.is_empty() || workid.is_empty() {
+            return;
+        }
+        let api = Api::new(&url, &token);
+        let details = format!("/api/projects/{project}/workitems/{workid}/details");
+        let _ = api.post(&details, &json!({"key": "claim", "valuetype": "json", "value": {
+            "claim": claim, "group": group, "upheld": upheld, "outcome": run.outcome.as_str(),
+            "counts": format!("{}/{}", run.pass, run.total), "ts": iter_core::now_utc(),
+        }}));
+        if let Some(reason) = park_reason {
+            if let Ok(mut item) = api.get(&format!("/api/projects/{project}/workitems/{workid}")) {
+                let version = item.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+                item["state"] = json!("parked");
+                item["lasterror"] = json!(reason.chars().take(400).collect::<String>());
+                let _ = api.put(&format!("/api/projects/{project}/workitems/{workid}?expect_version={version}"), &item);
+                let _ = api.post(&details, &json!({"key": "doc", "valuetype": "text", "value": reason}));
+            }
+        }
+    }
+
+    pub fn runtests(topdir: &Path, group: &str, test: Option<&str>, broken: bool, fixed: bool, timeout_min: u64) -> i32 {
+        if broken && fixed {
+            eprintln!("error: --broken and --fixed are mutually exclusive claims");
+            return 2;
+        }
+        if (broken || fixed) && test.is_some() {
+            eprintln!("error: claims are group-level; --test narrows only neutral runs");
+            return 2;
+        }
+        let (tg_file, _) = match rt::locate_group(topdir, group) {
+            Ok(found) => found,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        };
+        let run = match rt::run_group(&tg_file, group, test, timeout_min) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        };
+        for t in &run.runs {
+            println!(
+                "{}  {} ({}) [{}] — {}/{} — log: {}{}",
+                match t.outcome {
+                    rt::Outcome::Green => "PASS ",
+                    rt::Outcome::Red => "FAIL ",
+                    rt::Outcome::Error => "ERROR",
+                },
+                t.id, t.name, t.shell, t.pass, t.total, t.log_path.display(),
+                if t.detail.is_empty() { String::new() } else { format!(" — {}", t.detail) },
+            );
+        }
+        let pct = if run.total > 0 { run.pass * 100 / run.total } else { 0 };
+        println!(
+            "tests {}/{} {}% — testgroup \"{}\" {}{}",
+            run.pass, run.total, pct, run.label, run.outcome.as_str().to_uppercase(),
+            if run.full_run { "" } else { " (filtered run — the group's recorded result is not updated)" }
+        );
+        if broken {
+            return match run.outcome {
+                rt::Outcome::Red => {
+                    record_claim("broken", group, &run, true, None);
+                    println!("CLAIM UPHELD (--broken): the defect reproduces; proceed with the fix.");
+                    0
+                }
+                rt::Outcome::Green => {
+                    let reason = format!("stale item: --broken claim failed — testgroup \"{group}\" is fully green ({}/{})", run.pass, run.total);
+                    record_claim("broken", group, &run, false, Some(&reason));
+                    println!(
+                        "CLAIM FALSE (--broken): testgroup \"{group}\" is fully green — this work item is STALE and has been parked. \
+                         STOP NOW: touch no code and end your work immediately."
+                    );
+                    3
+                }
+                rt::Outcome::Error => {
+                    let reason = format!("--broken claim aborted: testgroup \"{group}\" has script errors — \"couldn't run\" must not pass for \"defect reproduces\"");
+                    record_claim("broken", group, &run, false, Some(&reason));
+                    println!(
+                        "CLAIM ABORTED (--broken): script error(s) in testgroup \"{group}\" — the tests could not run, which is not \
+                         the same as the defect reproducing. STOP NOW: the item has been parked."
+                    );
+                    3
+                }
+            };
+        }
+        if fixed {
+            return match run.outcome {
+                rt::Outcome::Green => {
+                    record_claim("fixed", group, &run, true, None);
+                    println!("CLAIM UPHELD (--fixed): testgroup \"{group}\" is fully green.");
+                    0
+                }
+                _ => {
+                    record_claim("fixed", group, &run, false, None);
+                    println!(
+                        "CLAIM FALSE (--fixed): testgroup \"{group}\" is {} — the work is NOT done. The close gate will not \
+                         let this item complete until a --fixed claim is upheld; report what remains.",
+                        run.outcome.as_str()
+                    );
+                    3
+                }
+            };
+        }
+        match run.outcome {
+            rt::Outcome::Green => 0,
+            rt::Outcome::Red => 1,
+            rt::Outcome::Error => 2,
+        }
+    }
+
+    pub fn validate(topdir: &Path, file: Option<&str>, fix: bool, template: bool) -> i32 {
+        let file = file.map(|f| { let p = PathBuf::from(f); if p.is_absolute() { p } else { topdir.join(p) } });
+        if template {
+            let Some(f) = file else {
+                eprintln!("error: --template needs --file <path> to pick the role from the filename");
+                return 2;
+            };
+            return match val::template_for(&f) {
+                Ok(t) => {
+                    println!("{t}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    2
+                }
+            };
+        }
+        let roots = project::scan_roots(topdir);
+        let report = match val::run(&roots, file.as_deref(), fix) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        };
+        for f in &report.findings {
+            println!("{:5} {:24} {}{} — {}", format!("{:?}", f.severity).to_uppercase(), f.code, if f.fixed { "[FIXED] " } else { "" }, f.file, f.message);
+        }
+        let remaining = report.findings.iter().filter(|f| !f.fixed).count();
+        println!(
+            "validate: {} file(s) checked, {} finding(s){}{}",
+            report.files_checked, report.findings.len(),
+            if report.fixed > 0 { format!(", {} fixed", report.fixed) } else { String::new() },
+            if remaining > 0 { format!(", {remaining} remaining") } else { String::new() }
+        );
+        match report.worst() {
+            Some(val::Severity::Error) | Some(val::Severity::Warn) => 1,
+            _ => 0,
+        }
+    }
+
+    pub fn markers(topdir: &Path) -> i32 {
+        let (_p, scan) = markers::scan_project(topdir);
+        match serde_json::to_string_pretty(&scan) {
+            Ok(j) => {
+                println!("{j}");
+                0
+            }
+            Err(e) => {
+                eprintln!("error: cannot serialize scan: {e}");
+                1
+            }
+        }
+    }
+
+    pub fn teststate(topdir: &Path, omit: &[String], include: &[String], block: &[String], clear: &[String], list: bool) -> i32 {
+        let scan_now = || markers::scan_project(topdir).1;
+        let edits: Vec<(markers::TestStateAction, &[String])> = vec![
+            (markers::TestStateAction::Omit, omit),
+            (markers::TestStateAction::Include, include),
+            (markers::TestStateAction::Block, block),
+            (markers::TestStateAction::Clear, clear),
+        ];
+        let mut edited = 0usize;
+        for (action, refs) in edits {
+            for target in refs {
+                match markers::teststate_apply(&scan_now(), target, action, false) {
+                    Ok(summary) => {
+                        println!("{summary}");
+                        edited += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        if edited > 0 {
+                            eprintln!("note: {edited} earlier edit(s) in this invocation were already applied");
+                        }
+                        return 2;
+                    }
+                }
+            }
+        }
+        if list || edited == 0 {
+            let scan = scan_now();
+            println!("teststate (flag → effective):");
+            for n in &scan.nodes {
+                let flag = if n.teststate.trim().is_empty() { "-".to_string() } else { n.teststate.trim().to_string() };
+                let eff = match markers::effective_teststate(n, &scan.nodes) {
+                    markers::TestState::Included => "included".to_string(),
+                    markers::TestState::Omitted { value, by } => format!("OMITTED ({value} via {by})"),
+                };
+                println!("  object    {:40} {:10} {:8} → {}", n.key, n.name, flag, eff);
+            }
+            for u in &scan.usecases {
+                let flag = if u.teststate.trim().is_empty() { "-".to_string() } else { u.teststate.trim().to_string() };
+                let eff = match markers::own_teststate(&u.teststate, &u.file) {
+                    markers::TestState::Included => "included".to_string(),
+                    markers::TestState::Omitted { value, .. } => format!("OMITTED ({value})"),
+                };
+                println!("  usecase   {:51} {:8} → {}", u.name, flag, eff);
+            }
+            for i in &scan.interfaces {
+                let flag = if i.teststate.trim().is_empty() { "-".to_string() } else { i.teststate.trim().to_string() };
+                let eff = match markers::own_teststate(&i.teststate, &i.file) {
+                    markers::TestState::Included => "included".to_string(),
+                    markers::TestState::Omitted { value, .. } => format!("OMITTED ({value})"),
+                };
+                println!("  interface {:51} {:8} → {}", i.id, flag, eff);
+            }
+        }
+        0
+    }
+
+    pub fn usecase(topdir: &Path, file: &str, add: &[String], remove: &[String], list: bool) -> i32 {
+        let p = PathBuf::from(file);
+        let path = if p.is_absolute() { p } else { topdir.join(p) };
+        let filename = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        if markers::role_of(&filename) != Some(markers::Role::Usecase) {
+            eprintln!("error: {} is not a *.usecase.iter.md file (the filename declares the nodetype)", path.display());
+            return 2;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: cannot read {}: {e}", path.display());
+                return 2;
+            }
+        };
+        let front = markers::parse_front(&content);
+        let mut codenodes = front.child("codenodes").unwrap_or_default();
+        for r in remove {
+            let r = r.trim();
+            codenodes.retain(|x| x != r);
+        }
+        for a in add {
+            let a = a.trim();
+            if !a.is_empty() && !codenodes.iter().any(|x| x == a) {
+                codenodes.push(a.to_string());
+            }
+        }
+        if !add.is_empty() || !remove.is_empty() {
+            if let Err(e) = markers::set_children_key(&path, "codenodes", &codenodes) {
+                eprintln!("error: {e}");
+                return 1;
+            }
+            println!("{}: codenodes updated ({} entr{})", path.display(), codenodes.len(), if codenodes.len() == 1 { "y" } else { "ies" });
+        }
+        if list {
+            for c in &codenodes {
+                println!("{c}");
+            }
+        }
+        if add.is_empty() && remove.is_empty() && !list {
+            eprintln!("nothing to do: pass --add, --remove, and/or --list");
+            return 2;
+        }
+        let _ = testgroups::BLOCK_START; // (keeps the import honest: testgroups is used by validate)
+        let _ = die;
+        0
     }
 }
 
@@ -553,35 +951,3 @@ fn status(e: &Env) {
     std::process::exit(0);
 }
 
-/// Local-file verbs: hand off to the V2 binary with its own project root.
-fn delegate(rest: Vec<String>) {
-    let verb = rest.first().cloned().unwrap_or_default();
-    let (bin, root) = match (std::env::var("ITER_V2_BIN"), std::env::var("ITER_V2_PROJECT")) {
-        (Ok(b), Ok(r)) if !b.is_empty() => (b, r),
-        _ => die(format!(
-            "`iter {verb}` is a local-file verb that V3 delegates to the V2 binary, and none is configured (ITER_V2_BIN / ITER_V2_PROJECT — the engine sets them when {{topdir}}/devops/iter exists)"
-        )),
-    };
-    let mut args: Vec<String> = vec![verb.clone()];
-    let mut has_project = false;
-    let mut it = rest.iter().skip(1).peekable();
-    while let Some(a) = it.next() {
-        if a == "--project" {
-            has_project = true;
-            args.push(a.clone());
-            if let Some(v) = it.next() {
-                // V2 wants its own .iter root, whatever the caller passed
-                let _ = v;
-                args.push(root.clone());
-            }
-        } else {
-            args.push(a.clone());
-        }
-    }
-    if !has_project {
-        args.push("--project".into());
-        args.push(root.clone());
-    }
-    let status = std::process::Command::new(&bin).args(&args).status().unwrap_or_else(|err| die(format!("cannot run {bin}: {err}")));
-    std::process::exit(status.code().unwrap_or(1));
-}

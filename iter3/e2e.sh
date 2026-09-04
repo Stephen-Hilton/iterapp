@@ -651,6 +651,59 @@ curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC/details" | jq -
 [ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GJ" | jq -r .state)" = parked ] || fail "iter reject did not park the caller"
 curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GJ" | jq -r .lasterror | grep -q "rejected: premise" || fail "reject reason not recorded"
 pass "agent CLI: capability index/doc, add (child of caller, deep dep, lockdir + context), doc, status, ask -> question kept at close, reject -> parked"
+
+# ---- local-file verbs served by V3 itself (2026-09-04: no V2 binary, no config.iter.json) ----
+mkdir -p "$SAMPLE/src/test" "$SAMPLE/usecases"
+printf 'echo "ITER_RESULT pass=2 fail=0 total=2"\nexit 0\n' > "$SAMPLE/src/test/t-ok.sh"
+printf 'echo "ITER_RESULT pass=0 fail=1 total=1"\nexit 1\n' > "$SAMPLE/src/test/t-bad.sh"
+chmod +x "$SAMPLE/src/test/"*.sh
+cat > "$SAMPLE/src/test/testgroup.iter.md" <<'TG'
+# sample tests
+
+<!-- iterapp:testgroups
+{"label":"green","desc":"passes","testlist":[{"id":"t-ok","name":"ok","desc":"","shell":"t-ok.sh"}]}
+{"label":"mixed","desc":"one red","testlist":[{"id":"t-ok","name":"ok","desc":"","shell":"t-ok.sh"},{"id":"t-bad","name":"bad","desc":"","shell":"t-bad.sh"}]}
+-->
+TG
+cat > "$SAMPLE/usecases/greet.usecase.iter.md" <<'UC'
+---
+name: greet
+children:
+  codenodes: []
+---
+# greet
+A user asks for a greeting.
+UC
+LV=(env ITER_TOPDIR="$SAMPLE" ITER_DATA_URL="$BASE" ITER_ENGINE_TOKEN="$ENGINE_TOKEN" ITER_PROJECT="$PROJECT" "$ENGINE_BIN" cli)
+# runtests: neutral green -> 0, mixed -> 1; the block's result/counts update
+"${LV[@]}" runtests --group green > "$SCRATCH/rt-green.txt" 2>&1 || fail "runtests green exit $? : $(cat "$SCRATCH/rt-green.txt")"
+grep -q 'tests 2/2 100% — testgroup "green" PASSED' "$SCRATCH/rt-green.txt" || { cat "$SCRATCH/rt-green.txt"; fail "runtests green output"; }
+RC=0; "${LV[@]}" runtests --group mixed > "$SCRATCH/rt-mixed.txt" 2>&1 || RC=$?; [ "$RC" = 1 ] || { cat "$SCRATCH/rt-mixed.txt"; fail "runtests mixed exit $RC (expected 1)"; }
+grep -q '"label":"mixed"' "$SAMPLE/src/test/testgroup.iter.md" && grep -q '"result":"failed"' "$SAMPLE/src/test/testgroup.iter.md" || fail "testgroup block not updated with the run"
+# claims inside a run: --fixed on a red group records a FALSE claim on the calling item (the close gate holds it)
+CL=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" -d '{"name":"claim holder","agent":"gatetest","priority":9,"lockdirs":["{topdir}/claim/"]}' | jq -r .id)
+RC=0; ITER_WORKID="$CL" "${LV[@]}" runtests --group mixed --fixed > "$SCRATCH/rt-fixed.txt" 2>&1 || RC=$?; [ "$RC" = 3 ] || { cat "$SCRATCH/rt-fixed.txt"; fail "false --fixed claim exit $RC (expected 3)"; }
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$CL/details" | jq -r '[.[]|select(.key=="claim")]|last|.value|"\(.claim) \(.upheld) \(.outcome)"')" = "fixed false failed" ] || fail "claim row not recorded"
+ITER_WORKID="$CL" "${LV[@]}" runtests --group green --fixed > /dev/null 2>&1 || fail "true --fixed claim should exit 0"
+# --broken on a green group = stale: parked with the reason
+RC=0; ITER_WORKID="$CL" "${LV[@]}" runtests --group green --broken > "$SCRATCH/rt-broken.txt" 2>&1 || RC=$?; [ "$RC" = 3 ] || fail "false --broken exit $RC (expected 3)"
+[ "$(st_of "$CL")" = parked ] || fail "stale --broken claim did not park the item (state $(st_of "$CL"))"
+# validate: template by role; a scan of the sample
+"${LV[@]}" validate --file "$SAMPLE/src/new.code.iter.md" --template > "$SCRATCH/val-tpl.txt" 2>&1 || fail "validate --template"
+grep -q "^---" "$SCRATCH/val-tpl.txt" || { cat "$SCRATCH/val-tpl.txt"; fail "template has no frontmatter"; }
+"${LV[@]}" validate > "$SCRATCH/val.txt" 2>&1 || true
+grep -q "^validate: [0-9]* file(s) checked" "$SCRATCH/val.txt" || { cat "$SCRATCH/val.txt"; fail "validate did not run"; }
+# markers: the scan as json; teststate --list; usecase --add/--list
+"${LV[@]}" markers > "$SCRATCH/markers.json" 2>&1 || fail "markers"
+jq -e '.testgroups|length>=1' "$SCRATCH/markers.json" >/dev/null 2>&1 || jq -e '.nodes' "$SCRATCH/markers.json" >/dev/null || { head -20 "$SCRATCH/markers.json"; fail "markers json"; }
+"${LV[@]}" teststate --list > "$SCRATCH/teststate.txt" 2>&1 || fail "teststate --list"
+grep -q "teststate (flag → effective)" "$SCRATCH/teststate.txt" || fail "teststate output"
+"${LV[@]}" usecase --file usecases/greet.usecase.iter.md --add "src/src.code.iter.md" > /dev/null 2>&1 || fail "usecase --add"
+[ "$("${LV[@]}" usecase --file usecases/greet.usecase.iter.md --list 2>/dev/null)" = "src/src.code.iter.md" ] || fail "usecase --list"
+# the V2-only verbs say so; nothing V2 is on the agent's environment
+{ "${LV[@]}" testsweep 2>&1 || true; } | grep -q "retired with the V2 binary" || fail "retired verb message"
+grep -q "ITER_V2" "$P1" && fail "prompt/env still mentions V2" || true
+pass "local-file verbs native to V3: runtests (neutral/claims -> claim rows, stale parks), validate (+template), markers, teststate, usecase; V2 verbs retired"
 # answered question flows back into the next run's mainwork
 QO=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC/details" | jq -r '[.[]|select(.key=="question")]|last|.order')
 curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GC/details" | jq -c "[.[]|select(.key==\"question\")]|last|.value.fields[0].value=\"blue\"|{key:\"question\",valuetype:\"json\",value:.value}" \

@@ -49,11 +49,10 @@ What the repo needs from the host (from its tests, scripts and CLAUDE.md):
   `corridor-dev1` is remote (EKS) and unaffected.
 - **python3** (the majority of test scripts), **jq**, **psql**
   (postgresql-client), **curl**, **aws** CLI with the deploy credentials.
-- The **V2 `iter` binary** at `devops/iter` is a macOS arm64 Mach-O. V3 delegates
-  `runtests`/`validate`/`markers`/`teststate`/`usecase` to it, so build a Linux
-  copy from this repo's root crate (`cargo build --release` → `target/release/iter`)
-  and place it at `devops/iter` on the server (it is a tracked file today; a
-  per-OS path or a `.gitattributes` split would be cleaner).
+- ~~The V2 `iter` binary at `devops/iter`~~ — no longer needed (2026-09-04):
+  V3 serves `runtests`/`validate`/`markers`/`teststate`/`usecase` itself
+  (`iter3/iter_local`). `devops/iter` and `devops/.iter/config.iter.json` can be
+  deleted from the project.
 
 Script fixes needed (grep `/Users/`, `/opt/homebrew` under `devops/script`):
 
@@ -72,8 +71,9 @@ Script fixes needed (grep `/Users/`, `/opt/homebrew` under `devops/script`):
   review before running on the server.
 
 Nothing in the Rust code, the testgroup layout, or the iter structure files
-is macOS-specific. The practical order: build the Linux `iter_engine` and
-V2 `iter`, install the toolchain + a local k8s, fix the five `REPO=` lines,
+is macOS-specific. The practical order: build the Linux `iter_engine`
+(`.iter/iter_engine` + `.iter/start_engine.sh` in the pdy-dev checkout do
+this), install the toolchain + a local k8s, fix the five `REPO=` lines,
 register `Ubuntu01`, assign pdy-dev to it, keep the Mac engine stopped (two
 engines serving one checkout on different machines would each run `git pull`
 against their own clone — fine — but the tree-lock semantics assume one

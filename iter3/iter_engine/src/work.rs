@@ -346,12 +346,6 @@ fn run_claude(
         let path = std::env::var("PATH").unwrap_or_default();
         envs.push(("PATH".into(), format!("{}:{}", dir.display(), path)));
     }
-    // V2 delegation for local-file verbs (runtests/validate/...): the V2 binary + its project root
-    if let Some((bin, root)) = v2_delegate(topdir) {
-        envs.push(("ITER_V2_BIN".into(), bin));
-        envs.push(("ITER_V2_PROJECT".into(), root));
-    }
-
     let extra: Vec<String> = flags.split_whitespace().map(String::from).collect();
     let mut session = Session { sid: String::new(), cwd: codepath.to_string_lossy().into_owned(), model, extra, envs, timeout, account: account.to_string() };
     if !std::path::Path::new(&session.cwd).is_dir() {
@@ -445,21 +439,6 @@ fn write_iter_shim(topdir: &str) -> Result<String, String> {
         let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
     }
     Ok(shim.to_string_lossy().into_owned())
-}
-
-/// The V2 binary + project root when the repo still carries them
-/// (`{topdir}/devops/iter` + `{topdir}/devops`), for the local-file verbs V3
-/// has not re-implemented (runtests, validate, markers, teststate, usecase…).
-fn v2_delegate(topdir: &str) -> Option<(String, String)> {
-    if let Ok(b) = std::env::var("ITER_V2_BIN") {
-        let root = std::env::var("ITER_V2_PROJECT").unwrap_or_else(|_| topdir.to_string());
-        return Some((b, root));
-    }
-    let cand = std::path::Path::new(topdir).join("devops").join("iter");
-    if cand.is_file() {
-        return Some((cand.to_string_lossy().into_owned(), cand.parent().unwrap().to_string_lossy().into_owned()));
-    }
-    None
 }
 
 /// Parse `--output-format stream-json` output: one JSON object per line.
@@ -795,6 +774,18 @@ fn run_gate(api: &Api, project: &Project, item: &WorkItem, out: &RunOut, ctx: &G
     }
     if ctx.gate.requires_children && ev.children == 0 {
         open.push("no workitems were created by this item (closegate.requires_children)".into());
+    }
+    // `iter runtests --fixed` is the TDD completion gate: the LAST fixed-claim
+    // must have been upheld (a later upheld claim clears an earlier false one)
+    if let Some(c) = gate::last_fixed_claim(&ctx.details) {
+        if !c.get("upheld").and_then(|b| b.as_bool()).unwrap_or(false) {
+            open.push(format!(
+                "the last `iter runtests --fixed` claim was FALSE: testgroup \"{}\" is {} ({})",
+                c.get("group").and_then(|g| g.as_str()).unwrap_or("?"),
+                c.get("outcome").and_then(|o| o.as_str()).unwrap_or("?"),
+                c.get("counts").and_then(|o| o.as_str()).unwrap_or("?")
+            ));
+        }
     }
     if ctx.gate.requires_commit && !ev.committed() {
         open.push("no new git commit was produced (closegate.requires_commit)".into());

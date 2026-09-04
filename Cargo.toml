@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "iter3/iter_core", "iter3/iter_data", "iter3/iter_engine"]
+members = [".", "iter3/iter_core", "iter3/iter_data", "iter3/iter_engine", "iter3/iter_local"]
 resolver = "2"
 
 [package]

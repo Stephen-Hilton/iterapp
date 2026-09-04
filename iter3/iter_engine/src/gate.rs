@@ -209,6 +209,17 @@ fn human_guidance(details: &[Value]) -> Option<String> {
     Some(g)
 }
 
+/// The latest "claim" row whose claim is "fixed" (`iter runtests --fixed`):
+/// {group, claim, upheld, outcome, counts, ts}.
+pub fn last_fixed_claim(details: &[Value]) -> Option<&Value> {
+    details
+        .iter()
+        .filter(|d| d.get("key").and_then(|k| k.as_str()) == Some("claim"))
+        .filter(|d| d.get("value").and_then(|v| v.get("claim")).and_then(|c| c.as_str()) == Some("fixed"))
+        .max_by_key(|d| d.get("order").and_then(|o| o.as_i64()).unwrap_or(0))
+        .and_then(|d| d.get("value"))
+}
+
 /// "review" rows (valuetype json) lacking a non-empty "disposition".
 pub fn open_reviews(details: &[Value]) -> usize {
     details

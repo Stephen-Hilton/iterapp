@@ -1714,11 +1714,22 @@ dependencies = [
  "ed25519-dalek",
  "glob",
  "iter_core",
+ "iter_local",
  "rand 0.8.8",
  "reqwest",
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "iter_local"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "glob",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
