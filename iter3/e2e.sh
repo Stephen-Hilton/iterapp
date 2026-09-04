@@ -372,6 +372,13 @@ ST=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WD" | jq -r .
 [ "$ST" = queued ] || fail "approved item state=$ST (expected queued)"
 pass "adduser + signed approval flow (item re-queued)"
 
+# ---- user timezone (2026-09-04): stored on the user record, echoed by login; data stays UTC ----
+curl -sf "${AUTH[@]}" "$BASE/api/users/admin" | jq '.timezone="America/Los_Angeles"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/users/admin" -d @- >/dev/null || fail "self timezone put"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/users/admin" | jq -r .timezone)" = "America/Los_Angeles" ] || fail "timezone not stored"
+LOGIN2=$(curl -s -X POST "$BASE/auth/login" -H content-type:application/json -d "{\"user\":\"admin\",\"password\":\"$PASS_ADMIN\"}")
+[ "$(echo "$LOGIN2" | jq -r .timezone)" = "America/Los_Angeles" ] || fail "login does not echo the timezone: $LOGIN2"
+pass "user timezone: stored on the record (self-service PUT), echoed by login"
+
 # widget helper
 echo '{"title":"t","fields":[{"key":"a","type":"text","value":""}]}' > "$SCRATCH/w.json"
 "$ENGINE_BIN" --question-widget "$SCRATCH/w.json" | grep -q "OK" || fail "--question-widget valid case"

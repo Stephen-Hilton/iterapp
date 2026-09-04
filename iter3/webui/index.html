@@ -16,6 +16,8 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system
 #brandrow{display:flex;align-items:center;gap:16px;padding:8px 18px}
 #brandrow h1{font-size:16px;margin:0;letter-spacing:.06em}
 #brandrow .who{margin-left:auto;color:var(--dim)}
+#brandrow #tz{max-width:170px;font-size:12px;padding:3px 6px}
+#nav-toggle{display:none;font-size:16px;padding:2px 9px}
 #counts{display:flex;gap:8px;align-items:center;padding:0 18px 10px;overflow-x:auto}
 #counts .tools{margin-left:auto;display:flex;gap:8px;align-items:center;flex:none}
 .count{display:flex;align-items:baseline;gap:6px;padding:4px 12px;border:1px solid var(--line);
@@ -25,15 +27,18 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system
 .count.zero{opacity:.38}
 .count.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
 .count.total b{color:var(--text)}
-.count.c-inprogress b{color:var(--ok)}.count.c-queued b{color:var(--accent)}
+.count.c-in-progress b{color:#f2d24b}.count.c-queued b{color:var(--accent)}
 .count.c-question b{color:var(--q)}.count.c-failed b{color:var(--bad)}
-.count.c-complete b{color:#7fae8c}.count.c-parked b,.count.c-paused b{color:var(--warn)}
+.count.c-complete b{color:#7fae8c}.count.c-parked b{color:#f0913a}.count.c-paused b{color:#d9772a}
 .count.c-scheduled b{color:#9fd3e8}
 
 /* ---- layout: left pane + main ---- */
 #layout{display:flex;align-items:flex-start;gap:0;min-height:calc(100vh - 90px)}
-aside{width:240px;flex:none;border-right:1px solid var(--line);padding:14px;position:sticky;top:90px;
+aside{width:var(--aside-w,240px);min-width:160px;max-width:60vw;flex:none;border-right:1px solid var(--line);padding:14px;position:sticky;top:90px;
   max-height:calc(100vh - 90px);overflow-y:auto}
+#aside-grip{flex:none;width:6px;cursor:col-resize;align-self:stretch;position:sticky;top:90px;max-height:calc(100vh - 90px);margin-left:-3px;z-index:2}
+#aside-grip:hover,#aside-grip.dragging{background:var(--accent);opacity:.5}
+body.resizing{cursor:col-resize;user-select:none}
 main{flex:1;padding:14px 18px;min-width:0}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:0 0 8px}
 .side-section{margin-bottom:22px}
@@ -156,15 +161,15 @@ a{color:var(--accent)}
   #counts .tools select{max-width:140px;padding:4px 6px;font-size:13px}
   #brandrow button{padding:4px 10px;font-size:13px}
   #layout{display:block !important;min-height:0}
-  aside{width:auto;position:static;max-height:none;border-right:0;border-bottom:1px solid var(--line);
-    padding:8px 12px;display:flex;gap:14px;overflow-x:auto}
-  .side-section{margin:0;flex:none}
-  #projects{display:flex;gap:6px}
-  .proj{width:auto;white-space:nowrap;padding:4px 9px}
-  .proj .kv{display:inline;margin-left:6px}
-  #engines,#agents{display:flex;gap:10px}
-  .eng{border-top:0;white-space:nowrap;padding:2px 0}
-  .eng br{display:none}
+  #aside-grip{display:none}
+  /* left nav: an off-canvas drawer (hidden by default; ☰ in the header opens it) */
+  aside{position:fixed;top:0;left:0;bottom:0;z-index:300;width:min(84vw,320px);max-width:none;max-height:none;
+    padding:14px 14px calc(14px + env(safe-area-inset-bottom));border-right:1px solid var(--line);background:var(--panel);
+    overflow-y:auto;transform:translateX(-102%);transition:transform .18s ease-out;box-shadow:0 0 24px rgba(0,0,0,.5)}
+  body.nav-open aside{transform:none}
+  #aside-backdrop{display:none;position:fixed;inset:0;z-index:299;background:rgba(0,0,0,.5)}
+  body.nav-open #aside-backdrop{display:block}
+  #nav-toggle{display:inline-block}
   main{padding:10px 12px}
   #viewnote{display:block;width:100%}
   /* rows: name on top, meta strip below */
@@ -197,10 +202,12 @@ a{color:var(--accent)}
 <body>
 <div id="top" style="display:none">
   <div id="brandrow">
+    <button class="ghost" id="nav-toggle" title="projects / engines / agents" aria-label="open the left nav">☰</button>
     <h1>ITER</h1>
     <span class="kv" id="backend"></span>
     <span id="projctl" class="segwrap"></span>
     <span class="who" id="who"></span>
+    <select id="tz" title="timezone for every timestamp shown (stored on your user record; the data itself is UTC)"></select>
     <button class="gear" id="user-gear" title="my settings">⚙</button>
     <button class="ghost" id="logout">logout</button>
   </div>
@@ -252,6 +259,8 @@ a{color:var(--accent)}
       <div id="tooling"></div>
     </div>
   </aside>
+  <div id="aside-grip" title="drag to resize"></div>
+  <div id="aside-backdrop"></div>
   <main>
     <div id="toolbar">
       <h2 style="margin:0">Workitems <span class="kv" id="wi-proj"></span></h2>
@@ -283,12 +292,36 @@ async function api(path,opts={}){
   return body;
 }
 function esc(s){const d=document.createElement("div");d.textContent=s==null?"":String(s);return d.innerHTML;}
+/* ---- timezone: everything is stored in UTC; the webui renders in the user's zone ---- */
+const TZ_CHOICES=[["","browser default"],["UTC","UTC"],
+  ["Pacific/Honolulu","Honolulu (HST)"],["America/Anchorage","Anchorage (AKT)"],["America/Los_Angeles","Los Angeles (PT)"],["America/Denver","Denver (MT)"],["America/Phoenix","Phoenix (MST)"],["America/Chicago","Chicago (CT)"],["America/New_York","New York (ET)"],["America/Toronto","Toronto (ET)"],["America/Mexico_City","Mexico City"],["America/Bogota","Bogotá"],["America/Lima","Lima"],["America/Santiago","Santiago"],["America/Sao_Paulo","São Paulo"],["America/Argentina/Buenos_Aires","Buenos Aires"],
+  ["Europe/London","London (GMT/BST)"],["Europe/Dublin","Dublin"],["Europe/Lisbon","Lisbon"],["Europe/Paris","Paris (CET)"],["Europe/Berlin","Berlin (CET)"],["Europe/Madrid","Madrid"],["Europe/Rome","Rome"],["Europe/Amsterdam","Amsterdam"],["Europe/Zurich","Zurich"],["Europe/Stockholm","Stockholm"],["Europe/Warsaw","Warsaw"],["Europe/Athens","Athens (EET)"],["Europe/Istanbul","Istanbul"],["Europe/Moscow","Moscow"],
+  ["Africa/Cairo","Cairo"],["Africa/Johannesburg","Johannesburg"],["Africa/Lagos","Lagos"],["Africa/Nairobi","Nairobi"],
+  ["Asia/Dubai","Dubai (GST)"],["Asia/Riyadh","Riyadh (AST)"],["Asia/Tehran","Tehran"],["Asia/Karachi","Karachi"],["Asia/Kolkata","India (IST)"],["Asia/Dhaka","Dhaka"],["Asia/Bangkok","Bangkok"],["Asia/Jakarta","Jakarta"],["Asia/Singapore","Singapore"],["Asia/Hong_Kong","Hong Kong"],["Asia/Shanghai","Shanghai (CST)"],["Asia/Taipei","Taipei"],["Asia/Manila","Manila"],["Asia/Seoul","Seoul (KST)"],["Asia/Tokyo","Tokyo (JST)"],
+  ["Australia/Perth","Perth (AWST)"],["Australia/Adelaide","Adelaide"],["Australia/Brisbane","Brisbane"],["Australia/Sydney","Sydney (AEST)"],["Australia/Melbourne","Melbourne"],["Pacific/Auckland","Auckland (NZST)"]];
+let userTz="";
+function tzValid(tz){try{new Intl.DateTimeFormat("en-US",{timeZone:tz});return true;}catch(e){return false;}}
+function setTz(tz){userTz=tzValid(tz)?tz:"";try{if(userTz)localStorage.setItem("iter_tz",userTz);else localStorage.removeItem("iter_tz");}catch(e){}
+  const sel=$("#tz");if(sel){sel.innerHTML=TZ_CHOICES.map(([v,l])=>`<option value="${esc(v)}" ${v===userTz?"selected":""}>${esc(l)}</option>`).join("");}}
+const tzParts=(()=>{const cache={};return d=>{const key=userTz||"_";
+  if(!cache[key])cache[key]=new Intl.DateTimeFormat("en-US",{...(userTz?{timeZone:userTz}:{}),month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false,timeZoneName:"short"});
+  const o={};cache[key].formatToParts(d).forEach(p=>{o[p.type]=p.value;});return o;};})();
+/* "MM-DD HH:mm" in the user's zone (ISO/UTC in, never shown raw) */
 function fmtTs(iso){
   if(!iso)return "";
   const d=new Date(iso);
   if(isNaN(d))return "";
-  const p=n=>String(n).padStart(2,"0");
-  return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  const o=tzParts(d);
+  return `${o.month}-${o.day} ${o.hour==="24"?"00":o.hour}:${o.minute}`;
+}
+function tzAbbrev(){return tzParts(new Date()).timeZoneName||"";}
+/* time until a unix-seconds instant: "2hr 23min", "3d 18hr 30min"; past -> "resetting…" */
+function fmtDur(epochSec){
+  if(!epochSec)return "—";
+  let s=Math.round(epochSec-Date.now()/1000);
+  if(s<=0)return "resetting…";
+  const d=Math.floor(s/86400);s-=d*86400;const h=Math.floor(s/3600);s-=h*3600;const m=Math.floor(s/60);
+  return (d?`${d}d `:"")+(d||h?`${h}hr `:"")+`${m}min`;
 }
 const P=name=>`/api/projects/${encodeURIComponent(project)}/workitems${name?"/"+name:""}`;
 function tagColor(t){
@@ -312,6 +345,20 @@ function tagsHtml(i){
 
 async function boot(){
   try{const h=await fetch("/health").then(r=>r.json());$("#backend").textContent="data: "+h.backend;}catch(e){}
+  try{setTz(localStorage.getItem("iter_tz")||"");}catch(e){}
+  try{const w=parseInt(localStorage.getItem("iter_aside_w"));if(w>=160)document.documentElement.style.setProperty("--aside-w",w+"px");}catch(e){}
+  (()=>{const nav=v=>document.body.classList.toggle("nav-open",v);
+    $("#nav-toggle").onclick=()=>nav(!document.body.classList.contains("nav-open"));
+    $("#aside-backdrop").onclick=()=>nav(false);
+    document.querySelector("aside").addEventListener("click",e=>{if(e.target.closest(".proj"))nav(false);});
+    document.addEventListener("keydown",e=>{if(e.key==="Escape"&&document.body.classList.contains("nav-open"))nav(false);});})();
+  (()=>{const grip=$("#aside-grip"),aside=document.querySelector("aside");if(!grip||!aside)return;
+    grip.onpointerdown=e=>{e.preventDefault();grip.setPointerCapture(e.pointerId);grip.classList.add("dragging");document.body.classList.add("resizing");
+      const x0=e.clientX,w0=aside.getBoundingClientRect().width;
+      grip.onpointermove=ev=>{const w=Math.max(160,Math.min(window.innerWidth*0.6,w0+ev.clientX-x0));document.documentElement.style.setProperty("--aside-w",w+"px");};
+      grip.onpointerup=grip.onpointercancel=()=>{grip.onpointermove=null;grip.classList.remove("dragging");document.body.classList.remove("resizing");
+        try{localStorage.setItem("iter_aside_w",String(Math.round(aside.getBoundingClientRect().width)));}catch(e){}};};
+    grip.ondblclick=()=>{document.documentElement.style.removeProperty("--aside-w");try{localStorage.removeItem("iter_aside_w");}catch(e){}};})();
   try{token=localStorage.getItem("iter_token");me=localStorage.getItem("iter_user");myRole=localStorage.getItem("iter_role")||"";
       const s=localStorage.getItem("iter_sort");if(s)$("#sort").value=s;}catch(e){}
   if(token){try{await load();return;}catch(e){token=null;}}
@@ -322,6 +369,7 @@ $("#li-go").onclick=async()=>{
     const r=await api("/auth/login",{method:"POST",body:JSON.stringify({user:$("#li-user").value,password:$("#li-pass").value})});
     token=r.token;me=r.user;myRole=r.role||"";
     try{localStorage.setItem("iter_token",token);localStorage.setItem("iter_user",me);localStorage.setItem("iter_role",myRole);}catch(e){}
+    if(typeof r.timezone==="string"&&r.timezone)setTz(r.timezone);
     await load();
   }catch(e){$("#li-err").textContent="login failed";}
 };
@@ -356,6 +404,14 @@ async function load(){
     me?api("/api/users/"+encodeURIComponent(me)).catch(()=>null):null]);
   agentsCache=agents;
   if(meRow&&meRow.role){myRole=meRow.role;try{localStorage.setItem("iter_role",myRole);}catch(e){}}
+  if(meRow&&typeof meRow.timezone==="string"&&meRow.timezone!==userTz)setTz(meRow.timezone);
+  else if(!$("#tz").options.length)setTz(userTz);
+  $("#tz").onchange=async()=>{
+    setTz($("#tz").value);
+    if(me){try{const fresh=await api("/api/users/"+encodeURIComponent(me));fresh.timezone=userTz;
+      await api("/api/users/"+encodeURIComponent(me),{method:"PUT",body:JSON.stringify(fresh)});}catch(e){}}
+    load();
+  };
   $("#who").textContent=(me||"")+(myRole?" · "+myRole:"");
   projects.sort((a,b)=>a.name.localeCompare(b.name,undefined,{sensitivity:"base"}));
   try{const lp=localStorage.getItem("iter_project");if(lp&&!project&&projects.some(p=>p.name===lp))project=lp;}catch(e){}
@@ -369,12 +425,14 @@ async function load(){
     const seen=e.last_seen?Date.parse(e.last_seen):0;
     const alive=seen&&(now-seen)<3*(e.ticksec||5)*1000+5000;
     const u=e.usage;
-    const usage=u?`5h <b>${esc(Math.round(u.five_hour_pct))}%</b> · 7d <b>${esc(Math.round(u.seven_day_pct))}%</b>${u.is_using_overage?` <b title="a window is exhausted and requests are billing as extra usage">OVERAGE</b>`:""}${u.age_sec!=null&&u.age_sec>900?` <span title="snapshot age">(${esc(Math.round(u.age_sec/60))}m old)</span>`:""}`:"usage: —";
+    const win=(label,pct,reset)=>`<br>• ${label} <b>${esc(Math.round(pct||0))}%</b> – <span title="resets ${esc(fmtTs(reset?new Date(reset*1000).toISOString():""))} ${esc(tzAbbrev())}">${esc(fmtDur(reset))}</span>`;
+    const usage=u?win("5h",u.five_hour_pct,u.five_hour_resets_at)+win("7d",u.seven_day_pct,u.seven_day_resets_at)
+      +(u.is_using_overage?`<br>• <b title="a window is exhausted and requests are billing as extra usage">OVERAGE</b>`:"")
+      +(u.age_sec!=null&&u.age_sec>900?`<br><span class="kv" title="snapshot age">usage snapshot ${esc(Math.round(u.age_sec/60))}m old</span>`:""):"<br>• usage: —";
     const t=e.test_result;
     const test=e.test_requested?`<span class="kv" data-testing="${esc(e.name)}">testing…</span>`
       :t?`<span class="kv" title="${esc(t.error||t.text||"")}">${t.ok?"✓":"✗"} ${esc(fmtTs(t.ts))}${t.ms?" "+(t.ms/1000).toFixed(1)+"s":""}${t.error?" "+esc(String(t.error).slice(0,40)):""}</span>`:"";
-    return `<div class="eng"><button class="gear" data-gear="engine" data-name="${esc(e.name)}" title="engine settings">⚙</button><span class="dot ${alive?"on":"off"}"></span><b>${esc(e.name)}</b> ${esc(e.state)}${alive?"":" (offline)"}
-      <br>acct: <b>${esc(e.account||"default")}</b> · ${usage}
+    return `<div class="eng"><button class="gear" data-gear="engine" data-name="${esc(e.name)}" title="engine settings">⚙</button><span class="dot ${alive?"on":"off"}"></span><b>${esc(e.name)}</b> ${esc(e.state)}${alive?"":" (offline)"} on <b>${esc(e.account||"default")}</b>${usage}
       <br>seen: ${esc(fmtTs(e.last_seen)||"never")} · ${esc(e.host||"?")}
       <br>serves: ${esc(Object.keys(e.projects||{}).join(", ")||"—")}
       <br><button class="ghost sm" data-test="${esc(e.name)}" ${e.test_requested?"disabled":""}>test</button> ${test}</div>`;

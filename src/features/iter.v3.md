@@ -508,6 +508,9 @@ Please create a small helper function called `iter --accounts` that attempt to r
 
 ## ITER_WEBUI
 
+### Timezones (decided 2026-09-04)
+Every timestamp is stored and transported in UTC (ISO 8601 `Z`, or unix seconds for the usage resets); nothing on the engine or in iter_data ever converts. The webui renders every timestamp in the **user's timezone**: a dedicated selector in the header (major IANA zones + "browser default") writes `timezone` on the user's own `webui_user` record (self-service PUT; login echoes it), cached in localStorage so the first paint is right. The engine chip reads `Engine01 Running on Dev2`, then one line per window — `• 5h 5% – 2hr 23min` / `• 7d 89% – 3d 18hr 30min` — the time until each window resets (the reset instant, in the user's zone, on hover).
+
 PRINCIPLE (decided 2026-09-01): iter_webui is THIN.  The state machine — legal state transitions, schedule-spawn dedup, approval verification, queue-action rules — lives exclusively in iter_data handlers, so webui, engine, and the future MCP layer all get identical behavior for free.  iter_webui is static assets plus a trivial serving wrapper, run with `--local` or `--server` flags; both talk to the same iter_data API, and Cognito-vs-JWT, hosting, and storage details never leak into it.
 
 This is basically the same as current-state, with a few enhancements:

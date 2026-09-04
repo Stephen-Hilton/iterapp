@@ -200,7 +200,7 @@ async fn login(State(st): Ctx, Json(req): Json<LoginReq>) -> Result<Json<Value>,
     let tokenver = body_u64(&row, "tokenver").max(1);
     let token = auth::mint_token(&st.secret, &req.user, &role, tokenver, 24 * 3600)
         .map_err(|e| ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(json!({"token": token, "role": role, "user": req.user})))
+    Ok(Json(json!({"token": token, "role": role, "user": req.user, "timezone": body_str(&row, "timezone")})))
 }
 
 // ---------- users ----------

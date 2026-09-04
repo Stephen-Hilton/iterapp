@@ -425,6 +425,10 @@ pub struct WebuiUser {
     pub tokenver: u64,
     #[serde(default)]
     pub css: String,
+    /// IANA zone the webui renders every (UTC-stored) timestamp in for this
+    /// user, e.g. "America/Los_Angeles"; "" = the browser's zone
+    #[serde(default)]
+    pub timezone: String,
     #[serde(default)]
     pub pubkey: String,
     #[serde(default)]
