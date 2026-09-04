@@ -1025,12 +1025,19 @@ async function toolingSettings(name){
 }
 async function engineSettings(name){
   const rec=await api("/api/engines/"+encodeURIComponent(name));
+  const extra=isAdmin()?`<div style="margin-top:18px;border-top:1px solid var(--line);padding-top:12px;text-align:right"><button class="ghost sm" id="eng-del" style="color:var(--bad);border-color:var(--bad)">delete engine record…</button></div>`:"";
   settingsBox(`Engine — ${name}`,ENGINE_FIELDS,rec,async(vals)=>{
     const fresh=await api("/api/engines/"+encodeURIComponent(name));
     Object.assign(fresh,vals);
     await api("/api/engines/"+encodeURIComponent(name),{method:"PUT",body:JSON.stringify(fresh)});
     sdlg.close();await load();
-  },{note:"state, last seen and account are written by the engine itself every tick; everything else is yours to set."});
+  },{extra,note:"state, last seen and account are written by the engine itself every tick; everything else is yours to set."});
+  const del=sdlg.querySelector("#eng-del");
+  if(del)del.onclick=async()=>{
+    if(!confirm(`Delete the engine record "${name}"? Only for an engine that is stopped or renamed — a heartbeating engine is refused. Projects listing it are updated.`))return;
+    try{await api("/api/engines/"+encodeURIComponent(name),{method:"DELETE"});sdlg.close();await load();}
+    catch(e){sdlg.querySelector("#sf-err").textContent="delete failed: "+e.message;}
+  };
 }
 async function userSettings(name){
   const self=name===me;

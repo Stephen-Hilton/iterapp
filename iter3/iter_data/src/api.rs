@@ -147,7 +147,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/prepostwork/{projectname}/{name}", put(prepostwork_put))
         // engines
         .route("/api/engines", get(engines_list))
-        .route("/api/engines/{name}", get(engine_get).put(engine_put))
+        .route("/api/engines/{name}", get(engine_get).put(engine_put).delete(engine_delete))
         .route("/api/engines/{name}/heartbeat", post(engine_heartbeat))
         .route("/api/engines/{name}/test", post(engine_test))
         // workitems
@@ -657,6 +657,33 @@ async fn engine_test(user: AuthUser, State(st): Ctx, Path(name): Path<String>) -
     st.store.put("engine", &name, NOSK, &row).await?;
     st.store.bump_seq(GLOBAL, "engine").await?;
     Ok(Json(json!({"requested": ts})))
+}
+
+/// Remove an engine record (admin). A record that heartbeated within three
+/// ticks is alive and refused: stop the engine first. Any project listing the
+/// engine drops it from its `engines` list.
+async fn engine_delete(user: AuthUser, State(st): Ctx, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    user.require_admin()?;
+    let row = st.store.get("engine", &name, NOSK).await?.ok_or_else(notfound)?;
+    let tick = row.get("ticksec").and_then(|t| t.as_i64()).unwrap_or(5).max(1);
+    let alive = chrono::DateTime::parse_from_rfc3339(&body_str(&row, "last_seen"))
+        .map(|seen| (chrono::Utc::now() - seen.with_timezone(&chrono::Utc)).num_seconds() <= 3 * tick + 5)
+        .unwrap_or(false);
+    if alive {
+        return Err(ApiError::Status(StatusCode::CONFLICT, format!("engine '{name}' is heartbeating — stop it before deleting its record")));
+    }
+    let deleted = st.store.delete("engine", &name, NOSK).await?;
+    st.store.bump_seq(GLOBAL, "engine").await?;
+    for mut p in st.store.scan("project").await? {
+        let list: Vec<Value> = p.get("engines").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+        if list.iter().any(|e| e.as_str() == Some(name.as_str())) {
+            let pname = body_str(&p, "name");
+            p["engines"] = Value::Array(list.into_iter().filter(|e| e.as_str() != Some(name.as_str())).collect());
+            st.store.put("project", &pname, NOSK, &p).await?;
+            st.store.bump_seq(&pname, "project").await?;
+        }
+    }
+    Ok(Json(json!({"deleted": deleted})))
 }
 
 async fn engine_heartbeat(

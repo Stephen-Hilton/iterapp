@@ -276,7 +276,11 @@ impl EngineRuntime {
     fn tick(&mut self, engine: &Engine) {
         self.prune_running();
 
-        // account selection: exclusion-with-fallback against other Running engines
+        // account selection: exclusion-with-fallback against other LIVE engines —
+        // "Running" per the record AND heartbeated within three ticks (fixed
+        // 2026-09-04: a killed engine never writes Stopped, so its stale record
+        // kept reserving its account forever)
+        let now_ts = chrono::Utc::now();
         let in_use: Vec<String> = self
             .api
             .get("/api/engines")
@@ -287,6 +291,14 @@ impl EngineRuntime {
             .filter(|e| {
                 e.get("name").and_then(|n| n.as_str()) != Some(self.name.as_str())
                     && e.get("state").and_then(|s| s.as_str()) == Some("Running")
+                    && {
+                        let tick = e.get("ticksec").and_then(|t| t.as_i64()).unwrap_or(5).max(1);
+                        e.get("last_seen")
+                            .and_then(|s| s.as_str())
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|seen| (now_ts - seen.with_timezone(&chrono::Utc)).num_seconds() <= 3 * tick + 5)
+                            .unwrap_or(false)
+                    }
             })
             .filter_map(|e| e.get("account").and_then(|a| a.as_str()).map(String::from))
             .filter(|a| !a.is_empty())

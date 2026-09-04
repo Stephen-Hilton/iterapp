@@ -712,7 +712,14 @@ fn add(
     }
     let shallow = depends_on_shallow || f.get("depends_on_shallow").and_then(|b| b.as_bool()).unwrap_or(false) || f.get("blockedby_shallow").and_then(|b| b.as_bool()).unwrap_or(false);
     let ctx = if context.is_empty() { arr(&f, &["context"]) } else { context.clone() };
-    let question = question.clone().or_else(|| { let q = s(&f, &["question"]); if q.is_empty() { None } else { Some(q) } });
+    // `@path` reads the question from a file, exactly like --mainwork (fixed
+    // 2026-09-04: a question filed as "@/tmp/q.md" used to store that literal
+    // string, and the file stayed behind on the engine's machine)
+    let question = question
+        .clone()
+        .map(|q| read_arg_or_file(Some(q), None))
+        .or_else(|| { let q = s(&f, &["question"]); if q.is_empty() { None } else { Some(read_arg_or_file(Some(q), None)) } })
+        .filter(|q| !q.trim().is_empty());
     let model = model.clone().unwrap_or_else(|| s(&f, &["model"]));
     let prio = priority.or_else(|| f.get("priority").and_then(|p| p.as_i64())).unwrap_or(5);
     let mut tags: Vec<Value> = tag

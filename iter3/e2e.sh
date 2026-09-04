@@ -700,6 +700,13 @@ jq -e '.testgroups|length>=1' "$SCRATCH/markers.json" >/dev/null 2>&1 || jq -e '
 grep -q "teststate (flag → effective)" "$SCRATCH/teststate.txt" || fail "teststate output"
 "${LV[@]}" usecase --file usecases/greet.usecase.iter.md --add "src/src.code.iter.md" > /dev/null 2>&1 || fail "usecase --add"
 [ "$("${LV[@]}" usecase --file usecases/greet.usecase.iter.md --list 2>/dev/null)" = "src/src.code.iter.md" ] || fail "usecase --list"
+# add --question @file stores the FILE's text (not the path) — the widget's title is its first line
+printf 'Situation. The cache has no memory alarm.\n\nThe decision needed: may it open a metrics port?\n' > "$SCRATCH/q.md"
+QF=$("${LV[@]}" add --type code --title "question by file" --mainwork "build it" --question "@$SCRATCH/q.md" 2>&1 | sed -n 's/^added \([^ ]*\).*/\1/p' | head -1)
+[ -n "$QF" ] || fail "add --question @file did not add"
+QW=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems" | jq -r --arg n "question by file" '.[]|select(.name==$n)|.id' | head -1)
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$QW/details" | jq -r '[.[]|select(.key=="question")][0].value.title')" = "Situation. The cache has no memory alarm." ] || fail "question widget stored the path, not the file text"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$QW/details" | jq -r '[.[]|select(.key=="question")][0].value.detail' | grep -c "metrics port")" = 1 ] || fail "question detail lacks the file body"
 # the V2-only verbs say so; nothing V2 is on the agent's environment
 { "${LV[@]}" testsweep 2>&1 || true; } | grep -q "retired with the V2 binary" || fail "retired verb message"
 grep -q "ITER_V2" "$P1" && fail "prompt/env still mentions V2" || true
@@ -728,6 +735,16 @@ EOF
 grep -q "registered 'EngineNew'" "$SCRATCH/engine-selfreg.log" || { cat "$SCRATCH/engine-selfreg.log"; fail "engine did not self-register"; }
 [ "$(curl -sf "${AUTH[@]}" "$BASE/api/engines/EngineNew" | jq -r .name)" = EngineNew ] || fail "self-registered engine record missing"
 pass "engine self-registers on first start"
+# delete: refused while heartbeating (409), allowed once stale; the project's engines list drops it
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.engines += ["Ghost"]' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
+curl -sf "${AUTH[@]}" -X PUT "$BASE/api/engines/Ghost" -d "{\"host\":\"x\",\"state\":\"Running\",\"ticksec\":5,\"last_seen\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"projects\":{}}" >/dev/null || fail "ghost engine put"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X DELETE "$BASE/api/engines/Ghost"); [ "$CODE" = 409 ] || fail "deleting a heartbeating engine should be 409 (got $CODE)"
+curl -sf "${AUTH[@]}" "$BASE/api/engines/Ghost" | jq '.last_seen="2000-01-01T00:00:00Z"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/engines/Ghost" -d @- >/dev/null
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $ENGINE_TOKEN" -X DELETE "$BASE/api/engines/Ghost"); [ "$CODE" = 403 ] || fail "engine role deleted an engine (HTTP $CODE)"
+curl -sf "${AUTH[@]}" -X DELETE "$BASE/api/engines/Ghost" >/dev/null || fail "delete stale engine"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/api/engines/Ghost")" = 404 ] || fail "ghost engine still there"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq -e '.engines|index("Ghost")|not' >/dev/null || fail "project still lists the deleted engine"
+pass "engine record delete: admin-only, refused while heartbeating, project engine lists cleaned"
 
 # ---- spend recording + daily cap (2026-09-04) ----
 SP=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/spend")
