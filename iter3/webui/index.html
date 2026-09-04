@@ -369,7 +369,7 @@ async function load(){
     const seen=e.last_seen?Date.parse(e.last_seen):0;
     const alive=seen&&(now-seen)<3*(e.ticksec||5)*1000+5000;
     const u=e.usage;
-    const usage=u?`5h <b>${esc(Math.round(u.five_hour_pct))}%</b> · 7d <b>${esc(Math.round(u.seven_day_pct))}%</b>${u.age_sec!=null&&u.age_sec>900?` <span title="snapshot age">(${esc(Math.round(u.age_sec/60))}m old)</span>`:""}`:"usage: —";
+    const usage=u?`5h <b>${esc(Math.round(u.five_hour_pct))}%</b> · 7d <b>${esc(Math.round(u.seven_day_pct))}%</b>${u.is_using_overage?` <b title="a window is exhausted and requests are billing as extra usage">OVERAGE</b>`:""}${u.age_sec!=null&&u.age_sec>900?` <span title="snapshot age">(${esc(Math.round(u.age_sec/60))}m old)</span>`:""}`:"usage: —";
     const t=e.test_result;
     const test=e.test_requested?`<span class="kv" data-testing="${esc(e.name)}">testing…</span>`
       :t?`<span class="kv" title="${esc(t.error||t.text||"")}">${t.ok?"✓":"✗"} ${esc(fmtTs(t.ts))}${t.ms?" "+(t.ms/1000).toFixed(1)+"s":""}${t.error?" "+esc(String(t.error).slice(0,40)):""}</span>`:"";
@@ -551,7 +551,7 @@ function comparator(mode,byId){
 /* depth = how far down the dependency/creation tree this item sits; 22px per level,
    no cap — a deep chain is supposed to look deep */
 function tileHtml(i,depth){
-  const att=(i.attempt>0?` <span class="att">(A${esc(i.attempt)})</span>`:"")+(i.run_now&&i.state==="queued"?` <span class="att" title="run-now override requested">▶ run now</span>`:"")+(i.stop_requested&&i.state==="in-progress"?` <span class="att" style="color:var(--bad)">■ stopping</span>`:"");
+  const att=(i.attempt>0?` <span class="att">(A${esc(i.attempt)})</span>`:"")+(i.run_now&&i.state==="queued"?` <span class="att" title="run-now override requested">▶ run now</span>`:"")+(i.stop_requested&&i.state==="in-progress"?` <span class="att" style="color:var(--bad)">■ stopping</span>`:"")+(i.explain_requested?` <span class="att" title="ELI5 requested — the engine is writing a plain-language explanation">✎ explaining…</span>`:"");
   return `
   <div class="tile" data-depth="${depth}" style="--d:${depth};margin-left:${depth*22}px" data-id="${esc(i.id)}">
     <div class="left">
@@ -879,7 +879,7 @@ const ENGINE_FIELDS=[
   {key:"name",type:"readonly"},{key:"state",type:"readonly",help:"engine-reported (actual)"},{key:"last_seen",type:"readonly"},{key:"account",type:"readonly"},
   {key:"usage",type:"readonly",help:"active account's 5h / 7d usage, refreshed by every claude session and the test button"},{key:"test_result",type:"readonly"},
   {key:"host",type:"text"},{key:"ticksec",label:"tick (sec)",type:"number"},{key:"full_refresh_minutes",label:"full refresh (min)",type:"number",help:"unconditional reload cadence — the seq fallback"},
-  {key:"probe_stale_min",label:"usage probe (min)",type:"number",default:20,help:"when idle and the account's usage snapshot is older than this, nudge haiku once to refresh it; 0 = off"},
+  {key:"probe_stale_min",label:"usage probe (min)",type:"number",default:20,help:"when idle, every account whose usage snapshot is older than this gets one direct 1-token probe (~9 tokens) so the ladder sees real 5h/7d numbers; 0 = off"},
   {key:"queuelock",type:"json",rows:3},
   {key:"projects",label:"projects served",type:"json",rows:6,help:'machine-specific dirs per project: {"pdy-dev":{"dirs":{"topdir":"~/dev/pdy-dev/"}}} — remove a project here to stop this engine serving it'},
 ];
@@ -1066,11 +1066,38 @@ async function openDetail(id){
       const pre=document.createElement("pre");pre.textContent=JSON.stringify(d.value,null,2);box.firstElementChild.appendChild(pre);
       dl.appendChild(box);return;
     }
-    box.innerHTML=`<h2 style="margin-top:14px">${head}</h2>`;
+    const label=d.key==="explained"?`Explained Simply <span class="kv">(ELI5)</span> `:esc(d.key)+" ";
+    box.innerHTML=`<h2 style="margin-top:14px">${label}${head.slice(esc(d.key).length+1)}</h2>`;
     if(d.valuetype==="json"&&d.value&&Array.isArray(d.value.fields)){box.appendChild(widgetForm(i,d));}
     else{const pre=document.createElement("pre");pre.textContent=typeof d.value==="string"?d.value:JSON.stringify(d.value,null,2);box.appendChild(pre);}
+    if(d.key==="request"){
+      /* ELI5 (spec: Explain / ELI5): the engine runs the read-only explain agent
+         on this item at once, outside the cap, and appends "Explained Simply" */
+      const bar=document.createElement("div");bar.style.cssText="margin:6px 0 2px;display:flex;gap:10px;align-items:center";
+      bar.innerHTML=`<button class="ghost sm" id="eli5" title="ask the engine to re-explain this item for someone who has never seen the codebase">ELI5</button><span class="kv" id="eli5-status"></span>`;
+      box.appendChild(bar);
+    }
     dl.appendChild(box);
   });
+  const eli5=dlg.querySelector("#eli5"),eli5s=dlg.querySelector("#eli5-status");
+  const maxOrder=details.reduce((m,d)=>Math.max(m,d.order||0),-1);
+  const watchExplain=async()=>{
+    eli5.disabled=true;eli5s.textContent="Explaining… this runs immediately on the engine (outside the agent cap) but usually takes 30–60 seconds, longer for a large item. The explanation appears below as \"Explained Simply\" when it lands.";
+    const t0=Date.now();
+    while(Date.now()-t0<15*60000&&dlg.open){
+      await new Promise(r=>setTimeout(r,3000));
+      const fresh=await api(P(i.id)+"/details").catch(()=>null);
+      if(fresh&&fresh.some(d=>d.key==="explained"&&(d.order||0)>maxOrder)){dlgDirty=false;await load().catch(()=>{});openDetail(i.id);return;}
+    }
+    if(dlg.open){eli5.disabled=false;eli5s.textContent="No explanation yet — is an engine running for this project? The request stays flagged; reopen this item later.";}
+  };
+  if(eli5){
+    if(i.explain_requested)watchExplain();
+    eli5.onclick=async()=>{
+      try{await api(P(i.id)+"/explain",{method:"POST",body:"{}"});watchExplain();}
+      catch(e){eli5s.textContent="failed: "+e.message;}
+    };
+  }
   /* blocked-by: close the lightbox, jump to that line, flash it */
   dlg.querySelectorAll("[data-dep]").forEach(a=>a.onclick=ev=>{
     ev.preventDefault();

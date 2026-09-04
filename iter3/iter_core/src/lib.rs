@@ -367,6 +367,12 @@ pub struct WorkItem {
     /// engine-owned: not before this ISO ts (failure backoff); cleared on claim
     #[serde(default)]
     pub retry_after: String,
+    /// webui-owned: ISO ts of a pending ELI5 request ("" = none). The engine
+    /// runs the read-only `explain` agent on it immediately, outside the
+    /// agent cap and the queue, appends an "explained" detail row, and
+    /// clears the flag. Allowed on closed items.
+    #[serde(default)]
+    pub explain_requested: String,
 }
 fn default_queued() -> String { "queued".into() }
 fn default_priority() -> i64 { 5 }

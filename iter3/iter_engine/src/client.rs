@@ -65,6 +65,16 @@ impl Api {
         Self::handle(resp)
     }
 
+    pub fn delete(&self, path: &str) -> Result<Value, ApiError> {
+        let resp = self
+            .http
+            .delete(format!("{}{}", self.base, path))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| ApiError { status: 0, body: e.to_string() })?;
+        Self::handle(resp)
+    }
+
     pub fn post(&self, path: &str, body: &Value) -> Result<Value, ApiError> {
         let resp = self
             .http

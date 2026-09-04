@@ -157,6 +157,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects/{name}/workitems/{id}/details/{order}", put(detail_put))
         .route("/api/projects/{name}/workitems/{id}/approve", post(workitem_approve))
         .route("/api/projects/{name}/workitems/{id}/reopen", post(workitem_reopen))
+        .route("/api/projects/{name}/workitems/{id}/explain", post(workitem_explain).delete(workitem_explained))
         // locks
         .route("/api/projects/{name}/locks", get(locks_list))
         .route("/api/projects/{name}/locks/acquire", post(lock_acquire))
@@ -805,6 +806,9 @@ async fn details_list(
 pub const CLOSED_STATES: &[&str] = &["complete", "failed"];
 /// The one detail key that may be appended to a closed item.
 pub const DOC_KEY: &str = "doc";
+/// the ELI5 row the engine appends (spec: Explain / ELI5); like "doc", it may
+/// land on a closed item
+pub const EXPLAINED_KEY: &str = "explained";
 
 pub fn is_closed(state: &str) -> bool {
     CLOSED_STATES.contains(&state)
@@ -890,10 +894,13 @@ async fn details_append(
 ) -> Result<Json<Value>, ApiError> {
     user.require_writer()?;
     let item = st.store.get("workitem", &name, &id).await?.ok_or_else(notfound)?;
-    if is_closed(&body_str(&item, "state")) && body_str(&body, "key") != DOC_KEY {
+    // closed items take only appended notes: "doc" (humans), "explained" (the
+    // ELI5 run) and the "spend" row that run costs — never a new response
+    let key = body_str(&body, "key");
+    if is_closed(&body_str(&item, "state")) && key != DOC_KEY && key != EXPLAINED_KEY && key != "spend" {
         return Err(ApiError::Status(
             StatusCode::FORBIDDEN,
-            format!("closed workitem: only \"{DOC_KEY}\" detail rows may be appended"),
+            format!("closed workitem: only \"{DOC_KEY}\", \"{EXPLAINED_KEY}\" and \"spend\" detail rows may be appended"),
         ));
     }
     append_detail(&st, &user, &name, &id, body).await
@@ -921,6 +928,52 @@ async fn append_detail(st: &Arc<AppState>, user: &AuthUser, name: &str, id: &str
         }
     }
     Err(ApiError::Status(StatusCode::CONFLICT, "could not allocate a detail order (contention)".into()))
+}
+
+// ---------- explain (ELI5) ----------
+
+/// webui -> engine: ask for a plain-language explanation of this item (spec:
+/// Explain / ELI5). Stamps `explain_requested`; the engine serving the project
+/// sees it on its next tick and runs the read-only `explain` agent at once,
+/// outside the agent cap. Works on closed items too (no state change).
+async fn workitem_explain(
+    user: AuthUser,
+    State(st): Ctx,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    user.require_writer()?;
+    let mut item = st.store.get("workitem", &name, &id).await?.ok_or_else(notfound)?;
+    let pending = body_str(&item, "explain_requested");
+    if !pending.is_empty() {
+        return Ok(Json(json!({"requested": pending, "already": true})));
+    }
+    let ts = now_utc();
+    let expect = body_u64(&item, "version");
+    item["explain_requested"] = json!(ts);
+    item["version"] = json!(expect + 1);
+    st.store.put_versioned("workitem", &name, &id, &item, expect).await?;
+    st.store.bump_seq(&name, "workitem").await?;
+    Ok(Json(json!({"requested": ts})))
+}
+
+/// engine -> iter_data: the explanation landed (or could not be produced);
+/// clear the flag so the button re-arms.
+async fn workitem_explained(
+    user: AuthUser,
+    State(st): Ctx,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    user.require_writer()?;
+    let mut item = st.store.get("workitem", &name, &id).await?.ok_or_else(notfound)?;
+    if body_str(&item, "explain_requested").is_empty() {
+        return Ok(Json(json!({"cleared": false})));
+    }
+    let expect = body_u64(&item, "version");
+    item["explain_requested"] = json!("");
+    item["version"] = json!(expect + 1);
+    st.store.put_versioned("workitem", &name, &id, &item, expect).await?;
+    st.store.bump_seq(&name, "workitem").await?;
+    Ok(Json(json!({"cleared": true})))
 }
 
 // ---------- reopen ----------

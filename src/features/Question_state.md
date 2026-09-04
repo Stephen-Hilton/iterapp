@@ -87,10 +87,17 @@ fixed. Before asking, the agent researches: the code node files
 the global context files, the interfaces and use-cases, and the actual code.
 A question the repository already answers is not a question.
 
-The `question` text is then written in four parts:
+The `question` text is then written in four parts — for a reader who has NEVER
+seen the codebase (revised 2026-09-04): the question is anchored in the business
+flow first (the moment in the user's or operator's journey where the decision
+bites, in their words), and every internal name — container, rule id, gate,
+file, work item id — is glossed the first time it appears. Bare internal names
+are what made questions unanswerable: the human could not find a starting point
+and had to ask the agent to re-explain. See `_ask_the_human.md` for the
+worked bad/good example. The parts:
 
-1. **Context** — where in the codebase this sits and why the decision is
-   needed now, in plain sentences.
+1. **Where this comes up** — the point in the business flow where the decision
+   is needed and why now, in plain sentences with internal names glossed.
 2. **The decision** — the one thing being asked, stated as a question. One
    decision per work item.
 3. **Recommendations** — two to four concrete options, each with what it buys

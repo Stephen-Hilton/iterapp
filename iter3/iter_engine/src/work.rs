@@ -384,7 +384,7 @@ fn run_claude(
 /// the ambient token, bounded by the persona's timeout.
 pub fn run_critic(cwd: &str, prompt: &str, model: &str, flags: &[String], timeout_sec: u64) -> Result<RunOut, String> {
     let mut cmd = Command::new("claude");
-    cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
+    cmd.arg("-p").arg(prompt).arg("--output-format").arg("stream-json").arg("--verbose");
     if !model.is_empty() {
         cmd.arg("--model").arg(model);
     }
@@ -393,7 +393,7 @@ pub fn run_critic(cwd: &str, prompt: &str, model: &str, flags: &[String], timeou
     }
     cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
     cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    Ok(parse_claude_json(&wait_with_timeout(cmd, timeout_sec)?))
+    Ok(parse_claude_stream("", &wait_with_timeout(cmd, timeout_sec)?).1)
 }
 
 /// One headless claude session across several turns (`--resume`).
@@ -416,7 +416,7 @@ impl Session {
         }
         args.extend(self.extra.iter().cloned());
         let raw = spawn_claude_env(project, &self.cwd, &self.account, prompt, &self.model, &args, self.timeout, &self.envs)?;
-        let (sid, out) = parse_claude_json_sid(&raw);
+        let (sid, out) = parse_claude_stream(&self.account, &raw);
         if !sid.is_empty() {
             self.sid = sid;
         }
@@ -458,15 +458,40 @@ fn v2_delegate(topdir: &str) -> Option<(String, String)> {
     None
 }
 
-/// Like `parse_claude_json` but also returns the session id for `--resume`.
-fn parse_claude_json_sid(raw: &str) -> (String, RunOut) {
+/// Parse `--output-format stream-json` output: one JSON object per line.
+/// The `rate_limit_event` line is written to `account`'s usage snapshot
+/// (spec: Usage%) and the `result` line becomes the RunOut (+ session id for
+/// `--resume`).  A lone result object (older CLIs, test doubles) or plain
+/// text still parse via `parse_claude_json`.
+fn parse_claude_stream(account: &str, raw: &str) -> (String, RunOut) {
+    let mut sid = String::new();
+    let mut result: Option<RunOut> = None;
+    for line in raw.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if crate::usage::record_event(account, &v) {
+            continue;
+        }
+        if v.get("type").and_then(|t| t.as_str()) == Some("result") {
+            if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
+                sid = s.to_string();
+            }
+            result = Some(parse_claude_json(line));
+        }
+    }
+    if let Some(out) = result {
+        return (sid, out);
+    }
+    // not a stream: a lone result object (possibly after warnings) or plain text
     let trimmed = raw.trim();
     let candidate = trimmed.find('{').map(|i| &trimmed[i..]).unwrap_or("");
     if let Ok(v) = serde_json::from_str::<Value>(candidate) {
-        let sid = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        return (sid, parse_claude_json(raw));
+        sid = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
     }
-    (String::new(), parse_claude_json(raw))
+    (sid, parse_claude_json(raw))
 }
 
 /// Spawn with an explicit environment (the multi-turn session path).
@@ -481,8 +506,7 @@ fn spawn_claude_env(
     envs: &[(String, String)],
 ) -> Result<String, String> {
     let mut cmd = Command::new("claude");
-    cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
-    cmd.arg("--settings").arg(crate::usage::statusline_settings(account));
+    cmd.arg("-p").arg(prompt).arg("--output-format").arg("stream-json").arg("--verbose");
     if !model.is_empty() {
         cmd.arg("--model").arg(model);
     }
@@ -518,10 +542,9 @@ fn spawn_claude(
     timeout_sec: u64,
 ) -> Result<String, String> {
     let mut cmd = Command::new("claude");
-    cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
-    // usage tracking: wire this session's statusline to the collector, teeing
-    // server-authoritative rate_limits into THIS account's snapshot file
-    cmd.arg("--settings").arg(crate::usage::statusline_settings(account));
+    cmd.arg("-p").arg(prompt).arg("--output-format").arg("stream-json").arg("--verbose");
+    // usage tracking: stream-json carries a rate_limit_event line per session;
+    // parse_claude_stream writes it to THIS account's snapshot file
     if !model.is_empty() {
         cmd.arg("--model").arg(model);
     }
@@ -546,25 +569,86 @@ fn spawn_claude(
     wait_with_timeout(cmd, timeout_sec)
 }
 
+/// ELI5 (spec: Explain / ELI5): one read-only session of the `explain` agent
+/// on a work item, run at once — outside the agent cap, no queue, no locks
+/// (it writes nothing in the repo) — whose whole output lands on the item as
+/// an "explained" detail row.  `agent_def` is the project's `explain` agent
+/// record when one exists (model / timeout / body); its flags are ignored:
+/// the tool set here is fixed to Read, Glob, Grep.
+pub fn explain(api: &Api, project: &Project, topdir: &str, item: &WorkItem, account: &str, agent_def: &Value) {
+    let started = Instant::now();
+    let details = fetch_details(api, project, item);
+    let top = std::path::Path::new(topdir);
+    let head = crate::prompt::read_head(project, top);
+    let codepath = item
+        .lockdirs
+        .first()
+        .map(|d| crate::prompt::expand_topdir_token(d, top))
+        .unwrap_or_else(|| topdir.to_string());
+    let codepath = std::path::PathBuf::from(codepath.trim_end_matches('/'));
+    let body = agent_def.get("promptbody").and_then(|b| b.as_str()).unwrap_or("");
+    // a stub body (the header line alone) means "use the built-in persona"
+    let body = if body.trim().lines().count() > 3 { body.to_string() } else { crate::prompt::EXPLAIN_DEFAULT_BODY.to_string() };
+    let prompt = crate::prompt::explain_prompt(&crate::prompt::ExplainInput {
+        agent_body: &body, head: &head, project, item, details: &details, codepath: &codepath, topdir: top,
+    });
+    let model = agent_def.get("model").and_then(|m| m.as_str()).unwrap_or("sonnet").trim().to_string();
+    let timeout = agent_def.get("timeoutsec").and_then(|t| t.as_u64()).unwrap_or(900).clamp(60, 3600);
+    let extra = vec![
+        "--allowedTools".to_string(),
+        "Read,Glob,Grep".to_string(),
+        "--disallowedTools".to_string(),
+        "Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent".to_string(),
+        "--max-turns".to_string(),
+        "40".to_string(),
+    ];
+    let details_path = format!("/api/projects/{}/workitems/{}/details", project.name, item.id);
+    let result = spawn_claude(project, topdir, account, &prompt, &model, &extra, timeout)
+        .map(|raw| parse_claude_stream(account, &raw).1);
+    let secs = started.elapsed().as_secs();
+    let value = match &result {
+        Ok(out) if out.subtype == "success" && !out.text.trim().is_empty() => out.text.trim().to_string(),
+        Ok(out) => format!("Could not explain this item: the session ended with '{}' after {secs}s.{}",
+            out.subtype, if out.text.trim().is_empty() { String::new() } else { format!("\n\n{}", out.text.trim()) }),
+        Err(e) => format!("Could not explain this item: {}", e.chars().take(800).collect::<String>()),
+    };
+    if let Err(e) = api.post(&details_path, &json!({"key": "explained", "valuetype": "text", "value": value})) {
+        eprintln!("[engine] could not append the explanation to {}: {e}", short(&item.id));
+    }
+    if let Ok(out) = &result {
+        if out.cost_usd > 0.0 || out.input_tokens > 0 {
+            let _ = api.post(&details_path, &json!({"key": "spend", "valuetype": "json", "value": {"usd": out.cost_usd,
+                "input_tokens": out.input_tokens, "output_tokens": out.output_tokens, "turns": out.num_turns, "agent": "explain"}}));
+            let _ = api.post(&format!("/api/projects/{}/spend", project.name),
+                &json!({"usd": out.cost_usd, "input_tokens": out.input_tokens, "output_tokens": out.output_tokens, "workid": item.id}));
+        }
+    }
+    if let Err(e) = api.delete(&format!("/api/projects/{}/workitems/{}/explain", project.name, item.id)) {
+        eprintln!("[engine] could not clear explain_requested on {}: {e}", short(&item.id));
+    }
+    println!("[engine] explained {} '{}' in {secs}s ({})", short(&item.id), item.name,
+        match &result { Ok(o) => format!("{}, ${:.3}", o.subtype, o.cost_usd), Err(_) => "failed".into() });
+}
+
 /// Connectivity nudge (spec: engine chip "test"): `claude -p "."` on haiku
 /// with no other context, billed to `account`'s token when one is configured.
-/// Cheap, and its statusline callback refreshes the usage snapshot as a side
-/// effect — which is the real payload.
+/// Proves the CLI + token work; its rate_limit_event line refreshes the
+/// account's usage snapshot as a side effect.
 pub fn nudge(token: Option<String>, account: &str, cwd: &str) -> Result<(RunOut, u128), String> {
     let started = Instant::now();
     let mut cmd = Command::new("claude");
-    cmd.arg("-p").arg(".").arg("--output-format").arg("json").arg("--model").arg("haiku").arg("--max-turns").arg("1");
-    cmd.arg("--settings").arg(crate::usage::statusline_settings(account));
+    cmd.arg("-p").arg(".").arg("--output-format").arg("stream-json").arg("--verbose").arg("--model").arg("haiku").arg("--max-turns").arg("1");
     if let Some(tok) = token {
         cmd.env("CLAUDE_CODE_OAUTH_TOKEN", tok);
     }
     cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
     cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let raw = wait_with_timeout(cmd, 120)?;
-    Ok((parse_claude_json(&raw), started.elapsed().as_millis()))
+    Ok((parse_claude_stream(account, &raw).1, started.elapsed().as_millis()))
 }
 
-/// `--output-format json` prints one result object: {"type":"result",
+/// The result object — the last line of stream-json, or all of
+/// `--output-format json`: {"type":"result",
 /// "subtype":"success"|"error_max_turns"|..., "result":"<final text>",
 /// "num_turns":N, ...}.  Anything that is not that object is treated as
 /// plain text output (older CLIs, test doubles).
@@ -619,6 +703,13 @@ fn wait_with_timeout(mut cmd: Command, timeout_sec: u64) -> Result<String, Strin
         cmd.process_group(0); // so a stop can take the whole tree down
     }
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    // drain both pipes on their own threads: stream-json echoes every message,
+    // and a full 64K pipe would block the child forever if read only at exit
+    let slurp = |pipe: Option<Box<dyn std::io::Read + Send>>| -> Option<std::thread::JoinHandle<String>> {
+        pipe.map(|mut s| std::thread::spawn(move || { let mut b = String::new(); let _ = s.read_to_string(&mut b); b }))
+    };
+    let mut out_h = slurp(child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>));
+    let mut err_h = slurp(child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>));
     let deadline = Instant::now() + Duration::from_secs(timeout_sec.max(1));
     let workid = CURRENT_WORKID.with(|w| w.borrow().clone());
     loop {
@@ -634,15 +725,8 @@ fn wait_with_timeout(mut cmd: Command, timeout_sec: u64) -> Result<String, Strin
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut out = String::new();
-                let mut err = String::new();
-                use std::io::Read;
-                if let Some(mut s) = child.stdout.take() {
-                    let _ = s.read_to_string(&mut out);
-                }
-                if let Some(mut s) = child.stderr.take() {
-                    let _ = s.read_to_string(&mut err);
-                }
+                let out = out_h.take().and_then(|h| h.join().ok()).unwrap_or_default();
+                let err = err_h.take().and_then(|h| h.join().ok()).unwrap_or_default();
                 if status.success() {
                     return Ok(out);
                 }
@@ -727,7 +811,7 @@ fn run_gate(api: &Api, project: &Project, item: &WorkItem, out: &RunOut, ctx: &G
         ctx.gate.verify_max_turns.max(1).to_string(),
     ];
     let verdict = match spawn_claude(project, &ctx.topdir, &ctx.account, &prompt, ctx.gate.verify.trim(), &extra, 600) {
-        Ok(raw) => gate::parse_verdict(&parse_claude_json(&raw).text),
+        Ok(raw) => gate::parse_verdict(&parse_claude_stream(&ctx.account, &raw).1.text),
         Err(e) => Verdict::Unclear { reason: format!("verifier session failed: {}", gate::clip(&e, 500)) },
     };
     match verdict {
@@ -901,5 +985,32 @@ mod tests {
         // leading noise before the object is tolerated
         let out = parse_claude_json("warn: x\n{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\"}");
         assert_eq!(out.text, "ok");
+    }
+
+    #[test]
+    fn stream_json_yields_result_sid_and_writes_the_usage_snapshot() {
+        let dir = std::env::temp_dir().join(format!("iter3-usage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: test-only; nothing else in this process reads ITER_USAGE_DIR concurrently
+        unsafe { std::env::set_var("ITER_USAGE_DIR", &dir) };
+        let raw = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sid-1\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\",\"isUsingOverage\":false,",
+            "\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.25,\"resetsAt\":99999999999},",
+            "\"seven_day\":{\"utilization\":0.5,\"resetsAt\":99999999999}}}}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"sid-1\",\"num_turns\":2,",
+            "\"total_cost_usd\":0.01,\"usage\":{\"input_tokens\":10,\"output_tokens\":3},\"result\":\"done\"}\n"
+        );
+        let (sid, out) = parse_claude_stream("Acct", raw);
+        assert_eq!(sid, "sid-1");
+        assert_eq!((out.text.as_str(), out.subtype.as_str(), out.num_turns, out.input_tokens), ("done", "success", 2, 10));
+        let u = crate::usage::read_usage("Acct").expect("snapshot written from the stream");
+        assert!((u.five_hour_pct - 25.0).abs() < 1e-9 && (u.seven_day_pct - 50.0).abs() < 1e-9);
+        assert_eq!(u.source, "stream");
+        // a lone result object (fake claude / older cli) still parses
+        let (sid, out) = parse_claude_stream("Acct", "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"s2\",\"result\":\"x\"}");
+        assert_eq!((sid.as_str(), out.text.as_str()), ("s2", "x"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

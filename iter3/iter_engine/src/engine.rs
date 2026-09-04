@@ -23,11 +23,15 @@ pub struct EngineRuntime {
     deferred: HashMap<String, Instant>,
     /// running work: (workid, agent_type, handle)
     running: Vec<(String, String, std::thread::JoinHandle<()>)>,
+    /// ELI5 runs in flight (spec: Explain / ELI5): outside the cap, never in
+    /// `running`, so they neither count toward maxagents nor delay a drain
+    explaining: Vec<(String, std::thread::JoinHandle<()>)>,
     running_count: Arc<AtomicUsize>,
     pub max_ticks: Option<u64>,
     /// test_requested value already answered (never run the same nudge twice)
     last_test_handled: String,
-    last_probe: Option<Instant>,
+    /// account -> when this engine last probed its usage ("" = ambient login)
+    last_probe: HashMap<String, Instant>,
     /// project -> date the daily-budget hold was announced
     budget_hold: HashMap<String, String>,
 }
@@ -73,10 +77,11 @@ impl EngineRuntime {
             agents: HashMap::new(),
             deferred: HashMap::new(),
             running: Vec::new(),
+            explaining: Vec::new(),
             running_count: Arc::new(AtomicUsize::new(0)),
             max_ticks: None,
             last_test_handled: String::new(),
-            last_probe: None,
+            last_probe: HashMap::new(),
             budget_hold: HashMap::new(),
         }
     }
@@ -121,7 +126,7 @@ impl EngineRuntime {
             if let Some(max) = self.max_ticks {
                 if ticks >= max {
                     println!("[engine] max ticks reached, draining running work");
-                    while self.prune_running() > 0 {
+                    while self.prune_running() > 0 || { self.explaining.retain(|(_, h)| !h.is_finished()); !self.explaining.is_empty() } {
                         std::thread::sleep(Duration::from_millis(200));
                     }
                     return;
@@ -171,6 +176,87 @@ impl EngineRuntime {
         );
     }
 
+    /// One probe per stale account (all of the project's accounts, not just
+    /// the chosen one — the ladder needs every account's number to switch).
+    /// No accounts configured = the ambient CLI login, which only the haiku
+    /// nudge can reach.
+    fn probe_stale_accounts(&mut self, engine: &Engine, now: chrono::DateTime<chrono::Utc>) {
+        let stale_sec = (engine.probe_stale_min * 60) as i64;
+        let mut any_accounts = false;
+        let mut targets: Vec<(String, String)> = Vec::new(); // (account, token)
+        for project_name in engine.projects.keys() {
+            if let Some(p) = self.projects.get(project_name) {
+                for a in &p.accounts {
+                    any_accounts = true;
+                    if targets.iter().any(|(n, _)| n == &a.name) {
+                        continue;
+                    }
+                    let tok = std::env::var(&a.token_envar).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+                    if let Some(tok) = tok {
+                        targets.push((a.name.clone(), tok));
+                    }
+                }
+            }
+        }
+        let due = |this: &Self, name: &str| -> bool {
+            let age = usage::read_usage(name).and_then(|u| u.age_sec(now)).unwrap_or(i64::MAX);
+            let since = this.last_probe.get(name).map(|t| t.elapsed().as_secs() as i64).unwrap_or(i64::MAX);
+            age > stale_sec && since > stale_sec
+        };
+        if !any_accounts {
+            if due(self, "") {
+                self.last_probe.insert(String::new(), Instant::now());
+                println!("[engine] default usage snapshot stale — nudging haiku through the CLI");
+                self.run_test(engine, "");
+            }
+            return;
+        }
+        for (name, tok) in targets {
+            if !due(self, &name) {
+                continue;
+            }
+            self.last_probe.insert(name.clone(), Instant::now());
+            match usage::probe_and_record(&name, &tok) {
+                Ok(u) => println!(
+                    "[engine] usage probe '{name}': 5h {:.0}% 7d {:.0}% ({}{})",
+                    u.five_hour_pct, u.seven_day_pct, u.status, if u.is_using_overage { ", OVERAGE" } else { "" }
+                ),
+                Err(e) => eprintln!("[engine] usage probe '{name}' failed: {e}"),
+            }
+        }
+    }
+
+    /// One read-only `explain` session per item flagged `explain_requested`
+    /// that this engine is not already explaining.
+    fn start_explains(&mut self, engine: &Engine, project: &Project, account: &str) {
+        self.explaining.retain(|(_, h)| !h.is_finished());
+        let Some(topdir) = engine.projects.get(&project.name).and_then(|d| d.dirs.get("topdir")).map(|t| expand_topdir(t)) else { return };
+        let wanted: Vec<WorkItem> = self
+            .items
+            .get(&project.name)
+            .map(|v| v.iter().filter(|i| !i.explain_requested.is_empty()).cloned().collect())
+            .unwrap_or_default();
+        for item in wanted {
+            if self.explaining.iter().any(|(id, _)| id == &item.id) {
+                continue;
+            }
+            let agent_def = self.agents.get("explain").cloned().unwrap_or(Value::Null);
+            println!(
+                "[engine] ELI5 requested at {} for {} '{}' — explaining now, outside the cap (running {})",
+                item.explain_requested, &item.id[..8.min(item.id.len())], item.name, self.running.len()
+            );
+            let api = self.api.clone();
+            let project = project.clone();
+            let topdir = topdir.clone();
+            let account = account.to_string();
+            let workid = item.id.clone();
+            let handle = std::thread::spawn(move || {
+                crate::work::explain(&api, &project, &topdir, &item, &account, &agent_def);
+            });
+            self.explaining.push((workid, handle));
+        }
+    }
+
     fn prune_running(&mut self) -> usize {
         self.running.retain(|(_, _, h)| !h.is_finished());
         self.running.len()
@@ -208,8 +294,8 @@ impl EngineRuntime {
         }
 
         // heartbeat: actual state + account + the account's usage snapshot,
-        // every tick (the snapshot is refreshed by every claude session's
-        // statusline callback, so a run's cost shows up on the next tick)
+        // every tick (every claude session's rate_limit_event line and the
+        // idle probe refresh it, so a run's cost shows up on the next tick)
         let _ = self.api.post(
             &format!("/api/engines/{}/heartbeat", self.name),
             &json!({"state": "Running", "account": chosen_account,
@@ -221,17 +307,6 @@ impl EngineRuntime {
         if !engine.test_requested.is_empty() && engine.test_requested != self.last_test_handled {
             self.last_test_handled = engine.test_requested.clone();
             self.run_test(engine, &chosen_account);
-        }
-        // idle usage probe (V2 limits.probe): a stale snapshot with nothing running
-        // gets one cheap nudge so the ladder and the chip see real numbers
-        if engine.probe_stale_min > 0 && self.running.is_empty() && !self.projects.is_empty() {
-            let age = usage::read_usage(&chosen_account).and_then(|u| u.age_sec(now)).unwrap_or(i64::MAX);
-            let since_probe = self.last_probe.map(|t| t.elapsed().as_secs()).unwrap_or(u64::MAX);
-            if age > (engine.probe_stale_min * 60) as i64 && since_probe > engine.probe_stale_min * 60 {
-                self.last_probe = Some(Instant::now());
-                println!("[engine] usage snapshot is {} old — probing", if age == i64::MAX { "missing".to_string() } else { format!("{age}s") });
-                self.run_test(engine, &chosen_account);
-            }
         }
         // stop requests for items THIS engine is running (workitem_stop.md)
         for items in self.items.values() {
@@ -267,7 +342,7 @@ impl EngineRuntime {
                     .unwrap_or(0)
             };
 
-            let mut reload = |rt: &mut Self, table: &str| -> bool {
+            let reload = |rt: &mut Self, table: &str| -> bool {
                 let key = (project_name.clone(), table.to_string());
                 let now_seq = seq_of(table);
                 let changed = rt.seen_seq.get(&key).copied() != Some(now_seq);
@@ -309,6 +384,10 @@ impl EngineRuntime {
             }
 
             let Some(project) = self.projects.get(project_name).cloned() else { continue };
+            // ELI5 requests (spec: Explain / ELI5) run at once whatever the
+            // project state or cap says: a human pressed the button, the run is
+            // read-only, and nothing waits on it
+            self.start_explains(engine, &project, &chosen_account);
             if project.state != "Running" {
                 // Draining is transitional: ask iter_data to settle it to Stopped
                 // once nothing is in progress anywhere
@@ -322,6 +401,14 @@ impl EngineRuntime {
                 // Draining/Stopped: finish running work, start nothing new,
                 // fire no schedules
                 continue;
+            }
+            // idle usage probe (spec: Usage%), BEFORE picking: with nothing
+            // running, every account whose snapshot is older than
+            // probe_stale_min gets one direct 1-token probe (the response
+            // headers carry the 5h/7d numbers; ~9 tokens, no claude process)
+            // so the ladder and the maxagents gates see real numbers
+            if engine.probe_stale_min > 0 && self.running.is_empty() {
+                self.probe_stale_accounts(engine, now);
             }
             self.fire_schedules(&project);
             let Some(dirs) = engine.projects.get(project_name) else { continue };
@@ -675,5 +762,25 @@ impl EngineRuntime {
         });
         self.running.push((workid, agent_type, handle));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pdy-dev ladder as configured 2026-09-04: keys are parsed as ">N%"
+    /// (no hard-coded levels); the most restrictive true gate wins.
+    #[test]
+    fn max_agents_evaluates_every_gt_percent_key() {
+        let gates: BTreeMap<String, u32> =
+            [(">90%", 2), (">95%", 1), (">99%", 0), ("else", 4)].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        for (pct, want) in [(0, 4), (50, 4), (90, 4), (91, 2), (95, 2), (96, 1), (99, 1), (100, 0)] {
+            assert_eq!(max_agents(&gates, pct), want, "usage {pct}%");
+        }
+        // no gates at all -> the default of 4; an "else"-only map -> its value
+        assert_eq!(max_agents(&BTreeMap::new(), 97), 4);
+        let only_else: BTreeMap<String, u32> = [("else".to_string(), 7)].into_iter().collect();
+        assert_eq!(max_agents(&only_else, 97), 7);
     }
 }

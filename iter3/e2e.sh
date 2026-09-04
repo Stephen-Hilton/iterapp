@@ -30,6 +30,7 @@ drop_e2e_tables() {
   fi
 }
 cleanup() {
+  [ -n "${PROBE_PID:-}" ] && kill "$PROBE_PID" 2>/dev/null || true
   [ -n "$DATA_PID" ] && kill "$DATA_PID" 2>/dev/null || true
   wait 2>/dev/null || true
   drop_e2e_tables
@@ -114,7 +115,7 @@ curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null <<EO
 EOF
 
 curl -sf "${AUTH[@]}" -X PUT "$BASE/api/engines/Engine01" -d @- >/dev/null <<EOF || fail "engine put"
-{"host":"$(hostname)","state":"Stopped","ticksec":1,"full_refresh_minutes":360,
+{"host":"$(hostname)","state":"Stopped","ticksec":1,"full_refresh_minutes":360,"probe_stale_min":0,
  "queuelock":{"retryms":50,"breaksec":60},
  "projects":{"$PROJECT":{"dirs":{"topdir":"$SAMPLE"}}}}
 EOF
@@ -357,6 +358,7 @@ rm -f "$SAMPLE/out_a.txt"
 [ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA" | jq -r .state)" = complete ] || fail "reopened item did not complete"
 pass "reopen: users-only, back to queued with a doc record, ran and closed again"
 
+
 # ---------- approval flow ----------
 WD=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
   -d '{"name":"sensitive change","agent":"exec","exec_shell":"echo approved-ran > out_d.txt","state":"question","needs_approval":true}' | jq -r .id)
@@ -405,7 +407,39 @@ pass "schedule fired once, clone completed, template intact, last_fired claimed"
 # ---------- usage%-driven account gating ----------
 export ITER_USAGE_DIR="$SCRATCH/usage"
 mkdir -p "$ITER_USAGE_DIR"
-FUTURE=$(( $(date +%s) + 86400 ))
+FUTURE=$(( $(date +%s) + 86400 )); export FUTURE
+# fake api.anthropic.com/v1/messages for the idle probe: logs the auth header,
+# answers with anthropic-ratelimit-unified-* headers (5h 42%, 7d 10%); a
+# "$PROBE_LOG.reject" flag file turns it into a 429 at 5h 100% (hard limit)
+PROBE_LOG="$SCRATCH/probe.log"; : > "$PROBE_LOG"
+cat > "$SCRATCH/probe_server.py" <<'PYS'
+import http.server, os, sys
+PORT, LOG, FUT = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get('Content-Length') or 0))
+        with open(LOG, 'a') as f:
+            f.write("auth=%s beta=%s\n" % (self.headers.get('Authorization'), self.headers.get('anthropic-beta')))
+        rej = os.path.exists(LOG + '.reject')
+        body = b'{"type":"error","error":{"type":"rate_limit_error"}}' if rej else b'{"type":"message","content":[{"type":"text","text":"#"}]}'
+        self.send_response(429 if rej else 200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('anthropic-ratelimit-unified-status', 'rejected' if rej else 'allowed_warning')
+        self.send_header('anthropic-ratelimit-unified-5h-status', 'rejected' if rej else 'allowed')
+        self.send_header('anthropic-ratelimit-unified-5h-utilization', '1.0' if rej else '0.42')
+        self.send_header('anthropic-ratelimit-unified-5h-reset', FUT)
+        self.send_header('anthropic-ratelimit-unified-7d-status', 'allowed_warning')
+        self.send_header('anthropic-ratelimit-unified-7d-utilization', '0.10')
+        self.send_header('anthropic-ratelimit-unified-7d-reset', FUT)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+http.server.HTTPServer(('127.0.0.1', PORT), H).serve_forever()
+PYS
+PROBE_PORT="${ITER_E2E_PROBE_PORT:-8399}"
+python3 "$SCRATCH/probe_server.py" "$PROBE_PORT" "$PROBE_LOG" "$FUTURE" &
+PROBE_PID=$!
+export ITER_USAGE_PROBE_URL="http://127.0.0.1:$PROBE_PORT/v1/messages"
 ITEM=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT")
 echo "$ITEM" | jq '.accounts=[{"name":"TestAcct","token_envar":"FAKE_TOKEN","order":1,"switch":80,"stop":99}]' \
   | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null || fail "project accounts update"
@@ -457,8 +491,13 @@ export GATE_PROMPTS="$SCRATCH/prompts"; mkdir -p "$GATE_PROMPTS"
 cat > "$FAKEBIN/claude" <<'FAKE'
 #!/usr/bin/env bash
 # fake claude for e2e: -p <prompt> ... ; prints a Claude Code json result object
-prompt=""; while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift;; esac; shift; done
+allargs="$*"; prompt=""; while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift;; esac; shift; done
 name=$(grep -o -m1 -E '(Title|Workitem): gate-[a-z0-9]*' <<<"$prompt" | sed -E 's/.*: //')
+if grep -q "# Explain this work item simply (ELI5)" <<<"$prompt"; then
+  printf '%s\n' "$prompt" > "$GATE_PROMPTS/eli5-prompt.txt"
+  echo "explain tools=$allargs" >> "$GATE_LOG"
+  printf '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"session_id":"fake-sid","total_cost_usd":0.05,"usage":{"input_tokens":500,"output_tokens":80},"result":"EXPLAINED-MARKER: when a customer asks for chips, we first check they paid."}\n'; exit 0
+fi
 if ! grep -q "# Step: mainwork" <<<"$prompt" && ! grep -q "iter close-gate verifier" <<<"$prompt"; then
   # prework / selfcheck turns of the same session: record, acknowledge, move on
   [ -n "$name" ] && [ -n "${ITER_WORKID:-}" ] && echo "$name" > "$GATE_PROMPTS/.name-$ITER_WORKID"
@@ -466,7 +505,9 @@ if ! grep -q "# Step: mainwork" <<<"$prompt" && ! grep -q "iter close-gate verif
   printf '%s\n' "$prompt" > "$GATE_PROMPTS/$(date +%s%N)-$name.txt" 2>/dev/null || true
   printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"fake-sid","result":"all done"}\n'; exit 0
 fi
-emit() { printf '{"type":"result","subtype":"%s","is_error":false,"num_turns":3,"session_id":"fake-sid","total_cost_usd":0.25,"usage":{"input_tokens":1000,"output_tokens":200},"result":%s}\n' "$1" "$(jq -Rn --arg t "$2" '$t')"; }
+emit() {
+  printf '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.33,"resetsAt":%s},"seven_day":{"utilization":0.07,"resetsAt":%s}}}}\n' "${FUTURE:-0}" "${FUTURE:-0}"
+  printf '{"type":"result","subtype":"%s","is_error":false,"num_turns":3,"session_id":"fake-sid","total_cost_usd":0.25,"usage":{"input_tokens":1000,"output_tokens":200},"result":%s}\n' "$1" "$(jq -Rn --arg t "$2" '$t')"; }
 if grep -q "iter close-gate verifier" <<<"$prompt"; then
   echo "verifier $name" >> "$GATE_LOG"
   if grep -q "DONE-MARKER" <<<"$prompt"; then emit success '{"verdict":"complete","open":[],"reason":"all obligations met"}'
@@ -641,6 +682,9 @@ R1=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" -d '{
 grep -q "token=tok-B-1yr name=gate-rot1" "$GATE_PROMPTS/tokens.txt" || { cat "$GATE_PROMPTS/tokens.txt"; cat "$SCRATCH/engine-rot1.log"; fail "engine did not route the run to account B's token"; }
 [ "$(curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01" | jq -r .account)" = B ] || fail "engine record does not show account B"
 [ "$(curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01" | jq -r .usage.account)" = B ] || fail "usage snapshot on the chip is not B's"
+[ "$(jq -r '.rate_limits.five_hour.used_percentage|round' "$ITER_USAGE_DIR/iter3-usage-B.json")" = 33 ] || fail "the run's rate_limit_event was not written to B's snapshot: $(cat "$ITER_USAGE_DIR/iter3-usage-B.json")"
+[ "$(jq -r .source "$ITER_USAGE_DIR/iter3-usage-B.json")" = stream ] || fail "snapshot source is not 'stream'"
+pass "per-run usage: the session's stream-json rate_limit_event (5h 33%) landed in the billed account's snapshot"
 snap A 85 10; snap B 90 5     # both over switch%, both under stop% -> pass 2 picks A (lowest order)
 : > "$GATE_PROMPTS/tokens.txt"
 R2=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" -d '{"name":"gate-rot2","agent":"gatetest","priority":0,"lockdirs":["{topdir}/rot2/"]}' | jq -r .id)
@@ -669,6 +713,36 @@ ENG=$(curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01")
 [ "$(grep -c "verifier\|worker" "$GATE_LOG")" -ge 1 ] || true
 pass "engine test: nudge ran on haiku via fake claude, result + usage reported to iter_data"
 
+# ---- idle usage probe: direct 1-token call, numbers from the headers (2026-09-04) ----
+curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01" | jq '.probe_stale_min=1' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/engines/Engine01" -d @- >/dev/null || fail "engine probe_stale_min"
+STALE=$(date -u -v-2H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+stale_snap() { printf '{"ts":"%s","rate_limits":{"five_hour":{"used_percentage":10,"resets_at":%s},"seven_day":{"used_percentage":5,"resets_at":%s}}}\n' "$STALE" "$FUTURE" "$FUTURE" > "$ITER_USAGE_DIR/iter3-usage-TestAcct.json"; }
+stale_snap
+export FAKE_TOKEN="tok-test-1yr"
+: > "$PROBE_LOG"
+(cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" ITER_USAGE_DIR="$ITER_USAGE_DIR" "$ENGINE_BIN" --config .iter/config.json --ticks 3 > "$SCRATCH/engine-probe.log" 2>&1) || true
+grep -q "usage probe 'TestAcct': 5h 42% 7d 10% (allowed_warning)" "$SCRATCH/engine-probe.log" || { cat "$SCRATCH/engine-probe.log"; fail "idle probe did not run"; }
+grep -q "auth=Bearer tok-test-1yr beta=oauth-2025-04-20" "$PROBE_LOG" || { cat "$PROBE_LOG"; fail "probe did not send the account token as Bearer"; }
+[ "$(jq -r '.rate_limits.five_hour.used_percentage|round' "$ITER_USAGE_DIR/iter3-usage-TestAcct.json")" = 42 ] || fail "probe snapshot not written"
+[ "$(jq -r .source "$ITER_USAGE_DIR/iter3-usage-TestAcct.json")" = probe ] || fail "snapshot source is not 'probe'"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01" | jq -r '.usage.five_hour_pct|floor')" = 42 ] || fail "probed usage not on the heartbeat"
+# --probe from the shell does the same
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config.json --probe > "$SCRATCH/probe-cli.log" 2>&1) || true
+grep -q "usage: 5h 42% 7d 10%" "$SCRATCH/probe-cli.log" || { cat "$SCRATCH/probe-cli.log"; fail "iter_engine --probe did not report usage"; }
+pass "idle usage probe: direct 1-token call with the account token; 5h/7d from the headers -> snapshot + heartbeat; --probe from the shell"
+# hard limit: the server rejects with 429 but still sends the headers -> the account reads 100% and nothing is picked
+touch "$PROBE_LOG.reject"
+stale_snap
+curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" -d '{"name":"probe-429 work","agent":"exec","exec_shell":"echo x > out_probe429.txt","priority":0,"lockdirs":["{topdir}/p429/"]}' >/dev/null || fail "probe-429 item"
+(cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" ITER_USAGE_DIR="$ITER_USAGE_DIR" "$ENGINE_BIN" --config .iter/config.json --ticks 3 > "$SCRATCH/engine-probe429.log" 2>&1) || true
+grep -q "usage probe 'TestAcct': 5h 100% 7d 10% (rejected)" "$SCRATCH/engine-probe429.log" || { cat "$SCRATCH/engine-probe429.log"; fail "429 probe did not yield 100%"; }
+[ ! -f "$SAMPLE/out_probe429.txt" ] || fail "engine ran work on an account the server rejects"
+grep -q "all accounts at stop%" "$SCRATCH/engine-probe429.log" || fail "hard-limit hold not logged"
+rm -f "$PROBE_LOG.reject"
+snap TestAcct 10 5
+curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01" | jq '.probe_stale_min=0' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/engines/Engine01" -d @- >/dev/null
+pass "hard limit: a 429 with headers reads as 100% -> no work picked, hold until a window resets"
+
 # human answers the stuck item's widget with "accept" -> engine closes it without a run
 GSO=$(echo "$GSQ" | jq -r .order)
 echo "$GSQ" | jq '.value.fields[0].value="accept" | {key:.key,valuetype:.valuetype,value:.value}' \
@@ -680,6 +754,31 @@ BEFORE=$(grep -c "worker gate-stuck" "$GATE_LOG")
 [ "$(st_of "$GS")" = complete ] || { cat "$SCRATCH/engine-gate2.log"; fail "gate-stuck after accept state=$(st_of "$GS") (expected complete)"; }
 [ "$(grep -c "worker gate-stuck" "$GATE_LOG")" = "$BEFORE" ] || fail "accept should close without running an agent"
 pass "close gate: human 'accept' closes the item complete without spending a run"
+
+# ---- ELI5 / explain (2026-09-04): on a CLOSED item, at once, outside the cap ----
+curl -sf "${AUTH[@]}" -X PUT "$BASE/api/agents/explain" -d '{"model":"sonnet","max":1,"timeoutsec":300,"promptbody":"# Agent Definition: explain\n\nYou are the **explain** agent.\n"}' >/dev/null || fail "explain agent put"
+GRX=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR"); [ "$(echo "$GRX" | jq -r .state)" = complete ] || fail "gate-recovers is not closed"
+R=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$GR/explain" -d '{}') || fail "explain request"
+[ -n "$(echo "$R" | jq -r .requested)" ] || fail "explain not stamped: $R"
+[ "$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$GR/explain" -d '{}' | jq -r .already)" = true ] || fail "second explain request should report already"
+[ -n "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR" | jq -r .explain_requested)" ] || fail "explain_requested not on the item"
+# the project is Stopped-or-Running either way; cap 0 must not matter: set maxagents else=0 for this run
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.maxagents={"else":0}' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
+(cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" "$ENGINE_BIN" --config .iter/config.json --ticks 3 > "$SCRATCH/engine-eli5.log" 2>&1) || true
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.maxagents={"else":4}' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
+grep -q "ELI5 requested .* explaining now, outside the cap" "$SCRATCH/engine-eli5.log" || { cat "$SCRATCH/engine-eli5.log"; fail "engine did not pick up the ELI5 request"; }
+grep -q "explained .* 'gate-recovers'" "$SCRATCH/engine-eli5.log" || { cat "$SCRATCH/engine-eli5.log"; fail "engine did not report the explanation"; }
+EX=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR/details" | jq -r '[.[]|select(.key=="explained")]|last|.value')
+grep -q "EXPLAINED-MARKER" <<<"$EX" || fail "no 'explained' detail row on the closed item: $(keys_of "$GR")"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR" | jq -r .explain_requested)" = "" ] || fail "explain_requested not cleared"
+[ "$(st_of "$GR")" = complete ] || fail "explain changed the item's state"
+grep -q -- "--allowedTools Read,Glob,Grep --disallowedTools Bash,Edit,Write" "$GATE_LOG" || { grep -A3 "explain tools" "$GATE_LOG" | tail -5; fail "explain session was not read-only"; }
+for m in "# Explain this work item simply (ELI5)" "READ-ONLY" "Title: gate-recovers" "### request" "### response" "main.iter.md" "reqs/techreq.md"; do
+  grep -qF -- "$m" "$GATE_PROMPTS/eli5-prompt.txt" || { head -40 "$GATE_PROMPTS/eli5-prompt.txt"; fail "ELI5 prompt lacks: $m"; }
+done
+grep -q "### spend" "$GATE_PROMPTS/eli5-prompt.txt" && fail "ELI5 prompt should not carry spend rows"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GR/details" | jq '[.[]|select(.key=="spend" and .value.agent=="explain")]|length')" = 1 ] || fail "explain spend row missing"
+pass "ELI5: button flag -> engine explains a closed item at once with cap 0 (read-only tools), 'Explained Simply' row appended, flag cleared, spend recorded"
 
 # webui served
 [ "$(curl -sf "$BASE/" | grep -c "ITER")" -ge 1 ] || fail "webui not served"

@@ -411,3 +411,130 @@ mod tests {
         assert!(answered_question(&d2).is_none(), "a surfaced answer is history");
     }
 }
+
+/// The built-in `explain` persona (spec: Explain / ELI5), used when the
+/// project's `explain` agent record has no body of its own.  Kept in sync
+/// with the record seeded into pdy-dev on 2026-09-04.
+pub const EXPLAIN_DEFAULT_BODY: &str = r#"# Agent Definition: explain
+
+You are the **explain** agent — the "explain it like I'm five" (ELI5) agent. A human
+pressed a button on a work item they could not follow. Your only job is to re-explain
+that work item so that person understands it on one reading. You change nothing:
+no code, no files, no work items — you read, and you write one explanation.
+
+## Who you are writing for
+
+Someone who has NEVER seen this codebase. They know the business — what the product
+does for the people who use it — and nothing about how the repository spells it.
+Every internal name (a container, a rule id, a gate, a function, a file, a work item
+id) is a word they have never met. A bare internal name is a lookup task you have
+handed them; gloss every one the first time it appears, in the same sentence.
+
+## How to explain
+
+1. **Start where the business flow is.** Name the moment in the user's or operator's
+   journey where this work item matters, in the words a customer or operator would
+   use. Only then introduce the internal names, each glossed as it appears.
+2. **Say what the work item is asking for, or asking about.** For a question: the one
+   decision, restated plainly, then each option in plain terms with what it buys and
+   what it costs, then the agent's recommendation if it gave one. For a parked or
+   failed item: why it stopped, in plain terms. For finished work: what changed and
+   why it mattered.
+3. **Use an analogy when the mechanism is genuinely complex.** One analogy, kept
+   close to the real thing; drop it as soon as the plain description carries.
+4. **Keep it short.** Context is not length. Aim for what fits on one screen: a few
+   short paragraphs, or a short list where the item has several parts. No headings
+   deeper than one level, no tables of internal names.
+5. **Point at the source.** End with one line naming the file(s) a curious reader
+   would open to see for themselves (path only, no quoting of code).
+
+Bad: "based on rule ABC, once _potatochip has traversed the cankor gate, should rule
+XYZ apply only twice?"
+Good: "When a customer asks for a bag of potato chips, we first confirm they have
+paid (rule ABC, enforced by the payment container cntr_ABC) and that they have not
+typed obscenities into the console (the 'cankor gate', a check run by the Rulebook
+container). If they have typed obscenities, should we refuse the chips after one
+offense or after two? The instructions in main.bizreq.iter.md do not say."
+"#;
+
+pub struct ExplainInput<'a> {
+    pub agent_body: &'a str,
+    pub head: &'a Head,
+    pub project: &'a Project,
+    pub item: &'a WorkItem,
+    pub details: &'a [Value],
+    pub codepath: &'a Path,
+    pub topdir: &'a Path,
+}
+
+/// The single-turn prompt for an ELI5 run: persona, the work item and every
+/// human-relevant detail row inline (the reader's whole record), then the
+/// files to read for context — project head + global context files, the
+/// codepath's marker chain (its node file and every ancestor's), and the
+/// item's own context files.  Read-only is stated up front and enforced by
+/// the spawn's tool allow-list.
+pub fn explain_prompt(inp: &ExplainInput) -> String {
+    let mut s = String::new();
+    s.push_str(inp.agent_body.trim_end());
+    s.push_str("\n\n# Explain this work item simply (ELI5)\n\n");
+    s.push_str("This session is READ-ONLY: you have Read, Glob and Grep and nothing else. Do not try to \
+                edit, run commands, or create work items. Your entire output is the explanation; it is \
+                appended to the work item as-is for the human to read, so write it for them directly — \
+                no preamble about what you are going to do, no notes to the engine.\n\n");
+    s.push_str(&format!(
+        "## The work item\nTitle: {}\nId: {}\nState: {}\nAgent type: {}\nPriority: P{}\nRequested by: {}\nCreated by: {}\n",
+        inp.item.name, inp.item.id, inp.item.state, inp.item.agent, inp.item.priority,
+        if inp.item.requestedby.is_empty() { "—" } else { &inp.item.requestedby },
+        if inp.item.createdby.is_empty() { "—" } else { &inp.item.createdby },
+    ));
+    if !inp.item.lasterror.is_empty() {
+        s.push_str(&format!("Last error: {}\n", inp.item.lasterror));
+    }
+    if !inp.item.lockdirs.is_empty() {
+        s.push_str(&format!("Codepath(s): {}\n", inp.item.lockdirs.join(", ")));
+    }
+    s.push_str("\n## Its record (every detail row, oldest first)\n");
+    let mut rows: Vec<&Value> = inp.details.iter().collect();
+    rows.sort_by_key(|d| d.get("order").and_then(|o| o.as_i64()).unwrap_or(0));
+    for d in rows {
+        let key = d.get("key").and_then(|k| k.as_str()).unwrap_or("");
+        if matches!(key, "spend" | "v2" | "explained") {
+            continue; // cost rows, migration leftovers and earlier explanations are not the story
+        }
+        let by = d.get("by").and_then(|b| b.as_str()).unwrap_or("");
+        let ts = d.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+        let body = match d.get("value") {
+            Some(Value::String(t)) => t.clone(),
+            Some(v) if !v.is_null() => serde_json::to_string_pretty(v).unwrap_or_default(),
+            _ => String::new(),
+        };
+        s.push_str(&format!("\n### {key}{}{}\n{}\n", if by.is_empty() { String::new() } else { format!(" (by {by})") },
+            if ts.is_empty() { String::new() } else { format!(" — {ts}") }, body.trim()));
+    }
+    s.push_str("\n## Read these for context before writing (paths, not quotes)\n");
+    if !inp.head.context_files.is_empty() {
+        s.push_str("Project definition and global requirements:\n");
+        for f in &inp.head.context_files {
+            s.push_str(&format!("- {}\n", f.display()));
+        }
+    }
+    let (marker, ancestors) = marker_chain(inp.codepath, inp.topdir);
+    let chain: Vec<&PathBuf> = marker.iter().chain(ancestors.iter()).filter(|f| !inp.head.context_files.contains(f)).collect();
+    if !chain.is_empty() {
+        s.push_str("The codepath's node files — its own first, then each ancestor's up to the project root:\n");
+        for f in chain {
+            s.push_str(&format!("- {}\n", f.display()));
+        }
+    }
+    let (files, _warnings) = resolve_context(inp.item, inp.project, inp.codepath, inp.topdir);
+    let extra: Vec<PathBuf> = files.into_iter().filter(|f| !inp.head.context_files.contains(f) && !marker.contains(f) && !ancestors.contains(f)).collect();
+    if !extra.is_empty() {
+        s.push_str("The work item's own context files:\n");
+        for f in &extra {
+            s.push_str(&format!("- {}\n", f.display()));
+        }
+    }
+    s.push_str("\nRead what you need from those (and the code they point at) to be sure you understand \
+                the item, then write the explanation. Output the explanation only.\n");
+    s
+}

@@ -48,6 +48,10 @@ struct Args {
     /// print configured account envars and whether each is set, then exit
     #[arg(long, default_value_t = false)]
     accounts: bool,
+    /// like --accounts, but also probe each set token for its live 5h/7d
+    /// usage% (one 1-token haiku call per account) and write the snapshots
+    #[arg(long, default_value_t = false)]
+    probe: bool,
     /// validate a question-widget json file, then exit
     #[arg(long)]
     question_widget: Option<String>,
@@ -126,8 +130,8 @@ fn main() {
     if let Some(workid) = &args.approve {
         return approve(&api, workid, args.pvtkeypath.as_deref(), args.user.as_deref());
     }
-    if args.accounts {
-        return accounts(&api);
+    if args.accounts || args.probe {
+        return accounts(&api, args.probe);
     }
     if let Some(prefix) = &args.doc {
         return doc(&api, prefix, args.text.as_deref(), args.file.as_deref());
@@ -137,7 +141,6 @@ fn main() {
         eprintln!("no engine token: set {} (mint via POST /api/users/<engine-user>/token as admin)", cfg.token_envar);
         std::process::exit(2);
     }
-    usage::install_collector();
     let mut rt = engine::EngineRuntime::new(api, cfg.engine_name.clone());
     if args.ticks > 0 {
         rt.max_ticks = Some(args.ticks);
@@ -339,7 +342,7 @@ fn doc(api: &Api, workid_prefix: &str, text: Option<&str>, file: Option<&str>) {
     }
 }
 
-fn accounts(api: &Api) {
+fn accounts(api: &Api, probe: bool) {
     let projects = api.get("/api/projects").ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
     for p in &projects {
         let pname = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -347,11 +350,24 @@ fn accounts(api: &Api) {
         for a in p.get("accounts").and_then(|a| a.as_array()).cloned().unwrap_or_default() {
             let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let envar = a.get("token_envar").and_then(|n| n.as_str()).unwrap_or("");
-            let set = std::env::var(envar).map(|v| !v.trim().is_empty()).unwrap_or(false);
+            let tok = std::env::var(envar).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
             println!(
                 "  {name}: {envar} = {}",
-                if set { "SET" } else { "NOT SET (add to your .env)" }
+                if tok.is_some() { "SET" } else { "NOT SET (add to your .env)" }
             );
+            if probe {
+                if let Some(tok) = tok {
+                    match usage::probe_and_record(name, &tok) {
+                        Ok(u) => println!(
+                            "      usage: 5h {:.0}% 7d {:.0}% ({}{}) -> {}",
+                            u.five_hour_pct, u.seven_day_pct, u.status,
+                            if u.is_using_overage { ", OVERAGE" } else { "" },
+                            usage::snapshot_path(name).display()
+                        ),
+                        Err(e) => println!("      probe FAILED: {e}"),
+                    }
+                }
+            }
         }
     }
     if projects.is_empty() {
