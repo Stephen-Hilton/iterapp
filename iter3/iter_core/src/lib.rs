@@ -258,6 +258,11 @@ pub struct WorkItem {
     pub requestedby: String,
     #[serde(default)]
     pub blockedby: Vec<String>,
+    /// opt out of DEEP dependencies (workitem_dependency.md): by default a
+    /// blocker is satisfied only when it AND everything it created (createdby,
+    /// transitively) closed complete; shallow = the blocker alone
+    #[serde(default)]
+    pub blockedby_shallow: bool,
     #[serde(default)]
     pub attempt: u32,
     /// close-gate bounces so far (spec: Close Gate); reset by a human requeue
@@ -387,6 +392,65 @@ pub struct ProjectStructure {
     pub snapshot: serde_json::Value,
 }
 
+/// Dependency gate (workitem_dependency.md, V2 semantics kept in V3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DepStatus {
+    Satisfied,
+    /// still waiting on this item (the blocker itself, or one of its descendants)
+    Waiting(String),
+    /// this blocker (or a descendant) closed failed: never release, park for review
+    Failed(String),
+}
+
+/// creator id -> items it created (createdby)
+pub fn children_index(items: &[WorkItem]) -> std::collections::HashMap<String, Vec<&WorkItem>> {
+    let mut idx: std::collections::HashMap<String, Vec<&WorkItem>> = std::collections::HashMap::new();
+    for i in items {
+        if !i.createdby.is_empty() {
+            idx.entry(i.createdby.clone()).or_default().push(i);
+        }
+    }
+    idx
+}
+
+/// Deep by default: every blocker must be complete and so must every item it
+/// created, transitively. Unknown ids (deleted) count as satisfied. Cycle-safe.
+pub fn dependency_status(
+    item: &WorkItem,
+    by_id: &std::collections::HashMap<String, &WorkItem>,
+    children: &std::collections::HashMap<String, Vec<&WorkItem>>,
+) -> DepStatus {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for dep in &item.blockedby {
+        let Some(d) = by_id.get(dep) else { continue };
+        if d.state == "failed" {
+            return DepStatus::Failed(d.id.clone());
+        }
+        if d.state != "complete" {
+            return DepStatus::Waiting(d.id.clone());
+        }
+        if item.blockedby_shallow {
+            continue;
+        }
+        let mut stack: Vec<&WorkItem> = children.get(dep).map(|v| v.clone()).unwrap_or_default();
+        while let Some(c) = stack.pop() {
+            if c.id == item.id || !seen.insert(c.id.clone()) {
+                continue;
+            }
+            if c.state == "failed" {
+                return DepStatus::Failed(c.id.clone());
+            }
+            if c.state != "complete" {
+                return DepStatus::Waiting(c.id.clone());
+            }
+            if let Some(more) = children.get(&c.id) {
+                stack.extend(more.iter().copied());
+            }
+        }
+    }
+    DepStatus::Satisfied
+}
+
 /// Two lock paths overlap when one is an ancestor of (or equal to) the other.
 /// Paths are compared after trimming trailing slashes; `{topdir}` prefixes
 /// compare literally, which is correct because both sides use the same token.
@@ -443,6 +507,35 @@ mod tests {
 
     fn acct(name: &str, order: i64, switch: u8, stop: u8) -> Account {
         Account { name: name.into(), token_envar: format!("{}_TOKEN", name.to_uppercase()), order, switch, stop }
+    }
+
+    fn wi(id: &str, state: &str, createdby: &str, blockedby: &[&str]) -> WorkItem {
+        WorkItem { id: id.into(), state: state.into(), createdby: createdby.into(),
+            blockedby: blockedby.iter().map(|s| s.to_string()).collect(), ..Default::default() }
+    }
+
+    #[test]
+    fn deep_dependencies_wait_for_descendants_and_park_on_failure() {
+        let items = vec![
+            wi("plan", "complete", "user", &[]),
+            wi("child", "queued", "plan", &[]),
+            wi("grandchild", "complete", "child", &[]),
+            wi("dep", "queued", "user", &["plan"]),
+        ];
+        let by_id: std::collections::HashMap<String, &WorkItem> = items.iter().map(|i| (i.id.clone(), i)).collect();
+        let kids = children_index(&items);
+        assert_eq!(dependency_status(&items[3], &by_id, &kids), DepStatus::Waiting("child".into()));
+        let mut shallow = items[3].clone();
+        shallow.blockedby_shallow = true;
+        assert_eq!(dependency_status(&shallow, &by_id, &kids), DepStatus::Satisfied);
+        // descendant failed -> Failed; unknown blocker -> satisfied
+        let mut failed = items.clone();
+        failed[1].state = "failed".into();
+        let by2: std::collections::HashMap<String, &WorkItem> = failed.iter().map(|i| (i.id.clone(), i)).collect();
+        let kids2 = children_index(&failed);
+        assert_eq!(dependency_status(&failed[3], &by2, &kids2), DepStatus::Failed("child".into()));
+        let ghost = wi("g", "queued", "", &["nope"]);
+        assert_eq!(dependency_status(&ghost, &by_id, &kids), DepStatus::Satisfied);
     }
 
     #[test]

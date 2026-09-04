@@ -380,7 +380,7 @@ async function loadItems(p){
   try{localStorage.setItem("iter_project",p);}catch(e){}
   document.querySelectorAll("#projects .proj").forEach(b=>b.classList.toggle("sel",b.dataset.p===p));
   const [items]=await Promise.all([api(P()),renderProjectCtl().catch(()=>{})]);
-  itemsCache=items;
+  itemsCache=items;buildKids(itemsCache);
   renderCounts();renderItems();
 }
 
@@ -389,27 +389,31 @@ async function loadItems(p){
    the status endpoint says whether every engine has honored a drain. */
 async function renderProjectCtl(){
   if(!project){$("#projctl").innerHTML="";return;}
-  const [proj,status]=await Promise.all([api("/api/projects/"+encodeURIComponent(project)),
-    api("/api/projects/"+encodeURIComponent(project)+"/status").catch(()=>null)]);
+  const pp="/api/projects/"+encodeURIComponent(project);
+  let proj=await api(pp);
+  if(proj.state==="Draining"){ // transitional: settle to Stopped as soon as nothing runs
+    try{const r=await api(pp+"/settle",{method:"POST",body:"{}"});if(r.settled)proj=await api(pp);}catch(e){}
+  }
+  const status=await api(pp+"/status").catch(()=>null);
   const live=status?status.engines.filter(e=>!e.stale).length:0;
   const total=status?status.engines.length:0;
   const running=status?(status.inprogress||0):0;
-  let note=`${live}/${total} engines online`;
-  if(proj.state==="Draining")note+=status&&status.all_drained?" · drained":` · ${running} still running`;
-  else if(proj.state==="Running")note+=` · ${running} running`;
+  let note=`${live}/${total} engines online · ${running} running`;
   if(status&&status.not_honoring&&status.not_honoring.length)note+=` · <span style="color:var(--bad)">not honoring: ${esc(status.not_honoring.join(", "))}</span>`;
-  $("#projctl").innerHTML=`<span class="kv"><b>${esc(project)}</b> ${note}</span>
-    <span class="seg">${["Running","Draining","Stopped"].map(st=>`<button class="${st} ${proj.state===st?"on":""}" data-st="${st}" ${proj.state===st?"disabled":""}>${st}</button>`).join("")}</span>`;
+  const st=proj.state;
+  const seg=st==="Draining"
+    ?`<button class="Draining on" disabled>Stopping… (${running} running)</button><button class="Running" data-st="Running">Running</button><button class="Stopped" data-st="Stopped" title="stop now without waiting for running work">force stop</button>`
+    :`<button class="Running ${st==="Running"?"on":""}" data-st="Running" ${st==="Running"?"disabled":""}>Running</button><button class="Stopped ${st==="Stopped"?"on":""}" data-st="Stopped" ${st==="Stopped"?"disabled":""}>Stopped</button>`;
+  $("#projctl").innerHTML=`<span class="kv"><b>${esc(project)}</b> ${note}</span><span class="seg">${seg}</span>`;
   $("#projctl").querySelectorAll("button[data-st]").forEach(b=>b.onclick=async()=>{
-    const st=b.dataset.st;
-    const warn={Running:"Engines will start picking queued work for this project.",
-      Draining:"Engines finish what is running and start nothing new.",
-      Stopped:"Engines stop picking work; anything mid-run finishes its turn."}[st];
-    if(!confirm(`Set ${project} to ${st}?\n${warn}`))return;
+    let target=b.dataset.st;
+    let msg=target==="Running"?"Engines start picking queued work for this project.":"Engines finish what is running and start nothing new; the project shows Stopped once drained.";
+    if(target==="Stopped"&&st==="Running"&&running>0)target="Draining";
+    if(target==="Stopped"&&st==="Draining")msg="Stop immediately without waiting for running work to finish (it keeps running on the engine until its turn ends).";
+    if(!confirm(`${target==="Draining"?"Stop":target} ${project}?\n${msg}`))return;
     try{
-      const fresh=await api("/api/projects/"+encodeURIComponent(project));
-      fresh.state=st;
-      await api("/api/projects/"+encodeURIComponent(project),{method:"PUT",body:JSON.stringify(fresh)});
+      const fresh=await api(pp);fresh.state=target;
+      await api(pp,{method:"PUT",body:JSON.stringify(fresh)});
       await load();
     }catch(e){alert("could not change state: "+e.message);}
   });
@@ -432,9 +436,28 @@ function renderCounts(){
 }
 
 /* ---- run order: only what can run, plus whatever a runnable item is stuck behind ---- */
-function depsSatisfied(i,byId){
-  return (i.blockedby||[]).every(d=>{const dep=byId[d];return !dep||dep.state==="complete";});
+/* dependency gate, DEEP like the engine: a blocker counts only when it and everything
+   it created (createdby, transitively) closed complete; blockedby_shallow opts out */
+let kidsIndex={};
+function buildKids(items){kidsIndex={};items.forEach(i=>{if(i.createdby)(kidsIndex[i.createdby]=kidsIndex[i.createdby]||[]).push(i);});}
+function depStatus(i,byId){
+  const seen=new Set();
+  for(const d of (i.blockedby||[])){
+    const dep=byId[d];if(!dep)continue;
+    if(dep.state==="failed")return {failed:dep.id};
+    if(dep.state!=="complete")return {waiting:dep.id};
+    if(i.blockedby_shallow)continue;
+    const stack=[...(kidsIndex[d]||[])];
+    while(stack.length){
+      const c=stack.pop();if(c.id===i.id||seen.has(c.id))continue;seen.add(c.id);
+      if(c.state==="failed")return {failed:c.id,via:d};
+      if(c.state!=="complete")return {waiting:c.id,via:d};
+      (kidsIndex[c.id]||[]).forEach(x=>stack.push(x));
+    }
+  }
+  return {ok:true};
 }
+function depsSatisfied(i,byId){return depStatus(i,byId).ok===true;}
 function runnable(i){return i.state==="in-progress"||(i.state==="queued"&&!i.needs_approval);}
 function runGroup(i,byId){
   if(i.state==="in-progress")return 0;                       // running now
@@ -629,8 +652,9 @@ async function doAction(act,i){
     case "queue": await setState(i,"queued",f=>{f.needs_approval=false;});break;
     case "runnow_item":{
       const byId={};itemsCache.forEach(x=>{byId[x.id]=x;});
-      const open=(i.blockedby||[]).filter(d=>byId[d]&&byId[d].state!=="complete");
-      if(open.length){alert(`Cannot run now: still blocked by ${open.map(d=>d.slice(-8)).join(", ")}`);return;}
+      const ds=depStatus(i,byId);
+      if(ds.failed){alert(`Cannot run now: dependency ${ds.failed.slice(-8)} closed failed.`);return;}
+      if(ds.waiting){alert(`Cannot run now: still waiting on ${ds.waiting.slice(-8)}${ds.via?" (created by blocker "+ds.via.slice(-8)+"; dependencies are deep)":""}`);return;}
       if(i.needs_approval){alert("Cannot run now: this item still needs a signed approval.");return;}
       if(!confirm(`Run "${i.name.slice(0,60)}" now?\nThe engine starts it on its next tick even if the agent cap is full (no other work starts until the count drops back under the cap). It still waits for any overlapping lock to clear.`))return;
       await setState(i,"queued",f=>{f.needs_approval=false;f.run_now=true;});break;}
@@ -917,6 +941,8 @@ async function openDetail(id){
         requested by <b>${esc(i.requestedby||"—")}</b> · created by <b>${esc(i.createdby||"—")}</b> · blocked by: ${blocked}</div>
       <div class="kv">received ${esc(fmtTs(i.ts&&i.ts.receive)||"—")} · started ${esc(fmtTs(i.ts&&i.ts.start)||"—")}
         · completed ${esc(fmtTs(i.ts&&i.ts.complete)||"—")} · attempt ${esc(i.attempt)} · engine ${esc(i.engine||"—")}</div>
+      ${(()=>{const byId={};itemsCache.forEach(x=>{byId[x.id]=x;});const ds=depStatus(i,byId);
+        return ds.ok?"":`<div class="kv" style="color:var(--warn)">gate: ${ds.failed?"dependency "+esc(ds.failed.slice(-8))+" FAILED":"waiting on "+esc(ds.waiting.slice(-8))+(ds.via?" (created by blocker "+esc(ds.via.slice(-8))+"; deep dependency)":"")}</div>`;})()}
       <div class="kv">lockdirs: ${esc((i.lockdirs||[]).join(", ")||"—")}
         ${i.lasterror?" · <span style='color:var(--bad)'>"+esc(i.lasterror.slice(0,200))+"</span>":""}</div>
       <div id="dl"></div>

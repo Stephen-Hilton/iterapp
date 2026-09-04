@@ -2,7 +2,7 @@
 //! fallback), heartbeat, pick queued work, take central locks, run, close.
 
 use crate::client::Api;
-use iter_core::{Engine, Project, WorkItem, now_utc, paths_overlap, pick_account};
+use iter_core::{DepStatus, Engine, Project, WorkItem, children_index, dependency_status, now_utc, paths_overlap, pick_account};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -271,6 +271,15 @@ impl EngineRuntime {
 
             let Some(project) = self.projects.get(project_name).cloned() else { continue };
             if project.state != "Running" {
+                // Draining is transitional: ask iter_data to settle it to Stopped
+                // once nothing is in progress anywhere
+                if project.state == "Draining" {
+                    if let Ok(r) = self.api.post(&format!("/api/projects/{project_name}/settle"), &json!({})) {
+                        if r.get("settled").and_then(|b| b.as_bool()).unwrap_or(false) {
+                            println!("[engine] {project_name}: drained -> Stopped");
+                        }
+                    }
+                }
                 // Draining/Stopped: finish running work, start nothing new,
                 // fire no schedules
                 continue;
@@ -397,10 +406,28 @@ impl EngineRuntime {
             })
             .collect();
 
+        // dependency gate: DEEP (workitem_dependency.md) — a blocker counts only
+        // when it and everything it created closed complete; a failed blocker
+        // parks the dependent for human review instead of ever releasing it
+        let kids = children_index(&items);
+        let mut park: Vec<(WorkItem, String)> = Vec::new();
+        for i in items.iter().filter(|i| i.state == "queued") {
+            if let DepStatus::Failed(f) = dependency_status(i, &by_id, &kids) {
+                park.push((i.clone(), f));
+            }
+        }
+        for (i, failed_dep) in park {
+            let mut body = serde_json::to_value(&i).unwrap();
+            body["state"] = json!("parked");
+            body["lasterror"] = json!(format!("dependency {} closed failed — parked for review", &failed_dep[..8.min(failed_dep.len())]));
+            println!("[engine] {} '{}': dependency {} failed -> parked", &i.id[..8], i.name, &failed_dep[..8.min(failed_dep.len())]);
+            let _ = self.api.put(
+                &format!("/api/projects/{}/workitems/{}?expect_version={}", project.name, i.id, i.version),
+                &body,
+            );
+        }
         let deps_satisfied = |item: &WorkItem| -> bool {
-            item.blockedby.iter().all(|dep| {
-                by_id.get(dep).map(|d| d.state == "complete").unwrap_or(true)
-            })
+            dependency_status(item, &by_id, &kids) == DepStatus::Satisfied
         };
         let scope_blocked = |item: &WorkItem| -> bool {
             item.lockdirs.iter().any(|d| {
@@ -534,7 +561,11 @@ impl EngineRuntime {
         }) {
             Ok(i) => i,
             Err(e) => {
-                if e.status != 409 {
+                if e.status == 409 {
+                    // usually another engine won the race; if this repeats every
+                    // tick for the same item the row's version is out of step
+                    println!("[engine] claim conflict on {} (v{}) — another engine took it, or its version is stale", &item.id[..8], item.version);
+                } else {
                     eprintln!("[engine] claim failed for {}: {e}", item.id);
                 }
                 return false;

@@ -201,6 +201,40 @@ NCOMMITS=$(cd "$SAMPLE" && git rev-list --count HEAD)
 [ "$NCOMMITS" -ge 2 ] || fail "engine did not commit its work (commits=$NCOMMITS)"
 pass "heartbeat written; git postwork committed ($NCOMMITS commits)"
 
+# ---------- deep dependencies + failed blocker + drain settle (2026-09-04) ----------
+DP=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"deep plan","agent":"exec","exec_shell":"true","state":"complete","lockdirs":["{topdir}/dp/"]}' | jq -r .id)
+DC=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d "{\"name\":\"deep child\",\"agent\":\"exec\",\"exec_shell\":\"echo child > out_dchild.txt\",\"createdby\":\"$DP\",\"state\":\"parked\",\"lockdirs\":[\"{topdir}/dc/\"]}" | jq -r .id)
+DD=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d "{\"name\":\"deep dependent\",\"agent\":\"exec\",\"exec_shell\":\"echo dep > out_ddep.txt\",\"blockedby\":[\"$DP\"],\"lockdirs\":[\"{topdir}/dd/\"]}" | jq -r .id)
+DS=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d "{\"name\":\"shallow dependent\",\"agent\":\"exec\",\"exec_shell\":\"echo shallow > out_dshallow.txt\",\"blockedby\":[\"$DP\"],\"blockedby_shallow\":true,\"lockdirs\":[\"{topdir}/ds/\"]}" | jq -r .id)
+DF=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"failed blocker","agent":"exec","exec_shell":"false","state":"failed","lockdirs":["{topdir}/df/"]}' | jq -r .id)
+DG=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d "{\"name\":\"depends on failed\",\"agent\":\"exec\",\"exec_shell\":\"echo never > out_dnever.txt\",\"blockedby\":[\"$DF\"],\"lockdirs\":[\"{topdir}/dg/\"]}" | jq -r .id)
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config.json --ticks 4 > "$SCRATCH/engine-deep.log" 2>&1) || true
+[ ! -f "$SAMPLE/out_ddep.txt" ] || fail "deep dependent ran while the blocker's child was still open"
+[ -f "$SAMPLE/out_dshallow.txt" ] || { cat "$SCRATCH/engine-deep.log"; fail "shallow dependent did not run"; }
+[ ! -f "$SAMPLE/out_dnever.txt" ] || fail "item depending on a FAILED blocker ran"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$DG" | jq -r .state)" = parked ] || fail "failed-blocker dependent not parked"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$DG" | jq -r .lasterror | grep -q "closed failed" || fail "parked dependent lacks the failed-dependency note"
+pass "dependencies are deep: waited on the blocker's child; shallow opt-out ran; failed blocker parked its dependent"
+# release the child -> dependent runs on the next pass
+ITEM=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$DC")
+echo "$ITEM" | jq '.state="queued"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$DC?expect_version=$(echo "$ITEM" | jq -r .version)" -d @- >/dev/null
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config.json --ticks 8 > "$SCRATCH/engine-deep2.log" 2>&1) || true
+[ -f "$SAMPLE/out_ddep.txt" ] || { cat "$SCRATCH/engine-deep2.log"; fail "deep dependent did not run after the child completed"; }
+pass "deep dependent released once the blocker's descendants completed"
+# Draining settles to Stopped when nothing is running (engine-driven)
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.state="Draining"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config.json --ticks 2 > "$SCRATCH/engine-settle.log" 2>&1) || true
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq -r .state)" = Stopped ] || fail "Draining did not settle to Stopped"
+grep -q "drained -> Stopped" "$SCRATCH/engine-settle.log" || fail "engine did not log the settle"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.state="Running"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
+pass "Draining is transitional: settled to Stopped once drained"
+
 # ---------- Run Now override (2026-09-04) ----------
 # cap 1: a long item occupies the only slot; a run_now item must start anyway
 curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.maxagents={"else":1}' \
@@ -356,10 +390,11 @@ WD2=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
 ST=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WD2" | jq -r .state)
 [ "$ST" = queued ] || fail "drain item state=$ST"
 STATUS=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/status")
-[ "$(echo "$STATUS" | jq -r .project_state)" = Draining ] || fail "status project_state"
+# nothing was running, so the transitional Draining settled to Stopped on the engine's first tick
+[ "$(echo "$STATUS" | jq -r .project_state)" = Stopped ] || fail "status project_state (expected settled Stopped, got $(echo "$STATUS" | jq -r .project_state))"
 [ "$(echo "$STATUS" | jq -r .all_drained)" = true ] || fail "status all_drained"
 echo "$STATUS" | jq -e '.engines|length >= 1' >/dev/null || fail "status has no engines"
-pass "Draining: no new picks; status endpoint reports drain state + engine liveness"
+pass "Draining: no new picks; settled to Stopped; status endpoint reports drain state + engine liveness"
 curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.state="Running"' \
   | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
 
@@ -456,7 +491,7 @@ BEFORE=$(grep -c "worker gate-stuck" "$GATE_LOG")
 pass "close gate: human 'accept' closes the item complete without spending a run"
 
 # webui served
-curl -sf "$BASE/" | grep -q "ITER" || fail "webui not served"
+[ "$(curl -sf "$BASE/" | grep -c "ITER")" -ge 1 ] || fail "webui not served"
 pass "webui static page served"
 
 # dynamodb mode: drop the isolated e2e tables so the next run starts clean.

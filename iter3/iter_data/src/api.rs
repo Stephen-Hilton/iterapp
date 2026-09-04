@@ -135,6 +135,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects/{name}", get(project_get).put(project_put).delete(project_delete))
         .route("/api/projects/{name}/versions", get(versions_get))
         .route("/api/projects/{name}/status", get(project_status))
+        .route("/api/projects/{name}/settle", post(project_settle))
         .route("/api/projects/{name}/structure", get(structure_get).put(structure_put))
         .route("/api/projects/{name}/prepostwork", get(prepostwork_list))
         .route("/api/prepostwork/{projectname}/{name}", put(prepostwork_put))
@@ -435,6 +436,28 @@ async fn project_status(_u: AuthUser, State(st): Ctx, Path(name): Path<String>) 
         "all_drained": total_inprogress == 0,
         "not_honoring": not_honoring,
     })))
+}
+
+/// Draining is transitional (decided 2026-09-04): once nothing is in progress
+/// on any live engine, the project settles to Stopped. Engines call this each
+/// tick while Draining; the webui calls it on refresh so a drain with nothing
+/// running settles at once even with no engine up. Writer role suffices —
+/// it can only ever move Draining -> Stopped, and only when drained.
+async fn project_settle(user: AuthUser, State(st): Ctx, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    user.require_writer()?;
+    let mut proj = st.store.get("project", &name, NOSK).await?.ok_or_else(notfound)?;
+    if body_str(&proj, "state") != "Draining" {
+        return Ok(Json(json!({"state": body_str(&proj, "state"), "settled": false})));
+    }
+    let items = st.store.query("workitem", &name).await?;
+    let inprogress = items.iter().filter(|i| body_str(i, "state") == "in-progress").count();
+    if inprogress > 0 {
+        return Ok(Json(json!({"state": "Draining", "settled": false, "inprogress": inprogress})));
+    }
+    proj["state"] = json!("Stopped");
+    st.store.put("project", &name, NOSK, &proj).await?;
+    st.store.bump_seq(&name, "project").await?;
+    Ok(Json(json!({"state": "Stopped", "settled": true})))
 }
 
 // ---------- structure ----------

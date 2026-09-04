@@ -444,6 +444,10 @@ Worker prompt addition: every agent prompt ends with a Close Gate paragraph tell
 
 Because the dependency check is simply `state == complete`, holding the plan item open would also have held its dependent — the gate closes both halves of the incident.
 
+### Dependencies are DEEP; Draining is transitional (built 2026-09-04)
+V2's workitem_dependency.md semantics carried into V3 (iter_core::dependency_status, shared by engine and webui): a blocker is satisfied only when it AND every item it created (createdby, transitively) closed complete; `blockedby_shallow: true` opts out (migrated from V2 depends_on_shallow); a failed blocker or descendant never releases the dependent — the engine parks it with a note naming the failed item.  Motivation: the pdy-dev tombstone (delete pdy_core_shared) sat first in line with its plan complete but the plan's children still open; the shallow check would have fired it.
+Project state control is two-way, Running | Stopped.  Stopping a project with work in progress sets Draining (shown as "Stopping… (N running)", with a force-stop escape); engines call `POST /api/projects/{name}/settle` each tick while Draining and the webui calls it on refresh, and iter_data flips Draining → Stopped once nothing is in progress.  A claim that answers 409 is now logged every tick (silent conflicts hid the migrated-row version bug).
+
 ### Engine usage readout + connectivity test (built 2026-09-04)
 Every heartbeat carries the active account's usage snapshot (`usage`: five_hour_pct, seven_day_pct, resets, ts, age) read from the per-account statusline-collector file, so a run's cost shows on the engine chip on the next tick — the engine bounces what Claude Code reports to it into iter_data for the webui.  The chip's "test" button POSTs `/api/engines/{name}/test`, which stamps `test_requested`; the engine sees it on its next tick, runs `claude -p "."` on haiku with no other context (billed to the active account's token), and answers via heartbeat with `test_result` {ok, ms, subtype, text|error, requested} plus a fresh usage snapshot, clearing the request.  The webui polls the record until the answer for its request lands.
 

@@ -133,6 +133,7 @@ pub fn map_item(v2: &Value, project: &str, topdir_abs: &str) -> Value {
         "createdby": s(v2, "created_by"),
         "requestedby": s(v2, "source"),
         "blockedby": arr(v2, "depends_on"),
+        "blockedby_shallow": v2.get("depends_on_shallow").and_then(|b| b.as_bool()).unwrap_or(false),
         "attempt": v2.get("attempts").and_then(|a| a.as_u64()).unwrap_or(0),
         "gate_bounces": 0,
         "prework": [],
