@@ -201,6 +201,31 @@ NCOMMITS=$(cd "$SAMPLE" && git rev-list --count HEAD)
 [ "$NCOMMITS" -ge 2 ] || fail "engine did not commit its work (commits=$NCOMMITS)"
 pass "heartbeat written; git postwork committed ($NCOMMITS commits)"
 
+# ---------- Run Now override (2026-09-04) ----------
+# cap 1: a long item occupies the only slot; a run_now item must start anyway
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.maxagents={"else":1}' \
+  | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null || fail "cap=1 project update"
+RL=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"long occupant","agent":"exec","exec_shell":"sleep 6; echo long > out_long.txt","priority":1,"lockdirs":["{topdir}/a/"]}' | jq -r .id)
+RN=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"run now please","agent":"exec","exec_shell":"echo now > out_now.txt","priority":9,"lockdirs":["{topdir}/b/"],"run_now":true}' | jq -r .id)
+RW=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+  -d '{"name":"ordinary waiter","agent":"exec","exec_shell":"echo wait > out_wait.txt","priority":2,"lockdirs":["{topdir}/c/"]}' | jq -r .id)
+say "running engine with cap 1 + run_now"
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config.json --ticks 3 > "$SCRATCH/engine-runnow.log" 2>&1) || true
+grep -q "run-now override: starting" "$SCRATCH/engine-runnow.log" || { cat "$SCRATCH/engine-runnow.log"; fail "no run-now override in engine log"; }
+[ -f "$SAMPLE/out_now.txt" ] || { cat "$SCRATCH/engine-runnow.log"; fail "run_now item did not run past the cap"; }
+[ ! -f "$SAMPLE/out_wait.txt" ] || fail "ordinary item started while the cap was saturated"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$RN" | jq -r .run_now)" = false ] || fail "run_now flag not consumed on claim"
+pass "run now: started past a full cap; ordinary work waited; flag consumed"
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config.json --ticks 8 > "$SCRATCH/engine-runnow2.log" 2>&1) || true
+for W in "$RL" "$RN" "$RW"; do
+  [ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$W" | jq -r .state)" = complete ] || fail "run-now scenario item $W not complete"
+done
+pass "run now: everything drained to complete afterwards"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.maxagents={">98%":0,"else":2}' \
+  | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
+
 # ---------- closed items: immutable, docs append, reopen ----------
 ITEM=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA")
 V=$(echo "$ITEM" | jq -r .version)

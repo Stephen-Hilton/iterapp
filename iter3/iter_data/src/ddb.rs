@@ -138,15 +138,19 @@ impl Storage for DdbBackend {
     }
 
     async fn put(&self, table: &str, pk: &str, sk: &str, body: &Value) -> Result<(), StorageError> {
-        self.client
+        // keep the native version attribute in step with the body: versioned
+        // writes condition on it, so a plain put must not leave it missing
+        let mut req = self
+            .client
             .put_item()
             .table_name(self.phys(table))
             .item("pk", av_s(pk))
             .item("sk", av_s(sk))
-            .item("body", av_s(&body.to_string()))
-            .send()
-            .await
-            .map_err(berr)?;
+            .item("body", av_s(&body.to_string()));
+        if let Some(v) = body.get("version").and_then(|v| v.as_u64()) {
+            req = req.item("version", AttributeValue::N(v.to_string()));
+        }
+        req.send().await.map_err(berr)?;
         Ok(())
     }
 

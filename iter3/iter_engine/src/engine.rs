@@ -324,10 +324,7 @@ impl EngineRuntime {
             }
         }
         let cap = max_agents(&project.maxagents, usage_pct) as usize;
-        let running_now = self.running.len();
-        if running_now >= cap {
-            return;
-        }
+        let account_name = account.as_ref().map(|a| a.name.clone()).unwrap_or_default();
 
         // current central lock rows (locks + reservations)
         let lock_rows: Vec<Value> = self
@@ -360,9 +357,33 @@ impl EngineRuntime {
             })
         };
 
+        // Run Now (operator override, 2026-09-04): a queued item flagged run_now
+        // starts as soon as its dependencies are complete and no lock overlaps,
+        // even when the maxagents cap is full.  The cap then stays saturated
+        // until enough running work finishes to bring the count back under it,
+        // so nothing else starts in the meantime.
+        let mut started_now: Vec<String> = Vec::new();
+        let run_now: Vec<&WorkItem> = items
+            .iter()
+            .filter(|i| i.run_now && i.state == "queued" && !i.needs_approval && deps_satisfied(i) && !scope_blocked(i))
+            .collect();
+        for item in run_now {
+            println!(
+                "[engine] run-now override: starting {} '{}' (running {} / cap {})",
+                &item.id[..8.min(item.id.len())], item.name, self.running.len(), cap
+            );
+            if self.start_item(engine, project, topdir, item, &account_name) {
+                started_now.push(item.id.clone());
+            }
+        }
+        let running_now = self.running.len();
+        if running_now >= cap {
+            return;
+        }
+
         let mut queued: Vec<&WorkItem> = items
             .iter()
-            .filter(|i| i.state == "queued" && !i.needs_approval)
+            .filter(|i| i.state == "queued" && !i.needs_approval && !started_now.contains(&i.id))
             .filter(|i| {
                 self.deferred
                     .get(&i.id)
@@ -427,7 +448,6 @@ impl EngineRuntime {
             if item.agent != "exec" && type_running >= type_max {
                 continue;
             }
-            let account_name = account.as_ref().map(|a| a.name.clone()).unwrap_or_default();
             if self.start_item(engine, project, topdir, item, &account_name) {
                 slots -= 1;
             }
@@ -445,6 +465,7 @@ impl EngineRuntime {
         // claim: queued -> in-progress via versioned write (loses race gracefully)
         let mut claimed = serde_json::to_value(item).unwrap();
         claimed["state"] = json!("in-progress");
+        claimed["run_now"] = json!(false); // the override is consumed by this start
         claimed["engine"] = json!(self.name);
         claimed["attempt"] = json!(item.attempt + 1);
         claimed["ts"]["start"] = json!(now_utc());

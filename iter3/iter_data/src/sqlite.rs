@@ -74,10 +74,14 @@ impl Storage for SqliteBackend {
 
     async fn put(&self, table: &str, pk: &str, sk: &str, body: &Value) -> Result<(), StorageError> {
         let conn = self.conn.lock().unwrap();
+        // keep the native version in step with the body (versioned writes
+        // compare against the column, so a plain put must not leave it stale)
+        let ver: Option<i64> = body.get("version").and_then(|v| v.as_i64());
         conn.execute(
-            "INSERT INTO rows (tbl, pk, sk, body) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(tbl, pk, sk) DO UPDATE SET body = excluded.body",
-            params![table, pk, sk, body.to_string()],
+            "INSERT INTO rows (tbl, pk, sk, version, body) VALUES (?1, ?2, ?3, COALESCE(?5, 0), ?4)
+             ON CONFLICT(tbl, pk, sk) DO UPDATE SET body = excluded.body,
+             version = COALESCE(?5, rows.version)",
+            params![table, pk, sk, body.to_string(), ver],
         )
         .map_err(berr)?;
         Ok(())

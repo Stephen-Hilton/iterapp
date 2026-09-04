@@ -277,6 +277,10 @@ pub struct WorkItem {
     pub approval_code: String,
     #[serde(default)]
     pub needs_approval: bool,
+    /// operator override (spec: Run Now): start on the next tick once deps
+    /// and locks allow, even when the maxagents cap is full; cleared on claim
+    #[serde(default)]
+    pub run_now: bool,
 }
 fn default_queued() -> String { "queued".into() }
 fn default_priority() -> i64 { 5 }

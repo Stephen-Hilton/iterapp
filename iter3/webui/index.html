@@ -111,6 +111,7 @@ input,select,textarea{background:var(--bg);color:var(--text);border:1px solid va
 @media (max-width:760px){.projrow .gear{padding:4px 8px}}
 
 /* ---- actions menu ---- */
+.actmenu[hidden]{display:none}   /* the class's display:flex must not beat [hidden] */
 .actmenu{position:fixed;z-index:200;background:var(--panel);border:1px solid var(--line);border-radius:8px;
   padding:6px;min-width:250px;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:2px}
 .actmenu button{background:transparent;color:var(--text);text-align:left;border:0;padding:7px 10px;border-radius:5px;font-weight:500}
@@ -322,8 +323,11 @@ $("#user-gear").onclick=()=>openSettings("user",me);
 async function load(){
   $("#login").style.display="none";$("#layout").style.display="flex";$("#top").style.display="";
   $("#who").textContent=me||"";
-  const[projects,engines,agents]=await Promise.all([api("/api/projects"),api("/api/engines"),api("/api/agents").catch(()=>[])]);
+  const[projects,engines,agents,meRow]=await Promise.all([api("/api/projects"),api("/api/engines"),api("/api/agents").catch(()=>[]),
+    me?api("/api/users/"+encodeURIComponent(me)).catch(()=>null):null]);
   agentsCache=agents;
+  if(meRow&&meRow.role){myRole=meRow.role;try{localStorage.setItem("iter_role",myRole);}catch(e){}}
+  $("#who").textContent=(me||"")+(myRole?" · "+myRole:"");
   projects.sort((a,b)=>a.name.localeCompare(b.name,undefined,{sensitivity:"base"}));
   try{const lp=localStorage.getItem("iter_project");if(lp&&!project&&projects.some(p=>p.name===lp))project=lp;}catch(e){}
   $("#projects").innerHTML=projects.map(p=>
@@ -446,7 +450,7 @@ function comparator(mode,byId){
 }
 
 function tileHtml(i,depth){
-  const att=i.attempt>0?` <span class="att">(A${esc(i.attempt)})</span>`:"";
+  const att=(i.attempt>0?` <span class="att">(A${esc(i.attempt)})</span>`:"")+(i.run_now&&i.state==="queued"?` <span class="att" title="run-now override requested">▶ run now</span>`:"");
   return `
   <div class="tile ${depth?"indent":""}" data-id="${esc(i.id)}">
     <div class="left">
@@ -548,7 +552,9 @@ function menuItems(i){
       note("An agent is waiting on this decision — open the item and answer there.")+b("delete","Delete","danger");
   }
   let rows=[];
+  if(s==="queued")rows.push(b("runnow_item",i.run_now?"Run now (already requested)":"Run now (override agent cap)"));
   if(s==="parked"||s==="paused")rows.push(b("queue","Queue"));
+  if(s==="parked"||s==="paused")rows.push(b("runnow_item","Queue &amp; run now"));
   if((s==="parked"||s==="paused")&&i.sched&&i.sched.kind)rows.push(b("schedule","Resume schedule"));
   if(s==="parked"||s==="paused")rows.push(b("question","Move to question"));
   if(s==="paused"||s==="queued")rows.push(b("park","Park"));
@@ -595,6 +601,13 @@ async function doAction(act,i){
     case "answer": return openDetail(i.id);
     case "doc": return openDetail(i.id);
     case "queue": await setState(i,"queued",f=>{f.needs_approval=false;});break;
+    case "runnow_item":{
+      const byId={};itemsCache.forEach(x=>{byId[x.id]=x;});
+      const open=(i.blockedby||[]).filter(d=>byId[d]&&byId[d].state!=="complete");
+      if(open.length){alert(`Cannot run now: still blocked by ${open.map(d=>d.slice(-8)).join(", ")}`);return;}
+      if(i.needs_approval){alert("Cannot run now: this item still needs a signed approval.");return;}
+      if(!confirm(`Run "${i.name.slice(0,60)}" now?\nThe engine starts it on its next tick even if the agent cap is full (no other work starts until the count drops back under the cap). It still waits for any overlapping lock to clear.`))return;
+      await setState(i,"queued",f=>{f.needs_approval=false;f.run_now=true;});break;}
     case "park": await setState(i,"parked");break;
     case "pause": await setState(i,"paused");break;
     case "question": await setState(i,"question");break;

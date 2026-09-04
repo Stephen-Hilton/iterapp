@@ -444,6 +444,9 @@ Worker prompt addition: every agent prompt ends with a Close Gate paragraph tell
 
 Because the dependency check is simply `state == complete`, holding the plan item open would also have held its dependent — the gate closes both halves of the incident.
 
+### Run Now (decided 2026-09-04)
+An operator override from the Actions menu.  Setting `"run_now": true` on a queued item (or queueing a parked/paused item with it) tells the engine to start that item on its next tick as soon as its dependencies are complete and no lock overlaps — even when the maxagents cap is already full.  The cap is not raised: the running count simply exceeds it until enough work finishes to bring it back under, so nothing else starts in the meantime.  The engine clears the flag when it claims the item, so a retry after failure queues normally.  The webui refuses the action while a logical dependency is open or an approval is pending, and warns that an overlapping lock still has to clear.  Project state is still respected: a Stopped or Draining project starts nothing.
+
 ### Queued is the default create-state
 When an agent creates a new work item, and doesn't specify otherwise, it should create as "queued" by default.  
 TODO is replaced by Parked, and should organically become a rare state, being for future / parked items only.  
