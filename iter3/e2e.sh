@@ -201,6 +201,53 @@ NCOMMITS=$(cd "$SAMPLE" && git rev-list --count HEAD)
 [ "$NCOMMITS" -ge 2 ] || fail "engine did not commit its work (commits=$NCOMMITS)"
 pass "heartbeat written; git postwork committed ($NCOMMITS commits)"
 
+# ---------- closed items: immutable, docs append, reopen ----------
+ITEM=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA")
+V=$(echo "$ITEM" | jq -r .version)
+CODE=$(echo "$ITEM" | jq '.priority=1' | curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$WA?expect_version=$V" -d @-)
+[ "$CODE" = 403 ] || fail "closed workitem PUT accepted (HTTP $CODE)"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$WA/details/0" \
+  -d '{"key":"request","valuetype":"text","value":"rewritten history"}')
+[ "$CODE" = 403 ] || fail "closed workitem detail PUT accepted (HTTP $CODE)"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$WA/details" \
+  -d '{"key":"response","valuetype":"text","value":"fake response"}')
+[ "$CODE" = 403 ] || fail "closed workitem accepted a non-doc append (HTTP $CODE)"
+# tags are the one summary-row exception on closed items
+echo "$ITEM" | jq '.tags=[{"text":"regressed","color":"#f54927"}]' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$WA?expect_version=$V" -d @- >/dev/null || fail "tag-only edit on closed item rejected"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA" | jq -r '.tags[0].text')" = regressed ] || fail "tag edit not persisted"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA" | jq -r .state)" = complete ] || fail "tag edit changed state"
+pass "closed item: summary PUT, detail PUT and non-doc append rejected (403); tag-only edit allowed"
+
+NDET=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA/details" | jq 'length')
+DOC=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$WA/details" \
+  -d '{"key":"doc","valuetype":"text","value":"closeout: verified by hand"}') || fail "doc append on closed item"
+[ "$(echo "$DOC" | jq -r .by)" = admin ] || fail "doc row not stamped with principal ($(echo "$DOC" | jq -c .))"
+[ -n "$(echo "$DOC" | jq -r .ts)" ] && [ "$(echo "$DOC" | jq -r .ts)" != null ] || fail "doc row not stamped with ts"
+# the engine helper appends as the engine principal, by id prefix
+(cd "$SAMPLE" && ITER_ENGINE_TOKEN=$ENGINE_TOKEN "$ENGINE_BIN" --config .iter/config.json --doc "${WA:0:12}" --text "closeout from an agent" > "$SCRATCH/doc.log" 2>&1) || { cat "$SCRATCH/doc.log"; fail "--doc helper"; }
+grep -q "appended" "$SCRATCH/doc.log" || { cat "$SCRATCH/doc.log"; fail "--doc did not report success"; }
+DETS=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA/details")
+[ "$(echo "$DETS" | jq 'length')" = $((NDET + 2)) ] || fail "expected $((NDET+2)) detail rows, got $(echo "$DETS" | jq 'length')"
+echo "$DETS" | jq -e '[.[]|select(.key=="doc")]|length==2' >/dev/null || fail "two doc rows expected"
+echo "$DETS" | jq -e '[.[]|select(.key=="doc" and .by=="engine01")]|length==1' >/dev/null || fail "engine doc row lacks engine principal"
+# orders are unique and dense (atomic allocation)
+[ "$(echo "$DETS" | jq '[.[].order]|unique|length')" = "$(echo "$DETS" | jq 'length')" ] || fail "duplicate detail orders"
+pass "closed item: doc rows append via API and --doc helper, provenance-stamped, orders unique"
+
+# reopen: engine role 403, admin ok -> queued + doc row; then it runs again
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $ENGINE_TOKEN" -H content-type:application/json \
+  -X POST "$BASE/api/projects/$PROJECT/workitems/$WA/reopen" -d '{"reason":"rogue"}')
+[ "$CODE" = 403 ] || fail "engine role reopened a closed item (HTTP $CODE)"
+curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$WA/reopen" -d '{"reason":"rerun after fix"}' >/dev/null || fail "admin reopen"
+ST=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA" | jq -r .state)
+[ "$ST" = queued ] || fail "reopened item state=$ST"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA/details" | jq -e '[.[]|select(.key=="doc" and (.value|test("reopened by admin.*rerun after fix")))]|length==1' >/dev/null || fail "reopen doc row missing"
+rm -f "$SAMPLE/out_a.txt"
+(cd "$SAMPLE" && "$ENGINE_BIN" --config .iter/config.json --ticks 6 > "$SCRATCH/engine-reopen.log" 2>&1) || true
+[ -f "$SAMPLE/out_a.txt" ] || { cat "$SCRATCH/engine-reopen.log"; fail "reopened item did not run again"; }
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$WA" | jq -r .state)" = complete ] || fail "reopened item did not complete"
+pass "reopen: users-only, back to queued with a doc record, ran and closed again"
+
 # ---------- approval flow ----------
 WD=$(curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
   -d '{"name":"sensitive change","agent":"exec","exec_shell":"echo approved-ran > out_d.txt","state":"question","needs_approval":true}' | jq -r .id)
@@ -290,6 +337,85 @@ echo "$STATUS" | jq -e '.engines|length >= 1' >/dev/null || fail "status has no 
 pass "Draining: no new picks; status endpoint reports drain state + engine liveness"
 curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.state="Running"' \
   | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null
+
+# ---------- close gate (spec: Close Gate, 2026-09-03) ----------
+# A fake `claude` on PATH answers worker and verifier sessions from the prompt
+# text, so the gate's state machine runs end to end without spending tokens.
+FAKEBIN="$SCRATCH/fakebin"; mkdir -p "$FAKEBIN"
+export GATE_LOG="$SCRATCH/gate_log.txt"; : > "$GATE_LOG"
+cat > "$FAKEBIN/claude" <<'FAKE'
+#!/usr/bin/env bash
+# fake claude for e2e: -p <prompt> ... ; prints a Claude Code json result object
+prompt=""; while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift;; esac; shift; done
+name=$(grep -o -m1 'Workitem: gate-[a-z]*' <<<"$prompt" | sed 's/Workitem: //')
+emit() { printf '{"type":"result","subtype":"%s","is_error":false,"num_turns":3,"result":%s}\n' "$1" "$(jq -Rn --arg t "$2" '$t')"; }
+if grep -q "iter close-gate verifier" <<<"$prompt"; then
+  echo "verifier $name" >> "$GATE_LOG"
+  if grep -q "DONE-MARKER" <<<"$prompt"; then emit success '{"verdict":"complete","open":[],"reason":"all obligations met"}'
+  else emit success '{"verdict":"incomplete","open":["file the ten build items"],"reason":"the message says it is waiting on a review"}'; fi
+  exit 0
+fi
+echo "worker $name" >> "$GATE_LOG"
+case "$name" in
+  gate-turncap)
+    if grep -q "Close-gate feedback" <<<"$prompt"; then emit success "DONE-MARKER: finished after the cut-off"
+    else emit error_max_turns "partial work, ran out of turns"; fi ;;
+  gate-recovers)
+    if grep -q "Close-gate feedback" <<<"$prompt"; then emit success "DONE-MARKER: filed the ten items"
+    else emit success "Plan written. I'm waiting for the review to finish."; fi ;;
+  *) emit success "Plan written. I'm waiting for the review to finish." ;;
+esac
+FAKE
+chmod +x "$FAKEBIN/claude"
+
+curl -sf "${AUTH[@]}" -X PUT "$BASE/api/agents/gatetest" \
+  -d '{"desc":"close-gate test agent","max":3,"timeoutsec":60,"model":"","promptbody":"You are the gate test agent.","closegate":{"verify":"haiku","max_bounces":1}}' >/dev/null || fail "gatetest agent put"
+curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT" | jq '.agents.gatetest={"max":3}' \
+  | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT" -d @- >/dev/null || fail "project gatetest override"
+mk_gate_item() {
+  curl -sf "${AUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" \
+    -d "{\"name\":\"$1\",\"agent\":\"gatetest\",\"priority\":2}" | jq -r .id
+}
+GR=$(mk_gate_item gate-recovers); GS=$(mk_gate_item gate-stuck); GT=$(mk_gate_item gate-turncap)
+for W in "$GR" "$GS" "$GT"; do
+  curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$W/details/0" \
+    -d '{"key":"request","valuetype":"text","value":"write the plan AND file its build items as workitems"}' >/dev/null || fail "gate request detail"
+done
+say "running engine with fake claude for the close gate"
+(cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" "$ENGINE_BIN" --config .iter/config.json --ticks 14 > "$SCRATCH/engine-gate.log" 2>&1) || true
+
+st_of() { curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$1" | jq -r .state; }
+gb_of() { curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$1" | jq -r .gate_bounces; }
+keys_of() { curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$1/details" | jq -r '[.[].key]|join(",")'; }
+
+[ "$(st_of "$GR")" = complete ] || { cat "$SCRATCH/engine-gate.log"; fail "gate-recovers state=$(st_of "$GR") (expected complete after one bounce)"; }
+[ "$(gb_of "$GR")" = 1 ] || fail "gate-recovers gate_bounces=$(gb_of "$GR") (expected 1)"
+keys_of "$GR" | grep -q "verify" || fail "gate-recovers has no verify detail row"
+[ "$(grep -c "worker gate-recovers" "$GATE_LOG")" = 2 ] || fail "gate-recovers worker runs=$(grep -c "worker gate-recovers" "$GATE_LOG") (expected 2)"
+pass "close gate: verifier bounced an unfinished item once; continuation run completed it"
+
+[ "$(st_of "$GS")" = question ] || { cat "$SCRATCH/engine-gate.log"; fail "gate-stuck state=$(st_of "$GS") (expected question)"; }
+[ "$(gb_of "$GS")" = 2 ] || fail "gate-stuck gate_bounces=$(gb_of "$GS") (expected 2)"
+GSQ=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GS/details" | jq -c '[.[]|select(.key=="question" and .value.gate=="close")]|last')
+[ -n "$GSQ" ] && [ "$GSQ" != null ] || fail "gate-stuck has no close-gate question widget"
+echo "$GSQ" | jq -e '.value.fields[0].key=="action"' >/dev/null || fail "gate widget shape"
+pass "close gate: bounce budget exhausted -> question state with a gate widget"
+
+[ "$(st_of "$GT")" = complete ] || { cat "$SCRATCH/engine-gate.log"; fail "gate-turncap state=$(st_of "$GT") (expected complete)"; }
+[ "$(grep -c "verifier gate-turncap" "$GATE_LOG")" = 1 ] || fail "turn-cap run should skip the verifier (verifier calls=$(grep -c "verifier gate-turncap" "$GATE_LOG"), expected 1)"
+pass "close gate: error_max_turns held deterministically (no verifier spend), continuation completed"
+
+# human answers the stuck item's widget with "accept" -> engine closes it without a run
+GSO=$(echo "$GSQ" | jq -r .order)
+echo "$GSQ" | jq '.value.fields[0].value="accept" | {key:.key,valuetype:.valuetype,value:.value}' \
+  | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$GS/details/$GSO" -d @- >/dev/null || fail "answer gate widget"
+FRESH=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems/$GS")
+echo "$FRESH" | jq '.state="queued"' | curl -sf "${AUTH[@]}" -X PUT "$BASE/api/projects/$PROJECT/workitems/$GS?expect_version=$(echo "$FRESH" | jq -r .version)" -d @- >/dev/null || fail "requeue after answer"
+BEFORE=$(grep -c "worker gate-stuck" "$GATE_LOG")
+(cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" "$ENGINE_BIN" --config .iter/config.json --ticks 4 > "$SCRATCH/engine-gate2.log" 2>&1) || true
+[ "$(st_of "$GS")" = complete ] || { cat "$SCRATCH/engine-gate2.log"; fail "gate-stuck after accept state=$(st_of "$GS") (expected complete)"; }
+[ "$(grep -c "worker gate-stuck" "$GATE_LOG")" = "$BEFORE" ] || fail "accept should close without running an agent"
+pass "close gate: human 'accept' closes the item complete without spending a run"
 
 # webui served
 curl -sf "$BASE/" | grep -q "ITER" || fail "webui not served"

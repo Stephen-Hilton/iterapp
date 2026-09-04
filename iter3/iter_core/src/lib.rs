@@ -57,6 +57,60 @@ pub struct AgentDef {
     pub flags: Option<String>,
     #[serde(default)]
     pub promptbody: String,
+    /// completion contract the engine enforces at close (spec: Close Gate)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closegate: Option<CloseGate>,
+}
+
+/// Per-agent close gate (decided 2026-09-03): what must be true before an
+/// item may close complete.  Every key is overridable per project via
+/// `project.agents[agent].closegate`; see `close_gate_for`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CloseGate {
+    /// verifier model alias (haiku | sonnet | opus | ...); "" disables the LLM half
+    #[serde(default = "default_verify")]
+    pub verify: String,
+    /// the item must have created >=1 workitem with createdby == its id
+    #[serde(default)]
+    pub requires_children: bool,
+    /// the enforced git postwork must have produced a new commit
+    #[serde(default)]
+    pub requires_commit: bool,
+    /// bounces back to queued before the item goes to question
+    #[serde(default = "default_max_bounces")]
+    pub max_bounces: u32,
+    /// turn cap for the verifier session
+    #[serde(default = "default_verify_max_turns")]
+    pub verify_max_turns: u32,
+}
+fn default_verify() -> String { "haiku".into() }
+fn default_max_bounces() -> u32 { 1 }
+fn default_verify_max_turns() -> u32 { 8 }
+impl Default for CloseGate {
+    fn default() -> Self {
+        Self {
+            verify: default_verify(),
+            requires_children: false,
+            requires_commit: false,
+            max_bounces: default_max_bounces(),
+            verify_max_turns: default_verify_max_turns(),
+        }
+    }
+}
+
+/// Resolve the effective close gate: agent-def defaults, then the project's
+/// per-agent override merged key-by-key (an override may set just one key).
+pub fn close_gate_for(agent_def: &serde_json::Value, project_override: &serde_json::Value) -> CloseGate {
+    let mut merged = agent_def.get("closegate").cloned().unwrap_or(serde_json::json!({}));
+    if !merged.is_object() {
+        merged = serde_json::json!({});
+    }
+    if let Some(ovr) = project_override.get("closegate").and_then(|v| v.as_object()) {
+        for (k, v) in ovr {
+            merged[k] = v.clone();
+        }
+    }
+    serde_json::from_value(merged).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -196,6 +250,9 @@ pub struct WorkItem {
     pub blockedby: Vec<String>,
     #[serde(default)]
     pub attempt: u32,
+    /// close-gate bounces so far (spec: Close Gate); reset by a human requeue
+    #[serde(default)]
+    pub gate_bounces: u32,
     #[serde(default)]
     pub prework: Vec<String>,
     #[serde(default)]
@@ -233,6 +290,11 @@ pub struct WorkItemDetail {
     pub valuetype: String,
     #[serde(default)]
     pub value: serde_json::Value,
+    /// provenance, stamped by iter_data on every write: JWT principal + UTC ts
+    #[serde(default)]
+    pub by: String,
+    #[serde(default)]
+    pub ts: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -367,6 +429,23 @@ mod tests {
 
     fn acct(name: &str, order: i64, switch: u8, stop: u8) -> Account {
         Account { name: name.into(), token_envar: format!("{}_TOKEN", name.to_uppercase()), order, switch, stop }
+    }
+
+    #[test]
+    fn close_gate_merges_override_keywise() {
+        let def = serde_json::json!({"closegate": {"verify": "sonnet", "requires_children": true}});
+        let ovr = serde_json::json!({"closegate": {"max_bounces": 2}});
+        let g = close_gate_for(&def, &ovr);
+        assert_eq!(g.verify, "sonnet");
+        assert!(g.requires_children);
+        assert_eq!(g.max_bounces, 2);
+        // absent everywhere -> defaults (haiku, one bounce)
+        let g = close_gate_for(&serde_json::json!({}), &serde_json::Value::Null);
+        assert_eq!(g, CloseGate::default());
+        assert_eq!(g.verify, "haiku");
+        // override can disable the verifier
+        let g = close_gate_for(&def, &serde_json::json!({"closegate": {"verify": ""}}));
+        assert_eq!(g.verify, "");
     }
 
     #[test]

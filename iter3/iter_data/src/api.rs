@@ -148,9 +148,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/projects/{name}/workitems/{id}",
             get(workitem_get).put(workitem_put).delete(workitem_delete),
         )
-        .route("/api/projects/{name}/workitems/{id}/details", get(details_list))
+        .route("/api/projects/{name}/workitems/{id}/details", get(details_list).post(details_append))
         .route("/api/projects/{name}/workitems/{id}/details/{order}", put(detail_put))
         .route("/api/projects/{name}/workitems/{id}/approve", post(workitem_approve))
+        .route("/api/projects/{name}/workitems/{id}/reopen", post(workitem_reopen))
         // locks
         .route("/api/projects/{name}/locks", get(locks_list))
         .route("/api/projects/{name}/locks/acquire", post(lock_acquire))
@@ -611,6 +612,14 @@ async fn workitem_put(
     if let Some(o) = body.as_object_mut() {
         o.remove("expect_version");
     }
+    // closed items are immutable (decided 2026-09-03): append a "doc" detail
+    // row, or POST .../reopen — never edit the record in place.  The one
+    // exception is "tags", so finished work can still be organized.
+    if let Some(current) = st.store.get("workitem", &name, &id).await? {
+        if is_closed(&body_str(&current, "state")) && !tags_only_change(&current, &body) {
+            return Err(closed_err());
+        }
+    }
     body["project"] = json!(name);
     body["id"] = json!(id);
     body["version"] = json!(expect + 1);
@@ -648,17 +657,50 @@ async fn details_list(
     Ok(Json(Value::Array(rows)))
 }
 
-async fn detail_put(
-    user: AuthUser,
-    State(st): Ctx,
-    Path((name, id, order)): Path<(String, String, i64)>,
-    Json(mut body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    user.require_writer()?;
+/// Closed states (decided 2026-09-03): the record is frozen; only "doc"
+/// detail rows may be appended, and only `reopen` moves it back to queued.
+pub const CLOSED_STATES: &[&str] = &["complete", "failed"];
+/// The one detail key that may be appended to a closed item.
+pub const DOC_KEY: &str = "doc";
+
+pub fn is_closed(state: &str) -> bool {
+    CLOSED_STATES.contains(&state)
+}
+
+/// True when `proposed` differs from `current` in nothing but "tags"
+/// (version is the write's own bump and is ignored).
+pub fn tags_only_change(current: &Value, proposed: &Value) -> bool {
+    let strip = |v: &Value| -> Value {
+        let mut c = v.clone();
+        if let Some(o) = c.as_object_mut() {
+            o.remove("tags");
+            o.remove("version");
+            o.remove("expect_version");
+        }
+        c
+    };
+    strip(current) == strip(proposed)
+}
+
+fn closed_err() -> ApiError {
+    ApiError::Status(
+        StatusCode::FORBIDDEN,
+        "closed workitem is immutable: append a \"doc\" detail row (POST .../details) or POST .../reopen".into(),
+    )
+}
+
+/// Validate + provenance-stamp a detail body.  Every detail write records
+/// who (JWT principal) and when, so a closeout note is a real record.
+fn prepare_detail(user: &AuthUser, id: &str, order: i64, mut body: Value) -> Result<Value, ApiError> {
     body["id"] = json!(id);
     body["order"] = json!(order);
+    body["by"] = json!(user.sub);
+    body["ts"] = json!(now_utc());
     let parsed: iter_core::WorkItemDetail =
         serde_json::from_value(body.clone()).map_err(|e| bad(format!("detail does not parse: {e}")))?;
+    if parsed.key.trim().is_empty() {
+        return Err(bad("detail key is required"));
+    }
     // question widgets are validated at write time so malformed ones bounce here
     if parsed.valuetype == "json" && parsed.value.get("fields").is_some() {
         let errs = widget::validate(&parsed.value);
@@ -666,11 +708,120 @@ async fn detail_put(
             return Err(bad(format!("widget invalid: {}", errs.join("; "))));
         }
     }
-    // zero-pad sk so lexical order == numeric order in backends
-    let sk = format!("{order:010}");
-    st.store.put("workitem_detail", &id, &sk, &body).await?;
+    Ok(body)
+}
+
+/// zero-pad sk so lexical order == numeric order in backends
+fn detail_sk(order: i64) -> String {
+    format!("{order:010}")
+}
+
+async fn detail_put(
+    user: AuthUser,
+    State(st): Ctx,
+    Path((name, id, order)): Path<(String, String, i64)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    user.require_writer()?;
+    // in-place detail writes (question answers overwrite value) are for OPEN items only
+    if let Some(item) = st.store.get("workitem", &name, &id).await? {
+        if is_closed(&body_str(&item, "state")) {
+            return Err(closed_err());
+        }
+    }
+    let body = prepare_detail(&user, &id, order, body)?;
+    st.store.put("workitem_detail", &id, &detail_sk(order), &body).await?;
     st.store.bump_seq(&name, "workitem_detail").await?;
     Ok(Json(body))
+}
+
+/// Append a detail row: iter_data allocates the next order atomically
+/// (create-if-absent on the zero-padded sk, retried on a lost race), so two
+/// appenders can never overwrite each other.  On a closed item only "doc"
+/// rows are accepted.
+async fn details_append(
+    user: AuthUser,
+    State(st): Ctx,
+    Path((name, id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    user.require_writer()?;
+    let item = st.store.get("workitem", &name, &id).await?.ok_or_else(notfound)?;
+    if is_closed(&body_str(&item, "state")) && body_str(&body, "key") != DOC_KEY {
+        return Err(ApiError::Status(
+            StatusCode::FORBIDDEN,
+            format!("closed workitem: only \"{DOC_KEY}\" detail rows may be appended"),
+        ));
+    }
+    append_detail(&st, &user, &name, &id, body).await
+}
+
+async fn append_detail(st: &Arc<AppState>, user: &AuthUser, name: &str, id: &str, body: Value) -> Result<Json<Value>, ApiError> {
+    for _ in 0..8 {
+        let next = st
+            .store
+            .query("workitem_detail", id)
+            .await?
+            .iter()
+            .map(|r| r.get("order").and_then(|o| o.as_i64()).unwrap_or(0))
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let row = prepare_detail(user, id, next, body.clone())?;
+        match st.store.put_versioned("workitem_detail", id, &detail_sk(next), &row, 0).await {
+            Ok(()) => {
+                st.store.bump_seq(name, "workitem_detail").await?;
+                return Ok(Json(row));
+            }
+            Err(StorageError::Conflict(_)) => continue, // lost the race for this order; re-read
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::Status(StatusCode::CONFLICT, "could not allocate a detail order (contention)".into()))
+}
+
+// ---------- reopen ----------
+
+#[derive(serde::Deserialize, Default)]
+struct ReopenReq {
+    #[serde(default)]
+    reason: String,
+}
+
+/// Reopen a closed item (users-only, like schedules): back to queued with the
+/// bounce counter reset, and a "doc" row recording who reopened it and why.
+/// Consequence (spec): downstream items still queued become blocked again.
+async fn workitem_reopen(
+    user: AuthUser,
+    State(st): Ctx,
+    Path((name, id)): Path<(String, String)>,
+    body: Option<Json<ReopenReq>>,
+) -> Result<Json<Value>, ApiError> {
+    user.require_writer()?;
+    if user.role == "engine" {
+        return Err(ApiError::Status(StatusCode::FORBIDDEN, "reopen is users-only: the engine/agent path may not reopen closed items".into()));
+    }
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let mut item = st.store.get("workitem", &name, &id).await?.ok_or_else(notfound)?;
+    if !is_closed(&body_str(&item, "state")) {
+        return Err(bad("workitem is not closed"));
+    }
+    let expect = body_u64(&item, "version");
+    let was = body_str(&item, "state");
+    item["state"] = json!("queued");
+    item["gate_bounces"] = json!(0);
+    item["lasterror"] = json!("");
+    item["ts"]["complete"] = json!("");
+    item["version"] = json!(expect + 1);
+    st.store.put_versioned("workitem", &name, &id, &item, expect).await?;
+    st.store.bump_seq(&name, "workitem").await?;
+    let note = if req.reason.trim().is_empty() {
+        format!("reopened by {} (was {was})", user.sub)
+    } else {
+        format!("reopened by {} (was {was}): {}", user.sub, req.reason.trim())
+    };
+    let _ = append_detail(&st, &user, &name, &id, json!({"key": DOC_KEY, "valuetype": "text", "value": note})).await?;
+    Ok(Json(item))
 }
 
 // ---------- approval ----------
@@ -829,4 +980,21 @@ async fn lock_extend(
     st.store.acquire_lock("lock", &name, &req.path, &row, &now, &req.workid).await?;
     st.store.bump_seq(&name, "lock").await?;
     Ok(Json(row))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_items_accept_only_tag_changes() {
+        let cur = json!({"id":"a","state":"complete","priority":5,"tags":[],"version":3});
+        let tagged = json!({"id":"a","state":"complete","priority":5,"tags":[{"text":"regressed","color":"#f00"}],"version":3});
+        assert!(tags_only_change(&cur, &tagged));
+        let reprioritized = json!({"id":"a","state":"complete","priority":1,"tags":[{"text":"x","color":""}],"version":3});
+        assert!(!tags_only_change(&cur, &reprioritized));
+        let reopened = json!({"id":"a","state":"queued","priority":5,"tags":[],"version":3});
+        assert!(!tags_only_change(&cur, &reopened));
+        assert!(is_closed("complete") && is_closed("failed") && !is_closed("question"));
+    }
 }

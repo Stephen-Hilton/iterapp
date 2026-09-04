@@ -4,6 +4,7 @@
 
 mod client;
 mod engine;
+mod gate;
 mod usage;
 mod work;
 
@@ -39,6 +40,16 @@ struct Args {
     /// validate a question-widget json file, then exit
     #[arg(long)]
     question_widget: Option<String>,
+    /// append a "doc" detail row to a workitem (id or unique prefix; works on
+    /// closed items too), then exit; text from --text or --file
+    #[arg(long)]
+    doc: Option<String>,
+    /// doc text for --doc
+    #[arg(long)]
+    text: Option<String>,
+    /// read the doc text from a file ("-" = stdin) for --doc
+    #[arg(long)]
+    file: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -103,6 +114,9 @@ fn main() {
     }
     if args.accounts {
         return accounts(&api);
+    }
+    if let Some(prefix) = &args.doc {
+        return doc(&api, prefix, args.text.as_deref(), args.file.as_deref());
     }
 
     if token.is_empty() {
@@ -226,7 +240,24 @@ fn approve(api: &Api, workid_prefix: &str, pvtkeypath: Option<&str>, user: Optio
         })
         .unwrap_or_default();
 
-    // find the workitem by id or unique prefix across visible projects
+    let (project, id) = find_workitem(api, workid_prefix);
+    let sig = signing.sign(id.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    match api.post(
+        &format!("/api/projects/{project}/workitems/{id}/approve"),
+        &json!({"user": username, "signature": sig_b64}),
+    ) {
+        Ok(_) => println!("approved {id} in '{project}' as {username}"),
+        Err(e) => {
+            eprintln!("approval rejected: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Find one workitem by id or unique prefix across visible projects; exits
+/// on zero or ambiguous matches.
+fn find_workitem(api: &Api, workid_prefix: &str) -> (String, String) {
     let projects = api.get("/api/projects").ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
     let mut matches: Vec<(String, String)> = Vec::new();
     for p in &projects {
@@ -245,22 +276,50 @@ fn approve(api: &Api, workid_prefix: &str, pvtkeypath: Option<&str>, user: Optio
             eprintln!("no workitem matches '{workid_prefix}'");
             std::process::exit(1);
         }
-        1 => {}
+        1 => matches.remove(0),
         n => {
             eprintln!("'{workid_prefix}' is ambiguous ({n} matches); use more of the id");
             std::process::exit(1);
         }
     }
-    let (project, id) = matches.remove(0);
-    let sig = signing.sign(id.as_bytes());
-    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+}
+
+/// `iter --doc <id> --text "..."` / `--file notes.md` (decided 2026-09-03):
+/// append a "doc" detail row.  This is the one write allowed on a closed
+/// item, so an agent can leave a closeout note on a finished prerequisite.
+fn doc(api: &Api, workid_prefix: &str, text: Option<&str>, file: Option<&str>) {
+    let body = match (text, file) {
+        (Some(t), _) => t.to_string(),
+        (None, Some("-")) => {
+            use std::io::Read;
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s).ok();
+            s
+        }
+        (None, Some(path)) => std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("cannot read {path}: {e}");
+            std::process::exit(2);
+        }),
+        (None, None) => {
+            eprintln!("--doc needs --text \"...\" or --file <path|->");
+            std::process::exit(2);
+        }
+    };
+    if body.trim().is_empty() {
+        eprintln!("doc text is empty");
+        std::process::exit(2);
+    }
+    let (project, id) = find_workitem(api, workid_prefix);
     match api.post(
-        &format!("/api/projects/{project}/workitems/{id}/approve"),
-        &json!({"user": username, "signature": sig_b64}),
+        &format!("/api/projects/{project}/workitems/{id}/details"),
+        &json!({"key": "doc", "valuetype": "text", "value": body.trim_end()}),
     ) {
-        Ok(_) => println!("approved {id} in '{project}' as {username}"),
+        Ok(row) => println!(
+            "doc #{} appended to {id} in '{project}'",
+            row.get("order").and_then(|o| o.as_i64()).unwrap_or(-1)
+        ),
         Err(e) => {
-            eprintln!("approval rejected: {e}");
+            eprintln!("doc rejected: {e}");
             std::process::exit(1);
         }
     }

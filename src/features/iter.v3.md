@@ -66,9 +66,11 @@ project json:
     "timeoutsec": 3600,
     "model": "opus",
     "flags": "--dangerously-skip-permissions",
+    "closegate": {"verify": "haiku", "requires_children": false, "requires_commit": false, "max_bounces": 1},
     "promptbody": "this is the full prompt body defining agent behavior, goals, tools, etc. Note there WILL be additional prompt content and context appended to this text."
 }
 ```
+"closegate" (decided 2026-09-03) is the per-agent completion contract the engine enforces before an item may close complete — see Close Gate under ITER_ENGINE.  Every key is overridable per project in iter3_project "agents" (e.g. `"plan": {"closegate": {"requires_children": true}}`).
 
 #### iter3_project
 Projects are a unified body of work which all share the same dev standards; exactly what you'd associate with the word Project. 
@@ -188,6 +190,7 @@ project json:
     "requestedby": "Susy",
     "blockedby": ["184fa9a3-f967-4a98-9d8f-57152e7cbe64"],
     "attempt": 1,
+    "gate_bounces": 0,
     "prework": ["git-pull"],
     "postwork": ["git-commit", "git-push"],
     "ts": { "recieve": "2026-08-29T22:52:53Z",
@@ -203,6 +206,7 @@ Table for workitem detail containing larger data fields; called only by the id. 
 Each ID will have one detail row of "request" with order: 0, but can have N-number of key/values 
 Some agents have built-in subagents, such as a plan agent's critical reviews; they'd have additional detail rows of "reivew" with an incrementing order.
 After completion, it should have a "response" row with the final/highest order.
+The engine's close gate (below) adds a "verify" row (valuetype json: verdict, open obligations, reason, evidence) each time it holds an item back, and a "question" widget row (with `"gate": "close"`) when it gives up and hands the item to a human.
 
 Value can be text, or could be a widget-json document, to record structured data.  
 Valuetype can be text, or json, or int, etc. 
@@ -244,6 +248,26 @@ Or, for structured data — the question-widget schema (decided 2026-09-01): a t
             {"key": "age", "label": "Your Age", "type": "int", "value": 42}
         ]
     }
+}
+```
+
+Closed items are immutable, docs append (decided 2026-09-03).  Motivation: a pdy-dev agent could not leave a closeout record on a completed plan item because the V2 API only edits open items, so the record ended up in a conversation instead of on the item.  V3 rules, enforced in iter_data (thin-webui principle):
+- "closed" = state complete or failed.  question / parked / paused stay fully editable.
+- A closed item's summary row rejects PUT (403), with one exception: a write that changes nothing but "tags" is accepted, so finished work can still be organized (labels like "regressed" or "superseded").  The only way out is `POST /api/projects/{p}/workitems/{id}/reopen` (users-only; the engine role gets 403): state → queued, gate_bounces → 0, lasterror and ts.complete cleared, plus an appended "doc" row "reopened by <user> (was <state>): <reason>".  Consequence, on purpose: downstream items still queued become blocked again.
+- Detail rows on a closed item reject PUT (403; in-place writes such as question answers are for open items).  `POST .../details` appends and is accepted on a closed item ONLY for key "doc" — the same key is valid on open items too (a mid-run note), and the UI badges docs whose ts is later than ts.complete as post-close.
+- `POST .../details` is the append verb everywhere: iter_data allocates the next order atomically (create-if-absent on the zero-padded order, retried on a lost race), so two appenders never overwrite each other.  The engine's own response / verify / question rows use it.
+- Every detail write is provenance-stamped by iter_data: "by" (JWT principal) and "ts" (UTC).  A closeout record is only a record if it says who and when.
+- Agents and humans reach it the same way: `iter --doc <id-or-prefix> --text "..."` or `--file notes.md` (or `-` for stdin), which uses the same unique-prefix lookup as `--approve`.
+
+```json
+{
+    "id": "01890a5d-ac70-7db8-8b5d-10505a42232f",
+    "order": 7,
+    "key": "doc",
+    "valuetype": "text",
+    "value": "Closeout: the ten build items are filed as 8c1…, 9f2…; round-3 critique disposition revised.",
+    "by": "code-agent-engine01",
+    "ts": "2026-09-03T21:14:02Z"
 }
 ```
 
@@ -394,6 +418,32 @@ the iter engine:
 - move whatever "fits" into in-progress state, and run (same as today)
 - loop
 
+### Close Gate (decided 2026-09-03)
+Motivation: in pdy-dev a plan item closed "complete" whose own final message said "I'm waiting for the review to finish"; it had written a plan document but filed none of the ten build items in it.  Three minutes later its dependent dispatched into a tree where the prerequisite had closed but built nothing, and the dependent's agent correctly rejected.  Root cause in iter: "the agent process exited 0 after its last turn" was the entire definition of complete.  Nothing engine-side ever asked whether the item delivered.
+
+The gate runs inside the engine's close step, only for agent items whose run returned successfully (exec:shell items keep exit-0 as their contract; failures keep the retry ladder).  It has a deterministic half and an LLM half, and every failure of either half is a **bounce**, never a silent close:
+
+Deterministic checks (free, evidence the engine already has):
+- **turn cap**: the worker was spawned with `--output-format json`; a result subtype of `error_max_turns` (or anything but `success`) means the agent was cut off, not finished.
+- **open review**: any "review" detail row (valuetype json) with no non-empty "disposition" means a critique was recorded and never acted on.
+- **requires_children** (closegate, default false; plan agents should set true): the item must have created at least one workitem whose "createdby" is this item's id.  A plan that filed nothing has not planned.
+- **requires_commit** (closegate, default false; code agents should set true): the enforced git postwork must have produced a new commit (HEAD moved).  Code that changed nothing has not coded.
+
+LLM verifier ("verify" in closegate: a claude model alias such as haiku | sonnet | opus, or "" to disable; default haiku):
+- one extra headless `claude -p` turn on the verify model, read-only tools (Read, Glob, Grep), bounded by `--max-turns`, billed to the same account as the worker so it shows in the usage% ladder.
+- it receives the request text, the worker's final message, and the deterministic evidence (commit + diff stat, children created, review rows, turn count).
+- it is asked a narrow question — did the final message claim to finish EVERY obligation in the request, and which are still open — and must answer with one json object: `{"verdict": "complete" | "incomplete" | "unclear", "open": ["..."], "reason": "..."}`.  It judges done-ness, not quality; critique review remains a separate mechanism.  An unparseable answer is "unclear".
+
+Outcomes (state transitions, not comments):
+- **complete** → close complete, as before.
+- any bounce while `gate_bounces < max_bounces` (default 1) → a "verify" detail row is written, `gate_bounces` increments, and the item goes back to **queued**.  The next run's prompt carries a "Close-gate feedback" section: the verdict, the open obligations, and the previous final message, so the agent continues rather than restarts.
+- a bounce at the limit, or an **unclear** verdict → a "verify" row plus a "question" widget row (`"gate": "close"`, radio `action`: continue | accept, text `guidance`), and the item goes to **question**.  Answering re-queues it (the widget rule): `continue` feeds the guidance into the next run's prompt; `accept` makes the engine close the item complete on pick without running an agent (honored only while no newer "response" row exists, so a stale accept cannot auto-close a later requeue).
+- the bounce budget is deliberately tiny and mirrors the V2 non-convergence guard: the verifier may not loop an item; after one retry a human decides.
+
+Worker prompt addition: every agent prompt ends with a Close Gate paragraph telling the agent its final message must state what was delivered and list any obligation it did NOT complete (prefixed "NOT DONE:"), and that a verifier compares that message to the request before the item closes.  An honest NOT DONE is a cheap bounce; a persuasive summary that hides one is what the verifier exists to catch.
+
+Because the dependency check is simply `state == complete`, holding the plan item open would also have held its dependent — the gate closes both halves of the incident.
+
 ### Queued is the default create-state
 When an agent creates a new work item, and doesn't specify otherwise, it should create as "queued" by default.  
 TODO is replaced by Parked, and should organically become a rare state, being for future / parked items only.  
@@ -420,6 +470,7 @@ Please create a small helper function called `iter --accounts` that attempt to r
 - `iter --adduser "name"` — see iter3_webui_user section (keypair + gitignore + registration)
 - `iter --approve '<workid>'` — see approval flow in iter3_webui_user section
 - `iter --question-widget` — validate a question-widget json before submitting
+- `iter --doc <id> --text "..."|--file <path|->` — append a "doc" detail row (the one write allowed on a closed item)
 
 
 ## ITER_WEBUI

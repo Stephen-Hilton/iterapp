@@ -142,6 +142,7 @@ a{color:var(--accent)}
 const $=s=>document.querySelector(s);
 let token=null,me=null,project=null,itemsCache=[],stateFilter="",dlgDirty=false;
 const STATES=["in-progress","queued","question","parked","paused","failed","complete","scheduled"];
+const CLOSED=new Set(["complete","failed"]); // immutable except appended "doc" rows + reopen
 
 async function api(path,opts={}){
   const r=await fetch(path,{...opts,headers:{"content-type":"application/json",
@@ -340,13 +341,37 @@ async function openDetail(id){
       <div class="kv">lockdirs: ${esc((i.lockdirs||[]).join(", ")||"—")}
         ${i.lasterror?" · <span style='color:var(--bad)'>"+esc(i.lasterror.slice(0,200))+"</span>":""}</div>
       <div id="dl"></div>
+      <div style="margin-top:14px"><h2>append doc</h2>
+        <textarea id="doc-text" rows="3" style="width:100%" placeholder="note, closeout record, decision… (allowed on closed items)"></textarea>
+        <div style="text-align:right;margin-top:4px"><button id="doc-add">append doc</button>
+        ${CLOSED.has(i.state)?`<button class="ghost" id="reopen" title="back to queued; downstream items become blocked again">reopen</button>`:""}</div></div>
       <div style="margin-top:12px;text-align:right"><button class="ghost" id="dlg-close">close</button></div>
     </div>`;
   dlg.querySelector("#dlg-close").onclick=()=>tryCloseDlg();
+  const docBtn=dlg.querySelector("#doc-add");
+  docBtn.onclick=async()=>{
+    const v=dlg.querySelector("#doc-text").value.trim();if(!v)return;
+    try{
+      await api(`/api/projects/${encodeURIComponent(project)}/workitems/${i.id}/details`,
+        {method:"POST",body:JSON.stringify({key:"doc",valuetype:"text",value:v})});
+      dlgDirty=false;openDetail(i.id);
+    }catch(e){docBtn.textContent="failed: "+e.message;}
+  };
+  const reopenBtn=dlg.querySelector("#reopen");
+  if(reopenBtn)reopenBtn.onclick=async()=>{
+    const reason=prompt("Reopen this item (back to queued). Reason?");if(reason===null)return;
+    try{
+      await api(`/api/projects/${encodeURIComponent(project)}/workitems/${i.id}/reopen`,
+        {method:"POST",body:JSON.stringify({reason})});
+      dlgDirty=false;dlg.close();loadItems(project);
+    }catch(e){reopenBtn.textContent="failed: "+e.message;}
+  };
   const dl=dlg.querySelector("#dl");
+  const closedAt=i.ts&&i.ts.complete;
   details.forEach(d=>{
     const box=document.createElement("div");
-    box.innerHTML=`<h2 style="margin-top:14px">${esc(d.key)} <span class="kv">#${esc(d.order)} (${esc(d.valuetype)})</span></h2>`;
+    const after=d.key==="doc"&&closedAt&&d.ts&&d.ts>closedAt;
+    box.innerHTML=`<h2 style="margin-top:14px">${esc(d.key)} <span class="kv">#${esc(d.order)} (${esc(d.valuetype)})${d.by?" · "+esc(d.by):""}${d.ts?" · "+esc(fmtTs(d.ts)):""}${after?" · <b style='color:var(--q)'>post-close</b>":""}</span></h2>`;
     if(d.valuetype==="json"&&d.value&&Array.isArray(d.value.fields)){box.appendChild(widgetForm(i,d));}
     else{const pre=document.createElement("pre");pre.textContent=typeof d.value==="string"?d.value:JSON.stringify(d.value,null,2);box.appendChild(pre);}
     dl.appendChild(box);
