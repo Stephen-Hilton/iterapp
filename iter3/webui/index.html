@@ -343,11 +343,31 @@ async function load(){
   $("#engines").innerHTML=engines.map(e=>{
     const seen=e.last_seen?Date.parse(e.last_seen):0;
     const alive=seen&&(now-seen)<3*(e.ticksec||5)*1000+5000;
+    const u=e.usage;
+    const usage=u?`5h <b>${esc(Math.round(u.five_hour_pct))}%</b> · 7d <b>${esc(Math.round(u.seven_day_pct))}%</b>${u.age_sec!=null&&u.age_sec>900?` <span title="snapshot age">(${esc(Math.round(u.age_sec/60))}m old)</span>`:""}`:"usage: —";
+    const t=e.test_result;
+    const test=e.test_requested?`<span class="kv" data-testing="${esc(e.name)}">testing…</span>`
+      :t?`<span class="kv" title="${esc(t.error||t.text||"")}">${t.ok?"✓":"✗"} ${esc(fmtTs(t.ts))}${t.ms?" "+(t.ms/1000).toFixed(1)+"s":""}${t.error?" "+esc(String(t.error).slice(0,40)):""}</span>`:"";
     return `<div class="eng"><button class="gear" data-gear="engine" data-name="${esc(e.name)}" title="engine settings">⚙</button><span class="dot ${alive?"on":"off"}"></span><b>${esc(e.name)}</b> ${esc(e.state)}${alive?"":" (offline)"}
-      <br>acct: ${esc(e.account||"—")} · ${esc(e.host||"?")}
-      <br>seen: ${esc(fmtTs(e.last_seen)||"never")}
-      <br>serves: ${esc(Object.keys(e.projects||{}).join(", ")||"—")}</div>`;
+      <br>acct: <b>${esc(e.account||"default")}</b> · ${usage}
+      <br>seen: ${esc(fmtTs(e.last_seen)||"never")} · ${esc(e.host||"?")}
+      <br>serves: ${esc(Object.keys(e.projects||{}).join(", ")||"—")}
+      <br><button class="ghost sm" data-test="${esc(e.name)}" ${e.test_requested?"disabled":""}>test</button> ${test}</div>`;
   }).join("")||"<div class='eng kv'>no engines registered</div>";
+  document.querySelectorAll("[data-test]").forEach(b=>b.onclick=async ev=>{
+    ev.stopPropagation();
+    const name=b.dataset.test;b.disabled=true;b.textContent="testing…";
+    try{
+      const r=await api("/api/engines/"+encodeURIComponent(name)+"/test",{method:"POST",body:"{}"});
+      const t0=Date.now();
+      while(Date.now()-t0<120000){
+        await new Promise(res=>setTimeout(res,2000));
+        const e=await api("/api/engines/"+encodeURIComponent(name));
+        if(!e.test_requested&&e.test_result&&e.test_result.requested===r.requested){await load();return;}
+      }
+      alert(`No answer from ${name} within 2 minutes — is the engine running?`);await load();
+    }catch(e){alert("test failed: "+e.message);await load();}
+  });
   $("#agents").innerHTML=agents.map(a=>`<div class="eng"><button class="gear" data-gear="agent" data-name="${esc(a.name)}" title="${isAdmin()?"edit agent":"view agent (admins edit)"}">${isAdmin()?"⚙":"👁"}</button><b>${esc(a.name)}</b> <span class="kv">${esc(a.model||"—")} · max ${esc(a.max??"—")}</span>
       <br><span class="kv">${esc((a.desc||"").slice(0,70))}</span></div>`).join("")||"<div class='eng kv'>no agents defined</div>";
   document.querySelectorAll("[data-gear]").forEach(g=>g.onclick=ev=>{ev.stopPropagation();openSettings(g.dataset.gear,g.dataset.name);});
@@ -770,6 +790,7 @@ const PROJECT_FIELDS=[
 ];
 const ENGINE_FIELDS=[
   {key:"name",type:"readonly"},{key:"state",type:"readonly",help:"engine-reported (actual)"},{key:"last_seen",type:"readonly"},{key:"account",type:"readonly"},
+  {key:"usage",type:"readonly",help:"active account's 5h / 7d usage, refreshed by every claude session and the test button"},{key:"test_result",type:"readonly"},
   {key:"host",type:"text"},{key:"ticksec",label:"tick (sec)",type:"number"},{key:"full_refresh_minutes",label:"full refresh (min)",type:"number",help:"unconditional reload cadence — the seq fallback"},
   {key:"queuelock",type:"json",rows:3},
   {key:"projects",label:"projects served",type:"json",rows:6,help:'machine-specific dirs per project: {"pdy-dev":{"dirs":{"topdir":"~/dev/pdy-dev/"}}} — remove a project here to stop this engine serving it'},

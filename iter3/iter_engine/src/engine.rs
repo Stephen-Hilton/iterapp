@@ -25,6 +25,8 @@ pub struct EngineRuntime {
     running: Vec<(String, String, std::thread::JoinHandle<()>)>,
     running_count: Arc<AtomicUsize>,
     pub max_ticks: Option<u64>,
+    /// test_requested value already answered (never run the same nudge twice)
+    last_test_handled: String,
 }
 
 use crate::usage;
@@ -70,6 +72,7 @@ impl EngineRuntime {
             running: Vec::new(),
             running_count: Arc::new(AtomicUsize::new(0)),
             max_ticks: None,
+            last_test_handled: String::new(),
         }
     }
 
@@ -111,6 +114,46 @@ impl EngineRuntime {
         }
     }
 
+    /// `claude -p "."` on haiku for the active account; the result and the
+    /// refreshed usage snapshot go back on the engine record.
+    fn run_test(&mut self, engine: &Engine, account: &str) {
+        // token: the active account's env var, from whichever project defines it
+        let token = self
+            .projects
+            .values()
+            .flat_map(|p| p.accounts.iter())
+            .find(|a| a.name == account)
+            .and_then(|a| std::env::var(&a.token_envar).ok())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        let cwd = engine
+            .projects
+            .values()
+            .next()
+            .and_then(|d| d.dirs.get("topdir"))
+            .map(|t| expand_topdir(t))
+            .filter(|t| std::path::Path::new(t).is_dir())
+            .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
+        println!("[engine] connectivity test requested at {} (account '{}')", engine.test_requested, if account.is_empty() { "default" } else { account });
+        let result = match crate::work::nudge(token, account, &cwd) {
+            Ok((out, ms)) => json!({
+                "requested": engine.test_requested, "ts": now_utc(), "ok": out.subtype == "success",
+                "ms": ms, "model": "haiku", "account": account,
+                "text": out.text.chars().take(200).collect::<String>(), "subtype": out.subtype,
+            }),
+            Err(e) => json!({
+                "requested": engine.test_requested, "ts": now_utc(), "ok": false, "model": "haiku",
+                "account": account, "error": e.chars().take(500).collect::<String>(),
+            }),
+        };
+        println!("[engine] connectivity test {}", if result["ok"].as_bool().unwrap_or(false) { "OK" } else { "FAILED" });
+        let _ = self.api.post(
+            &format!("/api/engines/{}/heartbeat", self.name),
+            &json!({"test_result": result, "clear_test": true,
+                    "usage": usage::snapshot_json(account, chrono::Utc::now())}),
+        );
+    }
+
     fn prune_running(&mut self) -> usize {
         self.running.retain(|(_, _, h)| !h.is_finished());
         self.running.len()
@@ -147,11 +190,21 @@ impl EngineRuntime {
             }
         }
 
-        // heartbeat: actual state + account, every tick
+        // heartbeat: actual state + account + the account's usage snapshot,
+        // every tick (the snapshot is refreshed by every claude session's
+        // statusline callback, so a run's cost shows up on the next tick)
         let _ = self.api.post(
             &format!("/api/engines/{}/heartbeat", self.name),
-            &json!({"state": "Running", "account": chosen_account}),
+            &json!({"state": "Running", "account": chosen_account,
+                    "usage": usage::snapshot_json(&chosen_account, now)}),
         );
+
+        // connectivity test requested from the webui: one haiku nudge, then
+        // report the outcome (and the refreshed usage) via heartbeat
+        if !engine.test_requested.is_empty() && engine.test_requested != self.last_test_handled {
+            self.last_test_handled = engine.test_requested.clone();
+            self.run_test(engine, &chosen_account);
+        }
 
         // metadata + queue sync, seq-gated with the periodic full-refresh fallback
         let full_refresh = self.last_full_refresh.elapsed()

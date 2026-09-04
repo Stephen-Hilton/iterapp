@@ -198,6 +198,16 @@ pub struct Engine {
     /// per-project machine paths, keyed by project name
     #[serde(default)]
     pub projects: BTreeMap<String, EngineProjectDirs>,
+    /// engine-owned: latest usage snapshot for the active account
+    /// {account, five_hour_pct, seven_day_pct, ..., ts} (heartbeat)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
+    /// webui-owned: ISO ts of a pending connectivity test ("" = none)
+    #[serde(default)]
+    pub test_requested: String,
+    /// engine-owned: outcome of the last connectivity test
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_result: Option<serde_json::Value>,
 }
 fn default_stopped() -> String { "Stopped".into() }
 fn default_ticksec() -> u64 { 5 }

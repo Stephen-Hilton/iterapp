@@ -142,6 +142,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/engines", get(engines_list))
         .route("/api/engines/{name}", get(engine_get).put(engine_put))
         .route("/api/engines/{name}/heartbeat", post(engine_heartbeat))
+        .route("/api/engines/{name}/test", post(engine_test))
         // workitems
         .route("/api/projects/{name}/workitems", get(workitems_list).post(workitem_create))
         .route(
@@ -519,6 +520,27 @@ struct HeartbeatReq {
     state: String,
     #[serde(default)]
     account: String,
+    /// latest usage snapshot for the active account (engine-owned)
+    #[serde(default)]
+    usage: Option<Value>,
+    /// outcome of a connectivity test the engine just ran
+    #[serde(default)]
+    test_result: Option<Value>,
+    /// the engine consumed test_requested
+    #[serde(default)]
+    clear_test: bool,
+}
+
+/// webui -> engine: ask for a connectivity nudge (`claude -p "."` on haiku);
+/// the engine sees `test_requested` on its next tick and answers via heartbeat.
+async fn engine_test(user: AuthUser, State(st): Ctx, Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
+    user.require_writer()?;
+    let mut row = st.store.get("engine", &name, NOSK).await?.ok_or_else(notfound)?;
+    let ts = now_utc();
+    row["test_requested"] = json!(ts);
+    st.store.put("engine", &name, NOSK, &row).await?;
+    st.store.bump_seq(GLOBAL, "engine").await?;
+    Ok(Json(json!({"requested": ts})))
 }
 
 async fn engine_heartbeat(
@@ -535,6 +557,15 @@ async fn engine_heartbeat(
     }
     if !req.account.is_empty() {
         row["account"] = json!(req.account);
+    }
+    if let Some(u) = req.usage {
+        row["usage"] = u;
+    }
+    if let Some(t) = req.test_result {
+        row["test_result"] = t;
+    }
+    if req.clear_test {
+        row["test_requested"] = json!("");
     }
     st.store.put("engine", &name, NOSK, &row).await?;
     st.store.bump_seq(GLOBAL, "engine").await?;

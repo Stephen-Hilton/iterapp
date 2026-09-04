@@ -444,6 +444,9 @@ Worker prompt addition: every agent prompt ends with a Close Gate paragraph tell
 
 Because the dependency check is simply `state == complete`, holding the plan item open would also have held its dependent — the gate closes both halves of the incident.
 
+### Engine usage readout + connectivity test (built 2026-09-04)
+Every heartbeat carries the active account's usage snapshot (`usage`: five_hour_pct, seven_day_pct, resets, ts, age) read from the per-account statusline-collector file, so a run's cost shows on the engine chip on the next tick — the engine bounces what Claude Code reports to it into iter_data for the webui.  The chip's "test" button POSTs `/api/engines/{name}/test`, which stamps `test_requested`; the engine sees it on its next tick, runs `claude -p "."` on haiku with no other context (billed to the active account's token), and answers via heartbeat with `test_result` {ok, ms, subtype, text|error, requested} plus a fresh usage snapshot, clearing the request.  The webui polls the record until the answer for its request lands.
+
 ### Run Now (decided 2026-09-04)
 An operator override from the Actions menu.  Setting `"run_now": true` on a queued item (or queueing a parked/paused item with it) tells the engine to start that item on its next tick as soon as its dependencies are complete and no lock overlaps — even when the maxagents cap is already full.  The cap is not raised: the running count simply exceeds it until enough work finishes to bring it back under, so nothing else starts in the meantime.  The engine clears the flag when it claims the item, so a retry after failure queues normally.  The webui refuses the action while a logical dependency is open or an approval is pending, and warns that an overlapping lock still has to clear.  Project state is still respected: a Stopped or Draining project starts nothing.
 

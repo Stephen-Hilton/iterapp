@@ -264,6 +264,24 @@ fn spawn_claude(
     wait_with_timeout(cmd, timeout_sec)
 }
 
+/// Connectivity nudge (spec: engine chip "test"): `claude -p "."` on haiku
+/// with no other context, billed to `account`'s token when one is configured.
+/// Cheap, and its statusline callback refreshes the usage snapshot as a side
+/// effect — which is the real payload.
+pub fn nudge(token: Option<String>, account: &str, cwd: &str) -> Result<(RunOut, u128), String> {
+    let started = Instant::now();
+    let mut cmd = Command::new("claude");
+    cmd.arg("-p").arg(".").arg("--output-format").arg("json").arg("--model").arg("haiku").arg("--max-turns").arg("1");
+    cmd.arg("--settings").arg(crate::usage::statusline_settings(account));
+    if let Some(tok) = token {
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", tok);
+    }
+    cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
+    cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let raw = wait_with_timeout(cmd, 120)?;
+    Ok((parse_claude_json(&raw), started.elapsed().as_millis()))
+}
+
 /// `--output-format json` prints one result object: {"type":"result",
 /// "subtype":"success"|"error_max_turns"|..., "result":"<final text>",
 /// "num_turns":N, ...}.  Anything that is not that object is treated as

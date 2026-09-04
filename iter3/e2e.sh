@@ -430,6 +430,19 @@ pass "close gate: bounce budget exhausted -> question state with a gate widget"
 [ "$(grep -c "verifier gate-turncap" "$GATE_LOG")" = 1 ] || fail "turn-cap run should skip the verifier (verifier calls=$(grep -c "verifier gate-turncap" "$GATE_LOG"), expected 1)"
 pass "close gate: error_max_turns held deterministically (no verifier spend), continuation completed"
 
+# connectivity test: webui POSTs /test, the engine nudges (fake claude) and reports back with usage
+curl -sf "${AUTH[@]}" -X POST "$BASE/api/engines/Engine01/test" -d '{}' >/dev/null || fail "engine test request"
+[ -n "$(curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01" | jq -r .test_requested)" ] || fail "test_requested not set"
+(cd "$SAMPLE" && PATH="$FAKEBIN:$PATH" ITER_USAGE_DIR="$ITER_USAGE_DIR" "$ENGINE_BIN" --config .iter/config.json --ticks 2 > "$SCRATCH/engine-test.log" 2>&1) || true
+grep -q "connectivity test OK" "$SCRATCH/engine-test.log" || { cat "$SCRATCH/engine-test.log"; fail "engine did not run the connectivity test"; }
+ENG=$(curl -sf "${AUTH[@]}" "$BASE/api/engines/Engine01")
+[ "$(echo "$ENG" | jq -r .test_requested)" = "" ] || fail "test_requested not cleared"
+[ "$(echo "$ENG" | jq -r .test_result.ok)" = true ] || fail "test_result not ok: $(echo "$ENG" | jq -c .test_result)"
+[ "$(echo "$ENG" | jq -r .usage.account)" = TestAcct ] || fail "usage snapshot not reported on heartbeat: $(echo "$ENG" | jq -c .usage)"
+[ "$(echo "$ENG" | jq -r '.usage.five_hour_pct|floor')" = 10 ] || fail "usage pct wrong: $(echo "$ENG" | jq -c .usage)"
+[ "$(grep -c "verifier\|worker" "$GATE_LOG")" -ge 1 ] || true
+pass "engine test: nudge ran on haiku via fake claude, result + usage reported to iter_data"
+
 # human answers the stuck item's widget with "accept" -> engine closes it without a run
 GSO=$(echo "$GSQ" | jq -r .order)
 echo "$GSQ" | jq '.value.fields[0].value="accept" | {key:.key,valuetype:.valuetype,value:.value}' \

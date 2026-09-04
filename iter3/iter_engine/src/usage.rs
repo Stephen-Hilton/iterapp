@@ -133,6 +133,21 @@ pub fn read_usage(account: &str) -> Option<Usage> {
     parse_snapshot(&text)
 }
 
+/// The snapshot as iter_data/webui see it (engine heartbeat "usage").
+pub fn snapshot_json(account: &str, now: DateTime<Utc>) -> Option<serde_json::Value> {
+    let u = read_usage(account)?;
+    Some(serde_json::json!({
+        "account": account,
+        "five_hour_pct": (u.five_hour_pct * 10.0).round() / 10.0,
+        "seven_day_pct": (u.seven_day_pct * 10.0).round() / 10.0,
+        "five_hour_resets_at": u.five_hour_resets_at,
+        "seven_day_resets_at": u.seven_day_resets_at,
+        "effective_pct": u.effective_pct(now).round(),
+        "ts": u.ts.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        "age_sec": u.age_sec(now),
+    }))
+}
+
 /// account name -> effective pct (rounded), for the ladder + maxagents gates.
 /// Missing snapshot = 0 (unknown usage never blocks; the stale warning is the
 /// operator's signal to wire the collector).
