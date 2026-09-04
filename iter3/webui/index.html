@@ -158,7 +158,7 @@ a{color:var(--accent)}
   #projects{display:flex;gap:6px}
   .proj{width:auto;white-space:nowrap;padding:4px 9px}
   .proj .kv{display:inline;margin-left:6px}
-  #engines{display:flex;gap:10px}
+  #engines,#agents{display:flex;gap:10px}
   .eng{border-top:0;white-space:nowrap;padding:2px 0}
   .eng br{display:none}
   main{padding:10px 12px}
@@ -238,6 +238,10 @@ a{color:var(--accent)}
       <h2>Servers &amp; Engines</h2>
       <div class="eng kv" id="dataserver"></div>
       <div id="engines"></div>
+    </div>
+    <div class="side-section">
+      <h2>Agents</h2>
+      <div id="agents"></div>
     </div>
   </aside>
   <main>
@@ -344,6 +348,8 @@ async function load(){
       <br>seen: ${esc(fmtTs(e.last_seen)||"never")}
       <br>serves: ${esc(Object.keys(e.projects||{}).join(", ")||"—")}</div>`;
   }).join("")||"<div class='eng kv'>no engines registered</div>";
+  $("#agents").innerHTML=agents.map(a=>`<div class="eng"><button class="gear" data-gear="agent" data-name="${esc(a.name)}" title="${isAdmin()?"edit agent":"view agent (admins edit)"}">${isAdmin()?"⚙":"👁"}</button><b>${esc(a.name)}</b> <span class="kv">${esc(a.model||"—")} · max ${esc(a.max??"—")}</span>
+      <br><span class="kv">${esc((a.desc||"").slice(0,70))}</span></div>`).join("")||"<div class='eng kv'>no agents defined</div>";
   document.querySelectorAll("[data-gear]").forEach(g=>g.onclick=ev=>{ev.stopPropagation();openSettings(g.dataset.gear,g.dataset.name);});
   if(projects.length&&!project)project=projects[0].name;
   if(project)await loadItems(project);else renderCounts();
