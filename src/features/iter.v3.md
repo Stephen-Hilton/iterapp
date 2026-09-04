@@ -490,6 +490,8 @@ This is basically the same as current-state, with a few enhancements:
   - clicking the ID should copy the id to clipboard (not open the item's detail)
 - add to "Sort" the attribute "Blocks" which sorts by blocking items
 
+BUILT 2026-09-04 (feedback round after the pdy-dev migration): pinned-bar state chips are ADDITIVE like V2 (queued + question shows both; "total" clears); Sort and Refresh live in the pinned bar; "run order" shows ONLY runnable items (in-progress, or queued without a pending approval) plus open items that have a runnable descendant, nested under the shown blocker — closed items never appear in it; tags render as colored pills on the row between the name and the timestamp (color from the tag, else a stable hash palette); the lightbox is ~50% wider; the migration's "v2" detail row is collapsed as reference-only; "+ New workitem" opens an editable form (name, agent, exec shell, priority, state on save, lockdirs, blocked-by, tags, request); every row and the lightbox carry an "Actions ▾" menu with V2 parity in V3 state names — open items: queue / park / pause / move to question / resume schedule / complete / pause & edit / clone / delete; question: answer / queue without answering; scheduled: run now (clone into a queued run) / pause schedule / retire; closed: clone / follow-up (new item blocked by this one) / reopen / append doc / delete from archive; in-progress: clone only (no mid-run stop in V3 yet).
+
 
 ----
 

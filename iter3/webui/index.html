@@ -10,14 +10,15 @@
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif}
 
-/* ---- pinned top: brand row + counts bar ---- */
+/* ---- pinned top: brand row + counts/tools bar ---- */
 #top{position:sticky;top:0;z-index:50;background:var(--panel);border-bottom:1px solid var(--line)}
 #brandrow{display:flex;align-items:center;gap:16px;padding:8px 18px}
 #brandrow h1{font-size:16px;margin:0;letter-spacing:.06em}
 #brandrow .who{margin-left:auto;color:var(--dim)}
 #counts{display:flex;gap:8px;align-items:center;padding:0 18px 10px;overflow-x:auto}
+#counts .tools{margin-left:auto;display:flex;gap:8px;align-items:center;flex:none}
 .count{display:flex;align-items:baseline;gap:6px;padding:4px 12px;border:1px solid var(--line);
-  border-radius:8px;cursor:pointer;white-space:nowrap;background:var(--bg)}
+  border-radius:8px;cursor:pointer;white-space:nowrap;background:var(--bg);user-select:none}
 .count b{font-size:16px;font-variant-numeric:tabular-nums}
 .count span{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)}
 .count.zero{opacity:.38}
@@ -46,8 +47,10 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
 .dot.on{background:var(--ok)}.dot.off{background:var(--bad)}
 
-button{background:var(--accent);color:#08121f;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer}
+button{background:var(--accent);color:#08121f;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer;font:inherit;font-weight:600}
 button.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+button.danger{background:transparent;color:var(--bad);border:1px solid var(--bad)}
+button.sm{padding:3px 9px;font-size:12px}
 input,select,textarea{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 9px;font:inherit}
 .kv{color:var(--dim);font-size:12px}
 .kv b{color:var(--text)}
@@ -62,6 +65,8 @@ input,select,textarea{background:var(--bg);color:var(--text);border:1px solid va
 .tile .right{display:flex;gap:12px;align-items:center;flex:none;color:var(--dim);font-size:12px}
 .tile .id{font-family:ui-monospace,monospace;cursor:copy}
 .tile .att{color:var(--warn);font-size:12px}
+.tags{display:flex;gap:5px;flex:none}
+.tag{font-size:11px;padding:1px 8px;border-radius:9px;font-weight:600;white-space:nowrap}
 .state{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase;flex:none}
 .state.queued{background:#28405c;color:#9ec9ff}.state.in-progress{background:#274733;color:#7de0ae}
 .state.complete{background:#243328;color:#7fae8c}.state.failed{background:#4b2626;color:#ff9b9b}
@@ -73,14 +78,29 @@ input,select,textarea{background:var(--bg);color:var(--text);border:1px solid va
 @keyframes flashbg{0%{background:#2b4a72;border-color:var(--accent)}100%{background:transparent;border-color:var(--line)}}
 .flash{animation:flashbg 1.8s ease-out}
 
+/* ---- actions menu ---- */
+.actmenu{position:fixed;z-index:200;background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:6px;min-width:250px;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column;gap:2px}
+.actmenu button{background:transparent;color:var(--text);text-align:left;border:0;padding:7px 10px;border-radius:5px;font-weight:500}
+.actmenu button:hover{background:var(--bg)}
+.actmenu button.danger{color:var(--bad)}
+.actmenu .sep{border-top:1px solid var(--line);margin:4px 0}
+.actmenu .note{font-size:11px;color:var(--dim);padding:4px 10px;max-width:300px;white-space:normal}
+
 #login{max-width:340px;margin:12vh auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
 #login input{width:100%;margin-bottom:10px}
 .err{color:var(--bad);min-height:20px}
-dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:10px;max-width:720px;width:90%}
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:10px;max-width:1100px;width:92%}
 dialog::backdrop{background:rgba(0,0,0,.55)}
-pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;max-height:320px;overflow:auto}
+pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;max-height:480px;overflow:auto}
 .wfield{margin:10px 0}
 .wfield label{display:block;color:var(--dim);margin-bottom:4px}
+.frow{display:grid;grid-template-columns:140px 1fr;gap:8px 12px;align-items:start;margin:8px 0}
+.frow label{color:var(--dim);padding-top:7px}
+.frow input,.frow select,.frow textarea{width:100%}
+.dlghead{display:flex;align-items:center;gap:10px}
+.dlghead h2{flex:1;font-size:15px;color:var(--text);text-transform:none;letter-spacing:0;margin:0}
+details.v2>summary{cursor:pointer;color:var(--dim);font-size:12px;margin-top:14px}
 a{color:var(--accent)}
 </style>
 </head>
@@ -92,7 +112,24 @@ a{color:var(--accent)}
     <span class="who" id="who"></span>
     <button class="ghost" id="logout">logout</button>
   </div>
-  <div id="counts"></div>
+  <div id="counts">
+    <div id="chips" style="display:flex;gap:8px;align-items:center"></div>
+    <div class="tools">
+      <button id="newitem">+ New workitem</button>
+      <label class="kv">sort
+        <select id="sort">
+          <option value="runorder">run order</option>
+          <option value="state">state</option>
+          <option value="priority">priority</option>
+          <option value="requested">requested ts</option>
+          <option value="completed">completed ts</option>
+          <option value="agent">agent assigned</option>
+          <option value="requestor">requestor</option>
+        </select>
+      </label>
+      <button class="ghost" id="refresh">refresh</button>
+    </div>
+  </div>
 </div>
 
 <div id="login">
@@ -118,31 +155,24 @@ a{color:var(--accent)}
   <main>
     <div id="toolbar">
       <h2 style="margin:0">Workitems <span class="kv" id="wi-proj"></span></h2>
-      <span style="flex:1"></span>
-      <label class="kv">sort
-        <select id="sort">
-          <option value="runorder">run order</option>
-          <option value="state">state</option>
-          <option value="priority">priority</option>
-          <option value="requested">requested ts</option>
-          <option value="completed">completed ts</option>
-          <option value="agent">agent assigned</option>
-          <option value="requestor">requestor</option>
-        </select>
-      </label>
-      <button class="ghost" id="refresh">refresh</button>
+      <span class="kv" id="viewnote"></span>
     </div>
     <div id="items"></div>
   </main>
 </div>
 
 <dialog id="detail"></dialog>
+<dialog id="form"></dialog>
+<div id="actmenu" class="actmenu" hidden></div>
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
-let token=null,me=null,project=null,itemsCache=[],stateFilter="",dlgDirty=false;
+let token=null,me=null,project=null,itemsCache=[],agentsCache=[],dlgDirty=false;
+const filters=new Set();   // additive state filters from the pinned counts bar
 const STATES=["in-progress","queued","question","parked","paused","failed","complete","scheduled"];
 const CLOSED=new Set(["complete","failed"]); // immutable except appended "doc" rows + reopen
+const OPEN_TARGETS=["queued","parked","paused","question"];
+const TAG_PALETTE=["#4da3ff","#39c47f","#e0b341","#b878e6","#e07a52","#4dd0c4","#e05252","#9fd3e8"];
 
 async function api(path,opts={}){
   const r=await fetch(path,{...opts,headers:{"content-type":"application/json",
@@ -158,6 +188,22 @@ function fmtTs(iso){
   if(isNaN(d))return "";
   const p=n=>String(n).padStart(2,"0");
   return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+const P=name=>`/api/projects/${encodeURIComponent(project)}/workitems${name?"/"+name:""}`;
+function tagColor(t){
+  if(t.color&&/^#[0-9a-f]{3,8}$/i.test(t.color))return t.color;
+  let h=0;for(const c of (t.text||""))h=(h*31+c.charCodeAt(0))>>>0;
+  return TAG_PALETTE[h%TAG_PALETTE.length];
+}
+function tagFg(hex){
+  const h=hex.replace("#","");const n=h.length===3?h.split("").map(c=>c+c).join(""):h.slice(0,6);
+  const r=parseInt(n.slice(0,2),16),g=parseInt(n.slice(2,4),16),b=parseInt(n.slice(4,6),16);
+  return (r*299+g*587+b*114)/1000>150?"#0b0d11":"#f3f5f8";
+}
+function tagsHtml(i){
+  const tags=(i.tags||[]).filter(t=>t&&t.text);
+  if(!tags.length)return "";
+  return `<span class="tags">${tags.map(t=>{const c=tagColor(t);return `<span class="tag" style="background:${esc(c)};color:${tagFg(c)}">${esc(t.text)}</span>`;}).join("")}</span>`;
 }
 
 async function boot(){
@@ -175,14 +221,17 @@ $("#li-go").onclick=async()=>{
     await load();
   }catch(e){$("#li-err").textContent="login failed";}
 };
+$("#li-pass").addEventListener("keydown",e=>{if(e.key==="Enter")$("#li-go").click();});
 $("#logout").onclick=()=>{token=null;try{localStorage.removeItem("iter_token");}catch(e){};location.reload();};
 $("#refresh").onclick=()=>project&&loadItems(project);
 $("#sort").onchange=()=>{try{localStorage.setItem("iter_sort",$("#sort").value);}catch(e){};renderItems();};
+$("#newitem").onclick=()=>openForm("create",null);
 
 async function load(){
   $("#login").style.display="none";$("#layout").style.display="flex";$("#top").style.display="";
   $("#who").textContent=me||"";
-  const[projects,engines]=await Promise.all([api("/api/projects"),api("/api/engines")]);
+  const[projects,engines,agents]=await Promise.all([api("/api/projects"),api("/api/engines"),api("/api/agents").catch(()=>[])]);
+  agentsCache=agents;
   projects.sort((a,b)=>a.name.localeCompare(b.name,undefined,{sensitivity:"base"}));
   try{const lp=localStorage.getItem("iter_project");if(lp&&!project&&projects.some(p=>p.name===lp))project=lp;}catch(e){}
   $("#projects").innerHTML=projects.map(p=>
@@ -206,29 +255,31 @@ async function loadItems(p){
   project=p;$("#wi-proj").textContent="— "+p;
   try{localStorage.setItem("iter_project",p);}catch(e){}
   document.querySelectorAll("#projects .proj").forEach(b=>b.classList.toggle("sel",b.dataset.p===p));
-  itemsCache=await api("/api/projects/"+encodeURIComponent(p)+"/workitems");
+  itemsCache=await api(P());
   renderCounts();renderItems();
 }
 
-/* ---- pinned counts bar: total + per-state, click to filter ---- */
+/* ---- pinned counts bar: total + per-state; clicks are ADDITIVE (V2 behaviour) ---- */
 function renderCounts(){
   const by={};itemsCache.forEach(i=>{by[i.state]=(by[i.state]||0)+1;});
-  const chip=(label,n,key,cls)=>`
-    <div class="count ${cls} ${n===0?"zero":""} ${stateFilter===key?"active":""}" data-k="${key}">
+  const chip=(label,n,key,cls,active)=>`
+    <div class="count ${cls} ${n===0?"zero":""} ${active?"active":""}" data-k="${key}">
       <b>${n}</b><span>${label}</span></div>`;
-  let html=chip("total",itemsCache.length,"","total");
-  for(const s of STATES)html+=chip(s,by[s]||0,s,"c-"+s);
-  $("#counts").innerHTML=html;
-  document.querySelectorAll("#counts .count").forEach(c=>c.onclick=()=>{
-    stateFilter=(stateFilter===c.dataset.k)?"":c.dataset.k;
+  let html=chip("total",itemsCache.length,"","total",filters.size===0);
+  for(const s of STATES)html+=chip(s,by[s]||0,s,"c-"+s,filters.has(s));
+  $("#chips").innerHTML=html;
+  document.querySelectorAll("#chips .count").forEach(c=>c.onclick=()=>{
+    const k=c.dataset.k;
+    if(!k)filters.clear();else if(filters.has(k))filters.delete(k);else filters.add(k);
     renderCounts();renderItems();
   });
 }
 
-/* ---- run order: what the engine would pick next; non-runnable below ---- */
+/* ---- run order: only what can run, plus whatever a runnable item is stuck behind ---- */
 function depsSatisfied(i,byId){
   return (i.blockedby||[]).every(d=>{const dep=byId[d];return !dep||dep.state==="complete";});
 }
+function runnable(i){return i.state==="in-progress"||(i.state==="queued"&&!i.needs_approval);}
 function runGroup(i,byId){
   if(i.state==="in-progress")return 0;                       // running now
   if(i.state==="queued"&&!i.needs_approval&&depsSatisfied(i,byId))return 1; // next up
@@ -239,6 +290,20 @@ function runGroup(i,byId){
   if(i.state==="scheduled")return 6;
   if(i.state==="failed")return 7;
   return 8;                                                  // complete
+}
+/* items that are runnable, or have a runnable descendant (via blockedby edges) */
+function runView(items){
+  const byId={},kids={};
+  items.forEach(i=>{byId[i.id]=i;});
+  items.forEach(i=>(i.blockedby||[]).forEach(d=>{if(byId[d])(kids[d]=kids[d]||[]).push(i.id);}));
+  const memo={};
+  const has=(id,seen=new Set())=>{
+    if(memo[id]!==undefined)return memo[id];
+    if(seen.has(id))return false;seen.add(id);
+    const r=(kids[id]||[]).some(c=>runnable(byId[c])||has(c,seen));
+    memo[id]=r;return r;
+  };
+  return items.filter(i=>runnable(i)||(!CLOSED.has(i.state)&&has(i.id)));
 }
 const stateOrder={"in-progress":0,"queued":1,"question":2,"paused":3,"parked":4,"scheduled":5,"failed":6,"complete":7};
 function comparator(mode,byId){
@@ -265,20 +330,22 @@ function tileHtml(i,depth){
       <span class="agent">${esc(i.agent||"")}</span>${att}
     </div>
     <div class="right">
+      ${tagsHtml(i)}
       <span>${esc(fmtTs(i.ts&&i.ts.receive))}</span>
       <span class="id" title="click to copy full id">${esc(i.id.slice(-8))}</span>
+      <button class="ghost sm actbtn" data-act-for="${esc(i.id)}">Actions ▾</button>
     </div>
   </div>`;
 }
 
 function renderItems(){
   const mode=$("#sort").value;
-  const shown=itemsCache.filter(i=>!stateFilter||i.state===stateFilter);
   const byId={};itemsCache.forEach(i=>{byId[i.id]=i;});
   const cmp=comparator(mode,byId);
-  let html="";
-  if(mode==="runorder"&&!stateFilter){
-    /* hierarchical: nest under the first visible blocker */
+  let shown,html="";
+  if(mode==="runorder"&&filters.size===0){
+    /* runnable-only view, nested under the first blocker that is itself shown */
+    shown=runView(itemsCache);
     const ids=new Set(shown.map(i=>i.id));
     const children={},roots=[];
     shown.forEach(i=>{
@@ -288,12 +355,16 @@ function renderItems(){
     roots.sort(cmp);
     const emit=(i,depth)=>tileHtml(i,depth)+((children[i.id]||[]).sort(cmp).map(c=>emit(c,depth+1)).join(""));
     html=roots.map(r=>emit(r,0)).join("");
+    $("#viewnote").textContent=`run order: ${shown.length} of ${itemsCache.length} — runnable items and what they are stuck behind`;
   }else{
+    shown=itemsCache.filter(i=>filters.size===0||filters.has(i.state));
     html=[...shown].sort(cmp).map(i=>tileHtml(i,0)).join("");
+    $("#viewnote").textContent=filters.size?`${shown.length} shown (${[...filters].join(" + ")})`:"";
   }
   $("#items").innerHTML=html||"<span class='kv'>no workitems</span>";
   document.querySelectorAll("#items .tile").forEach(t=>{
     t.onclick=e=>{
+      if(e.target.classList.contains("actbtn")){e.stopPropagation();openMenu(t.dataset.id,e.target);return;}
       if(e.target.classList.contains("id")){
         navigator.clipboard&&navigator.clipboard.writeText(t.dataset.id);
         e.target.textContent="copied!";
@@ -308,8 +379,8 @@ function renderItems(){
 /* jump to a workitem line in the queue and flash it */
 function jumpToItem(id){
   const t=document.querySelector(`#items .tile[data-id="${CSS.escape(id)}"]`);
-  if(!t){ // filtered out: clear filter and retry once
-    if(stateFilter){stateFilter="";renderCounts();renderItems();return jumpToItem(id);}
+  if(!t){ // not in the current view: show everything by state and retry once
+    if(filters.size||$("#sort").value==="runorder"){filters.clear();$("#sort").value="state";renderCounts();renderItems();return jumpToItem(id);}
     return;
   }
   t.scrollIntoView({block:"center",behavior:"smooth"});
@@ -318,28 +389,199 @@ function jumpToItem(id){
   setTimeout(()=>t.classList.remove("flash"),2000);
 }
 
-/* ---- lightbox: dirty-aware closing ---- */
+/* ================= actions menu (V2 parity; V3 state names) ================= */
+const menu=$("#actmenu");
+function closeMenu(){menu.hidden=true;menu.innerHTML="";}
+document.addEventListener("click",e=>{if(!menu.hidden&&!e.target.closest("#actmenu")&&!e.target.classList.contains("actbtn"))closeMenu();});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!menu.hidden){e.preventDefault();e.stopPropagation();closeMenu();}},true);
+let menuOpenedAt=0;
+document.addEventListener("scroll",()=>{if(!menu.hidden&&Date.now()-menuOpenedAt>600)closeMenu();},true);
+
+function menuItems(i){
+  const b=(act,label,cls="")=>`<button data-act="${act}" class="${cls}">${label}</button>`;
+  const note=t=>`<span class="note">${t}</span>`;
+  const s=i.state;
+  if(CLOSED.has(s)){
+    const att=i.attempt?` after ${i.attempt} attempt${i.attempt===1?"":"s"}`:"";
+    return b("clone","Clone (run it again)")+(s==="complete"?b("followup","Create follow-up request"):"")+
+      b("reopen","Reopen (back to queued)…")+b("doc","Append doc…")+`<div class="sep"></div>`+
+      note(`Closed ${esc(s)}${esc(att)} — a closed item is immutable; docs can be appended, or reopen it.`)+
+      b("delete","Delete from archive…","danger");
+  }
+  if(s==="in-progress"){
+    return b("clone","Clone")+`<div class="sep"></div>`+note("Agent is running. V3 has no mid-run stop yet; the engine will close it when the turn ends.");
+  }
+  if(s==="scheduled"){
+    return b("runnow","Run now")+b("pause","Pause schedule")+b("pauseedit","Pause &amp; edit")+
+      b("complete","Complete (retire schedule)")+b("clone","Clone")+`<div class="sep"></div>`+
+      note("Run now clones this schedule into a queued run.")+b("delete","Delete","danger");
+  }
+  if(s==="question"){
+    return b("answer","Answer…")+b("queue","Queue without answering")+b("park","Park")+b("pauseedit","Pause &amp; edit")+
+      b("complete","Complete (no work needed)")+b("clone","Clone")+`<div class="sep"></div>`+
+      note("An agent is waiting on this decision — open the item and answer there.")+b("delete","Delete","danger");
+  }
+  let rows=[];
+  if(s==="parked"||s==="paused")rows.push(b("queue","Queue"));
+  if((s==="parked"||s==="paused")&&i.sched&&i.sched.kind)rows.push(b("schedule","Resume schedule"));
+  if(s==="parked"||s==="paused")rows.push(b("question","Move to question"));
+  if(s==="paused"||s==="queued")rows.push(b("park","Park"));
+  rows.push(b("complete","Complete"));rows.push(b("pauseedit","Pause &amp; edit"));rows.push(b("clone","Clone"));
+  rows.push(`<div class="sep"></div>`);rows.push(b("delete","Delete","danger"));
+  return rows.join("");
+}
+function openMenu(id,anchor){
+  const i=itemsCache.find(x=>x.id===id);if(!i)return;
+  menu.innerHTML=`<span class="note"><b>${esc(i.name.slice(0,60))}</b> · ${esc(i.state)}</span>`+menuItems(i);
+  menu.hidden=false;menuOpenedAt=Date.now();
+  const r=anchor.getBoundingClientRect();
+  menu.style.top=Math.min(r.bottom+4,window.innerHeight-menu.offsetHeight-8)+"px";
+  menu.style.left=Math.max(8,Math.min(r.right-menu.offsetWidth,window.innerWidth-menu.offsetWidth-8))+"px";
+  menu.querySelectorAll("button[data-act]").forEach(btn=>btn.onclick=async e=>{
+    e.stopPropagation();closeMenu();
+    try{await doAction(btn.dataset.act,i);}catch(err){alert("action failed: "+err.message);}
+  });
+}
+async function fresh(id){return api(P(id));}
+async function setState(i,state,mutate){
+  const f=await fresh(i.id);
+  f.state=state;if(mutate)mutate(f);
+  await api(P(i.id)+"?expect_version="+f.version,{method:"PUT",body:JSON.stringify(f)});
+  return f;
+}
+async function requestText(id){
+  const d=await api(P(id)+"/details").catch(()=>[]);
+  const r=d.find(x=>x.key==="request");
+  return r?(typeof r.value==="string"?r.value:JSON.stringify(r.value,null,2)):"";
+}
+async function createItem(body,request){
+  const created=await api(P(),{method:"POST",body:JSON.stringify(body)});
+  await api(P(created.id)+"/details/0",{method:"PUT",body:JSON.stringify({key:"request",valuetype:"text",value:request||""})});
+  return created;
+}
+function cloneBody(i,over={}){
+  return {name:i.name,agent:i.agent,exec_shell:i.exec_shell||"",priority:i.priority??5,lockdirs:i.lockdirs||[],
+    blockedby:i.blockedby||[],tags:i.tags||[],prework:i.prework||[],postwork:i.postwork||[],
+    requestedby:me||"",createdby:me||"",state:"queued",...over};
+}
+async function doAction(act,i){
+  switch(act){
+    case "answer": return openDetail(i.id);
+    case "doc": return openDetail(i.id);
+    case "queue": await setState(i,"queued",f=>{f.needs_approval=false;});break;
+    case "park": await setState(i,"parked");break;
+    case "pause": await setState(i,"paused");break;
+    case "question": await setState(i,"question");break;
+    case "schedule": await setState(i,"scheduled");break;
+    case "complete":
+      if(!confirm(`Mark "${i.name.slice(0,60)}" complete without running it?`))return;
+      await setState(i,"complete",f=>{f.ts=f.ts||{};f.ts.complete=new Date().toISOString().replace(/\.\d+Z$/,"Z");});break;
+    case "reopen":{
+      const reason=prompt("Reopen this item (back to queued; downstream items become blocked again). Reason?");
+      if(reason===null)return;
+      await api(P(i.id)+"/reopen",{method:"POST",body:JSON.stringify({reason})});break;}
+    case "pauseedit":{
+      const f=(i.state==="paused")?await fresh(i.id):await setState(i,"paused");
+      await loadItems(project);
+      return openForm("edit",f);}
+    case "clone":{
+      const req=await requestText(i.id);
+      const c=await createItem(cloneBody(i,{name:i.name}),req);
+      await loadItems(project);
+      jumpToItem(c.id);return;}
+    case "runnow":{
+      const req=await requestText(i.id);
+      const c=await createItem(cloneBody(i,{source_schedule:i.id,sched:undefined}),req);
+      await loadItems(project);
+      jumpToItem(c.id);return;}
+    case "followup":{
+      const req=await requestText(i.id);
+      return openForm("followup",{...cloneBody(i,{name:"Follow-up: "+i.name,blockedby:[i.id],tags:[]}),
+        _request:`Follow-up to workitem ${i.id} ("${i.name}").\n\nOriginal request:\n${req}\n\n---\nWhat to do now:\n`});}
+    case "delete":
+      if(!confirm(`Delete "${i.name.slice(0,60)}" (${i.id.slice(-8)})? This cannot be undone.`))return;
+      await api(P(i.id),{method:"DELETE"});break;
+  }
+  await loadItems(project);
+}
+
+/* ================= new / edit / follow-up form ================= */
+const form=$("#form");
+form.addEventListener("click",e=>{if(e.target===form)form.close();});
+function openForm(mode,src){
+  const i=src||{};
+  const title={create:"New workitem",edit:"Edit workitem — "+(i.id||"").slice(-8),followup:"Create follow-up request"}[mode];
+  const agentNames=[...new Set([...(agentsCache.map(a=>a.name)),"exec",i.agent].filter(Boolean))];
+  const lines=a=>(a||[]).join("\n");
+  const tagsText=(i.tags||[]).map(t=>t.color?`${t.text}:${t.color}`:t.text).join(", ");
+  const stateOpts=(mode==="edit"?OPEN_TARGETS:["queued","parked","paused","question"]);
+  const curState=(mode==="edit"&&OPEN_TARGETS.includes(i.state))?i.state:"queued";
+  form.innerHTML=`
+    <div style="padding:16px">
+      <div class="dlghead"><h2>${esc(title)}</h2><button class="ghost sm" id="f-cancel">cancel</button></div>
+      <div class="frow"><label>name</label><input id="f-name" value="${esc(i.name||"")}" placeholder="short label, < 150 chars"></div>
+      <div class="frow"><label>agent</label><select id="f-agent">${agentNames.map(a=>`<option ${a===(i.agent||"code")?"selected":""}>${esc(a)}</option>`).join("")}</select></div>
+      <div class="frow" id="f-exec-row" ${ (i.agent||"code")==="exec"?"":"hidden"}><label>exec shell</label><textarea id="f-exec" rows="2">${esc(i.exec_shell||"")}</textarea></div>
+      <div class="frow"><label>priority</label><input id="f-prio" type="number" min="0" max="10" value="${esc(i.priority??5)}" style="width:90px"> <span class="kv">lower = sooner; P0 most urgent; default 5</span></div>
+      <div class="frow"><label>state on save</label><select id="f-state">${stateOpts.map(s=>`<option ${s===curState?"selected":""}>${s}</option>`).join("")}</select></div>
+      <div class="frow"><label>lockdirs</label><textarea id="f-lock" rows="2" placeholder="one per line, e.g. {topdir}/core/repos/x/">${esc(lines(i.lockdirs))}</textarea></div>
+      <div class="frow"><label>blocked by</label><textarea id="f-dep" rows="2" placeholder="workitem ids, one per line">${esc(lines(i.blockedby))}</textarea></div>
+      <div class="frow"><label>tags</label><input id="f-tags" value="${esc(tagsText)}" placeholder="comma separated; optional color: name:#hex"></div>
+      <div class="frow"><label>request</label><textarea id="f-req" rows="16" placeholder="the full request text the agent receives">${esc(i._request??"")}</textarea></div>
+      <div style="text-align:right;margin-top:10px"><span class="err" id="f-err" style="margin-right:12px"></span><button id="f-save">${mode==="edit"?"Save":"Create"}</button></div>
+    </div>`;
+  const agentSel=form.querySelector("#f-agent");
+  agentSel.onchange=()=>{form.querySelector("#f-exec-row").hidden=agentSel.value!=="exec";};
+  form.querySelector("#f-cancel").onclick=()=>form.close();
+  if(mode==="edit"&&i.id){requestText(i.id).then(t=>{if(!form.querySelector("#f-req").value)form.querySelector("#f-req").value=t;});}
+  form.querySelector("#f-save").onclick=async()=>{
+    const err=form.querySelector("#f-err");err.textContent="";
+    const val=s=>form.querySelector(s).value;
+    const list=s=>val(s).split("\n").map(x=>x.trim()).filter(Boolean);
+    const tags=val("#f-tags").split(",").map(x=>x.trim()).filter(Boolean).map(x=>{const m=x.match(/^(.*?):(#[0-9a-fA-F]{3,8})$/);return m?{text:m[1].trim(),color:m[2]}:{text:x,color:""};});
+    const body={name:val("#f-name").trim(),agent:val("#f-agent"),exec_shell:val("#f-exec"),priority:parseInt(val("#f-prio")||"5",10),
+      state:val("#f-state"),lockdirs:list("#f-lock"),blockedby:list("#f-dep"),tags};
+    if(!body.name){err.textContent="name is required";return;}
+    try{
+      if(mode==="edit"){
+        const f=await fresh(i.id);Object.assign(f,body);
+        await api(P(i.id)+"?expect_version="+f.version,{method:"PUT",body:JSON.stringify(f)});
+        await api(P(i.id)+"/details/0",{method:"PUT",body:JSON.stringify({key:"request",valuetype:"text",value:val("#f-req")})});
+        form.close();await loadItems(project);jumpToItem(i.id);
+      }else{
+        const c=await createItem({...body,requestedby:me||"",createdby:me||"",prework:[],postwork:[]},val("#f-req"));
+        form.close();await loadItems(project);jumpToItem(c.id);
+      }
+    }catch(e){err.textContent="save failed: "+e.message;}
+  };
+  form.showModal();
+}
+
+/* ================= detail lightbox ================= */
 const dlg=$("#detail");
 function tryCloseDlg(){
   if(dlgDirty&&!confirm("Discard unsaved edits?"))return false;
   dlgDirty=false;dlg.close();return true;
 }
 dlg.addEventListener("click",e=>{if(e.target===dlg)tryCloseDlg();});
-dlg.addEventListener("cancel",e=>{if(dlgDirty&&!confirm("Discard unsaved edits?"))e.preventDefault();else dlgDirty=false;});
+dlg.addEventListener("cancel",e=>{
+  if(!menu.hidden){e.preventDefault();closeMenu();return;}   // Escape closes the menu first
+  if(dlgDirty&&!confirm("Discard unsaved edits?"))e.preventDefault();else dlgDirty=false;});
 dlg.addEventListener("input",()=>{dlgDirty=true;});
 dlg.addEventListener("change",()=>{dlgDirty=true;});
 
 async function openDetail(id){
   const i=itemsCache.find(x=>x.id===id);if(!i)return;
-  const details=await api(`/api/projects/${encodeURIComponent(project)}/workitems/${id}/details`).catch(()=>[]);
+  const details=await api(P(id)+"/details").catch(()=>[]);
   dlgDirty=false;
   const blocked=(i.blockedby||[]).map(b=>`<a href="#" data-dep="${esc(b)}">${esc(b.slice(-8))}</a>`).join(", ")||"—";
   dlg.innerHTML=`
     <div style="padding:16px">
-      <h2 style="font-size:15px;color:var(--text);text-transform:none;letter-spacing:0">${esc(i.name)}</h2>
+      <div class="dlghead"><span class="state ${esc(i.state)}">${esc(i.state)}</span><h2>${esc(i.name)}</h2>${tagsHtml(i)}
+        <button class="ghost sm actbtn" id="dlg-actions">Actions ▾</button><button class="ghost sm" id="dlg-close">close</button></div>
       <div class="kv">id <b style="font-family:monospace">${esc(i.id)}</b> · v${esc(i.version)} ·
-        state <b>${esc(i.state)}</b> · P${esc(i.priority)} · agent <b>${esc(i.agent)}</b> ·
-        requested by <b>${esc(i.requestedby||"—")}</b> · blocked by: ${blocked}</div>
+        P${esc(i.priority)} · agent <b>${esc(i.agent)}</b> ·
+        requested by <b>${esc(i.requestedby||"—")}</b> · created by <b>${esc(i.createdby||"—")}</b> · blocked by: ${blocked}</div>
       <div class="kv">received ${esc(fmtTs(i.ts&&i.ts.receive)||"—")} · started ${esc(fmtTs(i.ts&&i.ts.start)||"—")}
         · completed ${esc(fmtTs(i.ts&&i.ts.complete)||"—")} · attempt ${esc(i.attempt)} · engine ${esc(i.engine||"—")}</div>
       <div class="kv">lockdirs: ${esc((i.lockdirs||[]).join(", ")||"—")}
@@ -347,35 +589,31 @@ async function openDetail(id){
       <div id="dl"></div>
       <div style="margin-top:14px"><h2>append doc</h2>
         <textarea id="doc-text" rows="3" style="width:100%" placeholder="note, closeout record, decision… (allowed on closed items)"></textarea>
-        <div style="text-align:right;margin-top:4px"><button id="doc-add">append doc</button>
-        ${CLOSED.has(i.state)?`<button class="ghost" id="reopen" title="back to queued; downstream items become blocked again">reopen</button>`:""}</div></div>
-      <div style="margin-top:12px;text-align:right"><button class="ghost" id="dlg-close">close</button></div>
+        <div style="text-align:right;margin-top:4px"><button id="doc-add">append doc</button></div></div>
     </div>`;
   dlg.querySelector("#dlg-close").onclick=()=>tryCloseDlg();
+  dlg.querySelector("#dlg-actions").onclick=e=>{e.stopPropagation();openMenu(i.id,e.target);};
   const docBtn=dlg.querySelector("#doc-add");
   docBtn.onclick=async()=>{
     const v=dlg.querySelector("#doc-text").value.trim();if(!v)return;
     try{
-      await api(`/api/projects/${encodeURIComponent(project)}/workitems/${i.id}/details`,
-        {method:"POST",body:JSON.stringify({key:"doc",valuetype:"text",value:v})});
+      await api(P(i.id)+"/details",{method:"POST",body:JSON.stringify({key:"doc",valuetype:"text",value:v})});
       dlgDirty=false;openDetail(i.id);
     }catch(e){docBtn.textContent="failed: "+e.message;}
-  };
-  const reopenBtn=dlg.querySelector("#reopen");
-  if(reopenBtn)reopenBtn.onclick=async()=>{
-    const reason=prompt("Reopen this item (back to queued). Reason?");if(reason===null)return;
-    try{
-      await api(`/api/projects/${encodeURIComponent(project)}/workitems/${i.id}/reopen`,
-        {method:"POST",body:JSON.stringify({reason})});
-      dlgDirty=false;dlg.close();loadItems(project);
-    }catch(e){reopenBtn.textContent="failed: "+e.message;}
   };
   const dl=dlg.querySelector("#dl");
   const closedAt=i.ts&&i.ts.complete;
   details.forEach(d=>{
     const box=document.createElement("div");
     const after=d.key==="doc"&&closedAt&&d.ts&&d.ts>closedAt;
-    box.innerHTML=`<h2 style="margin-top:14px">${esc(d.key)} <span class="kv">#${esc(d.order)} (${esc(d.valuetype)})${d.by?" · "+esc(d.by):""}${d.ts?" · "+esc(fmtTs(d.ts)):""}${after?" · <b style='color:var(--q)'>post-close</b>":""}</span></h2>`;
+    const head=`${esc(d.key)} <span class="kv">#${esc(d.order)} (${esc(d.valuetype)})${d.by?" · "+esc(d.by):""}${d.ts?" · "+esc(fmtTs(d.ts)):""}${after?" · <b style='color:var(--q)'>post-close</b>":""}</span>`;
+    if(d.key==="v2"){
+      /* migration leftovers: every V2 field V3 has no column for, kept for reference only */
+      box.innerHTML=`<details class="v2"><summary>V2 migration leftovers (${esc(Object.keys(d.value||{}).length)} fields, reference only) — #${esc(d.order)}</summary></details>`;
+      const pre=document.createElement("pre");pre.textContent=JSON.stringify(d.value,null,2);box.firstElementChild.appendChild(pre);
+      dl.appendChild(box);return;
+    }
+    box.innerHTML=`<h2 style="margin-top:14px">${head}</h2>`;
     if(d.valuetype==="json"&&d.value&&Array.isArray(d.value.fields)){box.appendChild(widgetForm(i,d));}
     else{const pre=document.createElement("pre");pre.textContent=typeof d.value==="string"?d.value:JSON.stringify(d.value,null,2);box.appendChild(pre);}
     dl.appendChild(box);
@@ -394,7 +632,7 @@ async function openDetail(id){
 function widgetForm(item,d){
   const w=d.value,form=document.createElement("div");
   form.innerHTML=`<div><b>${esc(w.title)}</b></div><div class="kv">${esc(w.summary||"")}</div>
-    ${w.detail?`<details><summary class="kv">more…</summary><div class="kv">${esc(w.detail)}</div></details>`:""}`;
+    ${w.detail?`<details><summary class="kv">more…</summary><pre>${esc(w.detail)}</pre></details>`:""}`;
   w.fields.forEach((f,idx)=>{
     const fd=document.createElement("div");fd.className="wfield";
     const lab=`<label>${esc(f.label||f.key)}</label>`;
@@ -412,11 +650,13 @@ function widgetForm(item,d){
     }else if(f.type==="int"){
       fd.innerHTML=lab+`<input type="number" data-f="${idx}" value="${esc(f.value??"")}">`;
     }else{
-      fd.innerHTML=lab+`<textarea data-f="${idx}" rows="2" style="width:100%">${esc(f.value??"")}</textarea>`;
+      fd.innerHTML=lab+`<textarea data-f="${idx}" rows="4" style="width:100%">${esc(f.value??"")}</textarea>`;
     }
     form.appendChild(fd);
   });
-  const btn=document.createElement("button");btn.textContent="Submit answer";
+  const closed=CLOSED.has(item.state);
+  const btn=document.createElement("button");btn.textContent=closed?"answered (closed item)":"Submit answer";
+  btn.disabled=closed;
   btn.onclick=async()=>{
     const w2=JSON.parse(JSON.stringify(w));
     w2.fields.forEach((f,idx)=>{
@@ -427,12 +667,10 @@ function widgetForm(item,d){
       else w2.fields[idx].value=els[0].value;
     });
     try{
-      await api(`/api/projects/${encodeURIComponent(project)}/workitems/${item.id}/details/${d.order}`,
-        {method:"PUT",body:JSON.stringify({key:d.key,valuetype:"json",value:w2})});
-      const fresh=await api(`/api/projects/${encodeURIComponent(project)}/workitems/${item.id}`);
-      fresh.state="queued";fresh.needs_approval=false;
-      await api(`/api/projects/${encodeURIComponent(project)}/workitems/${item.id}?expect_version=${fresh.version}`,
-        {method:"PUT",body:JSON.stringify(fresh)});
+      await api(P(item.id)+"/details/"+d.order,{method:"PUT",body:JSON.stringify({key:d.key,valuetype:"json",value:w2})});
+      const f=await fresh(item.id);
+      f.state="queued";f.needs_approval=false;
+      await api(P(item.id)+"?expect_version="+f.version,{method:"PUT",body:JSON.stringify(f)});
       dlgDirty=false;btn.textContent="answered ✓";dlg.close();loadItems(project);
     }catch(e){btn.textContent="failed: "+e.message;}
   };
@@ -444,7 +682,7 @@ boot();
 setInterval(()=>{
   if(!token||$("#layout").style.display==="none")return;
   load().catch(()=>{});
-  if(project&&!dlg.open)loadItems(project).catch(()=>{});
+  if(project&&!dlg.open&&!form.open&&menu.hidden)loadItems(project).catch(()=>{});
 },10000);
 </script>
 </body>
