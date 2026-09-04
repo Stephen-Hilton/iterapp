@@ -18,6 +18,8 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system
 #brandrow .who{margin-left:auto;color:var(--dim)}
 #brandrow #tz{max-width:170px;font-size:12px;padding:3px 6px}
 #nav-toggle{display:none;font-size:16px;padding:2px 9px}
+/* viewer role: read everything, change nothing (the API refuses anyway; this keeps the page honest) */
+body.viewer .docbox,body.viewer #newitem,body.viewer .actbtn,body.viewer #doc-add,body.viewer #doc-text,body.viewer #eli5,body.viewer [data-test],body.viewer .wsubmit{display:none !important}
 #counts{display:flex;gap:8px;align-items:center;padding:0 18px 10px;overflow-x:auto}
 #counts .tools{margin-left:auto;display:flex;gap:8px;align-items:center;flex:none}
 .count{display:flex;align-items:baseline;gap:6px;padding:4px 12px;border:1px solid var(--line);
@@ -413,6 +415,7 @@ async function load(){
     load();
   };
   $("#who").textContent=(me||"")+(myRole?" · "+myRole:"");
+  document.body.classList.toggle("viewer",myRole==="viewer");
   projects.sort((a,b)=>a.name.localeCompare(b.name,undefined,{sensitivity:"base"}));
   try{const lp=localStorage.getItem("iter_project");if(lp&&!project&&projects.some(p=>p.name===lp))project=lp;}catch(e){}
   $("#projects").innerHTML=projects.map(p=>
@@ -1037,7 +1040,7 @@ async function userSettings(name){
     const users=await api("/api/users").catch(()=>[]);
     extra=`<h3>All users (admin)</h3><div class="list">${users.map(u=>`<button class="ghost sm" data-user="${esc(u.user)}">⚙ ${esc(u.user)} <span class="kv">${esc(u.role)}</span></button>`).join("")}</div>
       <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center"><input id="nu-name" placeholder="new user name" style="width:150px"><input id="nu-pass" type="password" placeholder="password" style="width:150px">
-      <select id="nu-role"><option>user</option><option>engine</option><option>admin</option></select><button class="sm" id="nu-add">add user</button></div>`;
+      <select id="nu-role"><option>user</option><option>viewer</option><option>engine</option><option>admin</option></select><button class="sm" id="nu-add">add user</button></div>`;
   }
   settingsBox(self?`My settings — ${name}`:`User — ${name}`,userFields(self&&!isAdmin()),rec,async(vals)=>{
     const fresh=await api("/api/users/"+encodeURIComponent(name));
@@ -1098,7 +1101,7 @@ async function openDetail(id){
       <div class="kv">lockdirs: ${esc((i.lockdirs||[]).join(", ")||"—")}
         ${i.lasterror?" · <span style='color:var(--bad)'>"+esc(i.lasterror.slice(0,200))+"</span>":""}</div>
       <div id="dl"></div>
-      <div style="margin-top:14px"><h2>append doc</h2>
+      <div style="margin-top:14px" class="docbox"><h2>append doc</h2>
         <textarea id="doc-text" rows="3" style="width:100%" placeholder="note, closeout record, decision… (allowed on closed items)"></textarea>
         <div style="text-align:right;margin-top:4px"><button id="doc-add">append doc</button></div></div>
     </div>`;
@@ -1193,7 +1196,7 @@ function widgetForm(item,d){
     form.appendChild(fd);
   });
   const closed=CLOSED.has(item.state);
-  const btn=document.createElement("button");btn.textContent=closed?"answered (closed item)":"Submit answer";
+  const btn=document.createElement("button");btn.className="wsubmit";btn.textContent=closed?"answered (closed item)":"Submit answer";
   btn.disabled=closed;
   btn.onclick=async()=>{
     const w2=JSON.parse(JSON.stringify(w));

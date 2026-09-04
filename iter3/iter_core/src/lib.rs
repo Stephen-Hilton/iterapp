@@ -416,7 +416,8 @@ pub struct WebuiUser {
     pub user: String,
     #[serde(default)]
     pub email: String,
-    /// user | engine | admin
+    /// user | engine | admin | viewer (read-only: no queue writes; may edit
+    /// their own profile)
     #[serde(default = "default_role")]
     pub role: String,
     #[serde(default)]

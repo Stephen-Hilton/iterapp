@@ -79,7 +79,9 @@ impl AuthUser {
         if self.role == "admin" { Ok(()) } else { Err(forbidden()) }
     }
     fn require_writer(&self) -> Result<(), ApiError> {
-        // engines and admins and users may all mutate queue-level data
+        // engines and admins and users may all mutate queue-level data; a
+        // "viewer" (added 2026-09-04) reads everything and changes nothing but
+        // their own profile (timezone, password)
         if ["admin", "engine", "user"].contains(&self.role.as_str()) { Ok(()) } else { Err(forbidden()) }
     }
 }
@@ -242,7 +244,17 @@ async fn user_put(
     if self_edit {
         let Some(ex) = &existing else { return Err(forbidden()) };
         for k in ["role", "authz", "tokenver", "pubkey"] {
-            body[k] = ex.get(k).cloned().unwrap_or(Value::Null);
+            // a key the stored row never had must stay absent (serde defaults
+            // apply to missing keys, not to null): a null here failed every
+            // non-admin self-edit of a user created without "authz"
+            match ex.get(k) {
+                Some(v) if !v.is_null() => body[k] = v.clone(),
+                _ => {
+                    if let Some(o) = body.as_object_mut() {
+                        o.remove(k);
+                    }
+                }
+            }
         }
     }
     body["user"] = json!(name);
@@ -262,8 +274,8 @@ async fn user_put(
     }
     let parsed: WebuiUser =
         serde_json::from_value(body.clone()).map_err(|e| bad(format!("user does not parse: {e}")))?;
-    if !["user", "engine", "admin"].contains(&parsed.role.as_str()) {
-        return Err(bad("role must be user|engine|admin"));
+    if !["user", "engine", "admin", "viewer"].contains(&parsed.role.as_str()) {
+        return Err(bad("role must be user|engine|admin|viewer"));
     }
     st.store.put("webui_user", &name, NOSK, &body).await?;
     st.store.bump_seq(GLOBAL, "webui_user").await?;

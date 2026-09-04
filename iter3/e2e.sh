@@ -379,6 +379,21 @@ LOGIN2=$(curl -s -X POST "$BASE/auth/login" -H content-type:application/json -d 
 [ "$(echo "$LOGIN2" | jq -r .timezone)" = "America/Los_Angeles" ] || fail "login does not echo the timezone: $LOGIN2"
 pass "user timezone: stored on the record (self-service PUT), echoed by login"
 
+# ---- viewer role (2026-09-04): reads everything, writes nothing but their own profile ----
+curl -sf "${AUTH[@]}" -X PUT "$BASE/api/users/gerald" -d '{"role":"viewer","password":"view-only-pw","email":""}' >/dev/null || fail "create viewer"
+VTOK=$(curl -sf -X POST "$BASE/auth/login" -H content-type:application/json -d '{"user":"gerald","password":"view-only-pw"}' | jq -r .token)
+[ -n "$VTOK" ] && [ "$VTOK" != null ] || fail "viewer login"
+VAUTH=(-H "authorization: Bearer $VTOK" -H content-type:application/json)
+[ "$(curl -sf "${VAUTH[@]}" "$BASE/api/projects/$PROJECT/workitems" | jq 'length')" -ge 1 ] || fail "viewer cannot read workitems"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "${VAUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems" -d '{"name":"viewer write","agent":"exec","exec_shell":"true"}')
+[ "$CODE" = 403 ] || fail "viewer could create a workitem (HTTP $CODE)"
+ANYID=$(curl -sf "${AUTH[@]}" "$BASE/api/projects/$PROJECT/workitems" | jq -r '.[0].id')
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "${VAUTH[@]}" -X POST "$BASE/api/projects/$PROJECT/workitems/$ANYID/explain" -d '{}')
+[ "$CODE" = 403 ] || fail "viewer could request an ELI5 (HTTP $CODE)"
+curl -sf "${VAUTH[@]}" "$BASE/api/users/gerald" | jq '.timezone="Asia/Riyadh"' | curl -sf "${VAUTH[@]}" -X PUT "$BASE/api/users/gerald" -d @- >/dev/null || fail "viewer self profile put"
+[ "$(curl -sf "${AUTH[@]}" "$BASE/api/users/gerald" | jq -r '.role+" "+.timezone')" = "viewer Asia/Riyadh" ] || fail "viewer profile edit changed the role or lost the timezone"
+pass "viewer role: reads, 403 on queue writes and ELI5, may edit own profile"
+
 # widget helper
 echo '{"title":"t","fields":[{"key":"a","type":"text","value":""}]}' > "$SCRATCH/w.json"
 "$ENGINE_BIN" --question-widget "$SCRATCH/w.json" | grep -q "OK" || fail "--question-widget valid case"
